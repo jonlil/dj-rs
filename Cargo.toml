@@ -1,0 +1,13 @@
+[package]
+name = "dj-rs"
+version = "0.1.0"
+authors = ["Jonas Liljestrand <jonas.liljestrand@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dependencies.gtk]
+version = "0.9.0"
+features = ["v3_16"]
