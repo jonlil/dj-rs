@@ -7,13 +7,19 @@ pub struct MainView {
 
 impl MainView {
     pub fn new() -> Self {
-        let button = gtk::Button::new();
-        button.set_label("Open");
-        button.set_halign(gtk::Align::Center);
-
         let container = Grid::new();
+        let player_box = gtk::Box::new(
+            gtk::Orientation::Horizontal,
+            0,
+        );
 
-        container.attach(&button, 0, 1, 1, 1);
+        let player1 = PlayerView::new();
+        let player2 = PlayerView::new();
+
+        player_box.pack_start(&player1.container, true, true, 5);
+        player_box.pack_end(&player2.container, true, true, 5);
+
+        container.add(&player_box);
 
         container.set_row_spacing(12);
         container.set_border_width(6);
@@ -25,3 +31,33 @@ impl MainView {
         }
     }
 }
+
+pub struct PlayerView {
+    pub container: gtk::Scale,
+}
+
+impl PlayerView {
+    pub fn new() -> Self {
+        let adjustment = gtk::Adjustment::new(
+            0.0,
+            0.0,
+            255.0,
+            1.0,
+            1.0,
+            1.0,
+        );
+
+        let track_position = gtk::Scale::new(
+            gtk::Orientation::Horizontal,
+            Some(&adjustment),
+        );
+
+        track_position.set_hexpand(true);
+
+        PlayerView {
+            container: track_position,
+        }
+    }
+}
+
+pub struct BrowserView;

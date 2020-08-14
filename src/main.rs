@@ -43,20 +43,13 @@ impl Widgets {
         let main_view = views::MainView::new();
         let menu_bar = MenuBar::new();
         let vertical_box = gtk::Box::new(Orientation::Vertical, 10);
-
-        let view_stack = gtk::Stack::new();
-        view_stack.set_border_width(6);
-        view_stack.set_vexpand(true);
-        view_stack.set_hexpand(true);
-        view_stack.add(&main_view.container);
-
         let window = ApplicationWindow::new(application);
 
         window.set_default_size(640, 640);
         window.set_title("DJ Application");
 
-        vertical_box.add(&menu_bar.container);
-        vertical_box.add(&view_stack);
+        vertical_box.pack_start(&menu_bar.container, false, false, 0);
+        vertical_box.pack_start(&main_view.container, true, true, 0);
 
         window.add(&vertical_box);
         window.show_all();
