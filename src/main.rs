@@ -2,6 +2,8 @@ extern crate gtk;
 extern crate gio;
 extern crate glib;
 
+mod views;
+
 use gtk::prelude::*;
 use gio::prelude::*;
 
@@ -9,63 +11,109 @@ use glib::clone;
 
 use gtk::{
     ApplicationWindow,
-    Application,
     Orientation,
-    Label,
-    Menu,
-    MenuBar,
     MenuItem
 };
 
+use std::rc::Rc;
 use std::env;
 
-fn build_menu(window: &ApplicationWindow) -> MenuBar {
-    let menu_bar = MenuBar::new();
-    let file = MenuItem::with_label("File");
-    let menu = Menu::new();
-    let quit = MenuItem::with_label("Quit");
-
-    let about = MenuItem::with_label("About");
-
-    menu.append(&quit);
-    file.set_submenu(Some(&menu));
-
-    menu_bar.append(&file);
-    menu_bar.append(&about);
-
-    quit.connect_activate(clone!(@weak window => move |_| {
-        window.close();
-    }));
-
-    menu_bar
+pub struct Application {
+    pub widgets: Rc<Widgets>,
 }
 
-fn build_ui(application:  &Application) {
-    let window = ApplicationWindow::new(application);
+impl Application {
+    pub fn new(app: &gtk::Application) -> Self {
+        let app = Application {
+            widgets: Rc::new(Widgets::new(app)),
+        };
 
-    window.set_default_size(640, 640);
-    window.set_title("DJ Application");
+        app
+    }
+}
 
-    let label = Label::new(Some("DJ RS"));
-    let v_box = gtk::Box::new(Orientation::Vertical, 10);
+pub struct Widgets {
+    pub window: ApplicationWindow,
+    pub main_view: views::MainView,
+    pub vertical_box: gtk::Box,
+}
 
-    v_box.pack_start(&build_menu(&window), false, false, 0);
-    v_box.pack_start(&label, true, true, 0);
+impl Widgets {
+    pub fn new(application: &gtk::Application) -> Self {
+        let main_view = views::MainView::new();
+        let menu_bar = MenuBar::new();
+        let vertical_box = gtk::Box::new(Orientation::Vertical, 10);
 
-    window.add(&v_box);
-    window.show_all();
+        let view_stack = gtk::Stack::new();
+        view_stack.set_border_width(6);
+        view_stack.set_vexpand(true);
+        view_stack.set_hexpand(true);
+        view_stack.add(&main_view.container);
+
+        let window = ApplicationWindow::new(application);
+
+        window.set_default_size(640, 640);
+        window.set_title("DJ Application");
+
+        vertical_box.add(&menu_bar.container);
+        vertical_box.add(&view_stack);
+
+        window.add(&vertical_box);
+        window.show_all();
+
+        menu_bar.quit.connect_activate(clone!(@weak window => move |_| {
+            window.close();
+        }));
+
+        Widgets {
+            window,
+            main_view,
+            vertical_box,
+        }
+    }
+}
+
+pub struct MenuBar {
+    container: gtk::MenuBar,
+    quit: MenuItem,
+}
+
+impl MenuBar {
+    pub fn new() -> Self {
+        let container = gtk::MenuBar::new();
+
+        let file = MenuItem::with_label("File");
+        let menu = gtk::Menu::new();
+        let quit = MenuItem::with_label("Quit");
+
+        let about = MenuItem::with_label("About");
+
+        menu.append(&quit);
+        file.set_submenu(Some(&menu));
+
+        container.append(&file);
+        container.append(&about);
+
+        MenuBar {
+            container,
+            quit,
+        }
+    }
 }
 
 fn main() {
-    let application = Application::new(
+    glib::set_program_name(Some("Rust DJ Application"));
+
+    let application = gtk::Application::new(
         Some("se.jonlil.dj"),
         Default::default(),
     )
     .expect("Failed to initialize Application");
 
-    application.connect_activate(|app| {
-        build_ui(app);
+    application.connect_startup(|app| {
+        Application::new(app);
     });
 
+    application.connect_activate(|_| {});
     application.run(&env::args().collect::<Vec<_>>());
 }
