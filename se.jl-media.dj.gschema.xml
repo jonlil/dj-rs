@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<schemalist>
+    <schema id="se.jl-media.dj" path="/se/jl-media/dj/">
+        <key name="is-switch-enabled" type="b">
+            <default>false</default>
+            <description>Default switch state</description>
+        </key>
+        <key name="window-width" type="i">
+            <default>-1</default>
+            <description>Default window width</description>
+        </key>
+        <key name="window-height" type="i">
+            <default>-1</default>
+            <description>Default window height</description>
+        </key>
+        <key name="is-maximized" type="b">
+            <default>false</default>
+            <description>Default window maximized behaviour</description>
+        </key>
+    </schema>
+</schemalist>

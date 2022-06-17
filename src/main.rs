@@ -1,112 +1,103 @@
-extern crate gtk;
-extern crate gio;
-extern crate glib;
+mod custom_button;
+mod custom_window;
 
-mod views;
-
+use gio::{Settings, SettingsBindFlags};
+use glib::BindingFlags;
+use gtk4 as gtk;
 use gtk::prelude::*;
-use gio::prelude::*;
-
-use glib::clone;
-
-use gtk::{
-    ApplicationWindow,
-    Orientation,
-    MenuItem
-};
-
-use std::rc::Rc;
-use std::env;
-
-pub struct Application {
-    pub widgets: Rc<Widgets>,
-}
-
-impl Application {
-    pub fn new(app: &gtk::Application) -> Self {
-        let app = Application {
-            widgets: Rc::new(Widgets::new(app)),
-        };
-
-        app
-    }
-}
-
-pub struct Widgets {
-    pub window: ApplicationWindow,
-    pub main_view: views::MainView,
-    pub vertical_box: gtk::Box,
-}
-
-impl Widgets {
-    pub fn new(application: &gtk::Application) -> Self {
-        let main_view = views::MainView::new();
-        let menu_bar = MenuBar::new();
-        let vertical_box = gtk::Box::new(Orientation::Vertical, 10);
-        let window = ApplicationWindow::new(application);
-
-        window.set_default_size(640, 640);
-        window.set_title("DJ Application");
-
-        vertical_box.pack_start(&menu_bar.container, false, false, 0);
-        vertical_box.pack_start(&main_view.container, true, true, 0);
-
-        window.add(&vertical_box);
-        window.show_all();
-
-        menu_bar.quit.connect_activate(clone!(@weak window => move |_| {
-            window.close();
-        }));
-
-        Widgets {
-            window,
-            main_view,
-            vertical_box,
-        }
-    }
-}
-
-pub struct MenuBar {
-    container: gtk::MenuBar,
-    quit: MenuItem,
-}
-
-impl MenuBar {
-    pub fn new() -> Self {
-        let container = gtk::MenuBar::new();
-
-        let file = MenuItem::with_label("File");
-        let menu = gtk::Menu::new();
-        let quit = MenuItem::with_label("Quit");
-
-        let about = MenuItem::with_label("About");
-
-        menu.append(&quit);
-        file.set_submenu(Some(&menu));
-
-        container.append(&file);
-        container.append(&about);
-
-        MenuBar {
-            container,
-            quit,
-        }
-    }
-}
+use gtk::Application;
+use custom_button::CustomButton;
 
 fn main() {
-    glib::set_program_name(Some("Rust DJ Application"));
+    let app = Application::builder()
+        .application_id("se.jl-media.dj")
+        .build();
 
-    let application = gtk::Application::new(
-        Some("se.jonlil.dj"),
-        Default::default(),
-    )
-    .expect("Failed to initialize Application");
+    app.connect_activate(build_ui);
 
-    application.connect_startup(|app| {
-        Application::new(app);
-    });
+    app.run();
+}
 
-    application.connect_activate(|_| {});
-    application.run(&env::args().collect::<Vec<_>>());
+fn build_ui(app: &Application) {
+    let settings = Settings::new("se.jl-media.dj");
+    let button_1 = CustomButton::new();
+    let button_2 = CustomButton::new();
+    let switch = gtk::Switch::builder()
+        .margin_top(48)
+        .margin_bottom(48)
+        .margin_start(48)
+        .margin_end(48)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .build();
+
+    settings
+        .bind("is-switch-enabled", &switch, "state")
+        .flags(SettingsBindFlags::DEFAULT)
+        .build();
+
+    //switch.connect_state_set(move |_, is_enabled| {
+    //    settings
+    //        .set_boolean("is-switch-enabled", is_enabled)
+    //        .expect("Could not set setting.");
+    //    // Do not inhibit default handler
+    //    Inhibit(false)
+    //});
+
+    button_1
+        .bind_property("number", &button_2, "number")
+        .transform_to(|_, value| {
+            let number = value
+                .get::<i32>()
+                .expect("The property needs to be of type `i32`");
+            let incremented_number = number + 1;
+            Some(incremented_number.to_value())
+        })
+        .transform_from(|_, value| {
+            let number = value
+                .get::<i32>()
+                .expect("The property needs to be of type `i32`");
+            let decremented_number = number - 1;
+            Some(decremented_number.to_value())
+        })
+        .flags(BindingFlags::BIDIRECTIONAL | BindingFlags::SYNC_CREATE)
+        .build();
+
+    let gtk_box = gtk::Box::builder()
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .spacing(12)
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+
+    gtk_box.append(&button_1);
+    gtk_box.append(&button_2);
+    gtk_box.append(&switch);
+    build_track_ui(&gtk_box);
+
+    let window = custom_window::Window::new(app);
+    window.set_title(Some("My DJ App"));
+    window.set_child(Some(&gtk_box));
+
+    window.present();
+}
+
+fn build_track_ui(container: &gtk::Box) {
+    let list_box = gtk::ListBox::new();
+    for number in 0..=100 {
+        let label = gtk::Label::new(Some(&number.to_string()));
+        list_box.append(&label);
+    }
+
+    let scrolled_window = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_width(600)
+        .min_content_height(300)
+        .child(&list_box)
+        .build();
+    container.append(&scrolled_window);
 }
