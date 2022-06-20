@@ -9,6 +9,11 @@ edition = "2018"
 [dependencies]
 glib = "^0"
 once_cell = "1"
+waveform = "0.3.2"
+gdk-pixbuf = "0.15.11"
+gstreamer-audio = "0.18.7"
+gstreamer = "0.18.8"
+anyhow = "*"
 
 [dependencies.gtk4]
 version = "0.4.8"

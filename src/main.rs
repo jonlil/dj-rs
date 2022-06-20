@@ -1,5 +1,6 @@
 mod custom_button;
 mod custom_window;
+mod player;
 
 use gio::{Settings, SettingsBindFlags};
 use glib::BindingFlags;
@@ -7,6 +8,8 @@ use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::Application;
 use custom_button::CustomButton;
+use gstreamer::prelude::*;
+use gstreamer as gst;
 
 fn main() {
     let app = Application::builder()
@@ -36,14 +39,6 @@ fn build_ui(app: &Application) {
         .flags(SettingsBindFlags::DEFAULT)
         .build();
 
-    //switch.connect_state_set(move |_, is_enabled| {
-    //    settings
-    //        .set_boolean("is-switch-enabled", is_enabled)
-    //        .expect("Could not set setting.");
-    //    // Do not inhibit default handler
-    //    Inhibit(false)
-    //});
-
     button_1
         .bind_property("number", &button_2, "number")
         .transform_to(|_, value| {
@@ -63,6 +58,8 @@ fn build_ui(app: &Application) {
         .flags(BindingFlags::BIDIRECTIONAL | BindingFlags::SYNC_CREATE)
         .build();
 
+    gstreamer::init().expect("Failed initializing gstreamer");
+
     let gtk_box = gtk::Box::builder()
         .margin_top(12)
         .margin_bottom(12)
@@ -77,7 +74,8 @@ fn build_ui(app: &Application) {
     gtk_box.append(&button_1);
     gtk_box.append(&button_2);
     gtk_box.append(&switch);
-    build_track_ui(&gtk_box);
+    build_player_ui(&gtk_box);
+    build_library_browser_ui(&gtk_box);
 
     let window = custom_window::Window::new(app);
     window.set_title(Some("My DJ App"));
@@ -86,7 +84,7 @@ fn build_ui(app: &Application) {
     window.present();
 }
 
-fn build_track_ui(container: &gtk::Box) {
+fn build_library_browser_ui(container: &gtk::Box) {
     let list_box = gtk::ListBox::new();
     for number in 0..=100 {
         let label = gtk::Label::new(Some(&number.to_string()));
@@ -100,4 +98,8 @@ fn build_track_ui(container: &gtk::Box) {
         .child(&list_box)
         .build();
     container.append(&scrolled_window);
+}
+
+fn build_player_ui(container: &gtk::Box) {
+    player::build(&container);
 }
