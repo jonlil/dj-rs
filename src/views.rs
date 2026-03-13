@@ -685,7 +685,6 @@ impl BrowserView {
         let track_store = gtk::ListStore::new(&[
             str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t,
         ]);
-        let track_sort = gtk::TreeModelSort::new(&track_store);
 
         // ── playlist panel ───────────────────────────────────────────────────
         let pl_view = gtk::TreeView::new();
@@ -716,7 +715,7 @@ impl BrowserView {
 
         // ── track panel ──────────────────────────────────────────────────────
         let track_view = gtk::TreeView::new();
-        track_view.set_model(Some(&track_sort));
+        track_view.set_model(Some(&track_store));
         track_view.set_headers_visible(true);
         track_view.set_enable_search(false);
 
@@ -789,29 +788,17 @@ impl BrowserView {
                 gdk::DragAction::COPY,
             );
 
-            let config           = config.clone();
-            let track_store2     = track_store.clone();
-            let track_sort2      = track_sort.clone();
-            let cur_db_id        = current_track_db_id.clone();
+            let config    = config.clone();
+            let cur_db_id = current_track_db_id.clone();
             track_view.connect_drag_data_get(move |view, _ctx, sel, _info, _time| {
                 let selection = view.get_selection();
-                if let Some((sort_model, sort_iter)) = selection.get_selected() {
-                    // Convert sort iter to base store iter
-                    let ts: gtk::TreeModelSort = sort_model.downcast().unwrap_or_else(|_| track_sort2.clone());
-                    let base_iter = ts.convert_iter_to_child_iter(&sort_iter);
-                    let raw: String = track_store2
-                        .get_value(&base_iter, T_FILE_PATH as i32)
-                        .get::<String>()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    // Update current_track_db_id
-                    let id_str: String = track_store2
-                        .get_value(&base_iter, T_TRACK_ID as i32)
-                        .get::<String>()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
+                if let Some((model, iter)) = selection.get_selected() {
+                    let raw: String = model
+                        .get_value(&iter, T_FILE_PATH as i32)
+                        .get::<String>().ok().flatten().unwrap_or_default();
+                    let id_str: String = model
+                        .get_value(&iter, T_TRACK_ID as i32)
+                        .get::<String>().ok().flatten().unwrap_or_default();
                     if let Ok(id) = id_str.parse::<i64>() {
                         *cur_db_id.borrow_mut() = Some(id);
                     }
@@ -823,10 +810,8 @@ impl BrowserView {
 
         // ── track right-click context menu ───────────────────────────────────
         if let Some(on_queue) = on_queue {
-            let config       = config.clone();
-            let track_store2 = track_store.clone();
-            let track_sort2  = track_sort.clone();
-            let cur_db_id    = current_track_db_id.clone();
+            let config    = config.clone();
+            let cur_db_id = current_track_db_id.clone();
             track_view.connect_button_press_event(move |view, event| {
                 if event.get_button() != 3 { return gtk::Inhibit(false); }
                 let selection = view.get_selection();
@@ -841,29 +826,19 @@ impl BrowserView {
                 let menu = gtk::Menu::new();
                 let queue_item = gtk::MenuItem::with_label("Queue");
                 {
-                    let on_queue     = on_queue.clone();
-                    let config       = config.clone();
-                    let view         = view.clone();
-                    let track_store3 = track_store2.clone();
-                    let track_sort3  = track_sort2.clone();
-                    let cur_db_id2   = cur_db_id.clone();
+                    let on_queue   = on_queue.clone();
+                    let config     = config.clone();
+                    let view       = view.clone();
+                    let cur_db_id2 = cur_db_id.clone();
                     queue_item.connect_activate(move |_| {
                         let sel = view.get_selection();
-                        if let Some((sort_model, sort_iter)) = sel.get_selected() {
-                            let ts: gtk::TreeModelSort = sort_model.downcast().unwrap_or_else(|_| track_sort3.clone());
-                            let base_iter = ts.convert_iter_to_child_iter(&sort_iter);
-                            let raw: String = track_store3
-                                .get_value(&base_iter, T_FILE_PATH as i32)
-                                .get::<String>()
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            let id_str: String = track_store3
-                                .get_value(&base_iter, T_TRACK_ID as i32)
-                                .get::<String>()
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
+                        if let Some((model, iter)) = sel.get_selected() {
+                            let raw: String = model
+                                .get_value(&iter, T_FILE_PATH as i32)
+                                .get::<String>().ok().flatten().unwrap_or_default();
+                            let id_str: String = model
+                                .get_value(&iter, T_TRACK_ID as i32)
+                                .get::<String>().ok().flatten().unwrap_or_default();
                             if let Ok(id) = id_str.parse::<i64>() {
                                 *cur_db_id2.borrow_mut() = Some(id);
                             }
@@ -994,13 +969,6 @@ impl BrowserView {
                     Ok(lib) => {
                         // Populate key combo
                         if let Ok(keys) = lib.all_keys() {
-                            // Remove all except "Any"
-                            while key_combo2.get_active() != Some(0) || {
-                                key_combo2.set_active(Some(0));
-                                // remove items after index 0
-                                false
-                            } {}
-                            // Clear and re-add
                             key_combo2.remove_all();
                             key_combo2.append_text("Any");
                             for k in &keys {
@@ -1670,25 +1638,17 @@ impl BrowserView {
 
         // ── track selection: My Tags + Rating ────────────────────────────────
         {
-            let library      = library.clone();
-            let track_store2 = track_store.clone();
-            let track_sort2  = track_sort.clone();
-            let tags_label2  = tags_label.clone();
-            // Clone star buttons for the rating callback
+            let library           = library.clone();
+            let track_store2      = track_store.clone();
+            let tags_label2       = tags_label.clone();
             let star_btns_rc: Vec<gtk::Button> = star_btns.clone();
             let clear_rating_btn2 = clear_rating_btn.clone();
 
             track_view.get_selection().connect_changed(move |sel| {
-                if let Some((sort_model, sort_iter)) = sel.get_selected() {
-                    let ts: gtk::TreeModelSort = sort_model.downcast().unwrap_or_else(|_| track_sort2.clone());
-                    let base_iter = ts.convert_iter_to_child_iter(&sort_iter);
-
-                    let id_str: String = track_store2
-                        .get_value(&base_iter, T_TRACK_ID as i32)
-                        .get::<String>()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
+                if let Some((model, iter)) = sel.get_selected() {
+                    let id_str: String = model
+                        .get_value(&iter, T_TRACK_ID as i32)
+                        .get::<String>().ok().flatten().unwrap_or_default();
                     let track_id: i64 = id_str.parse().unwrap_or(0);
 
                     if let Some(lib) = library.borrow().as_ref() {
@@ -1701,52 +1661,37 @@ impl BrowserView {
                         }
                     }
 
-                    // Wire rating buttons for this track
                     for (i, btn) in star_btns_rc.iter().enumerate() {
-                        let rating_val = (i + 1) as i32;
-                        let library2   = library.clone();
+                        let rating_val   = (i + 1) as i32;
+                        let library2     = library.clone();
                         let track_store3 = track_store2.clone();
-                        let track_sort3  = track_sort2.clone();
-                        let sel2 = sel.clone();
+                        let sel2         = sel.clone();
                         btn.connect_clicked(move |_| {
-                            if let Some((sm, si)) = sel2.get_selected() {
-                                let ts2: gtk::TreeModelSort = sm.downcast().unwrap_or_else(|_| track_sort3.clone());
-                                let bi = ts2.convert_iter_to_child_iter(&si);
+                            if let Some((_, si)) = sel2.get_selected() {
                                 let tid_str: String = track_store3
-                                    .get_value(&bi, T_TRACK_ID as i32)
-                                    .get::<String>()
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_default();
+                                    .get_value(&si, T_TRACK_ID as i32)
+                                    .get::<String>().ok().flatten().unwrap_or_default();
                                 let tid: i64 = tid_str.parse().unwrap_or(0);
                                 if let Some(lib) = library2.borrow().as_ref() {
                                     let _ = lib.set_rating(tid, rating_val);
-                                    // Update the store
-                                    track_store3.set_value(&bi, T_RATING, &rating_stars(rating_val).to_value());
+                                    track_store3.set_value(&si, T_RATING, &rating_stars(rating_val).to_value());
                                 }
                             }
                         });
                     }
-                    // Clear rating button
                     {
                         let library2     = library.clone();
                         let track_store3 = track_store2.clone();
-                        let track_sort3  = track_sort2.clone();
-                        let sel2 = sel.clone();
+                        let sel2         = sel.clone();
                         clear_rating_btn2.connect_clicked(move |_| {
-                            if let Some((sm, si)) = sel2.get_selected() {
-                                let ts2: gtk::TreeModelSort = sm.downcast().unwrap_or_else(|_| track_sort3.clone());
-                                let bi = ts2.convert_iter_to_child_iter(&si);
+                            if let Some((_, si)) = sel2.get_selected() {
                                 let tid_str: String = track_store3
-                                    .get_value(&bi, T_TRACK_ID as i32)
-                                    .get::<String>()
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_default();
+                                    .get_value(&si, T_TRACK_ID as i32)
+                                    .get::<String>().ok().flatten().unwrap_or_default();
                                 let tid: i64 = tid_str.parse().unwrap_or(0);
                                 if let Some(lib) = library2.borrow().as_ref() {
                                     let _ = lib.set_rating(tid, 0);
-                                    track_store3.set_value(&bi, T_RATING, &"".to_value());
+                                    track_store3.set_value(&si, T_RATING, &"".to_value());
                                 }
                             }
                         });
@@ -1959,7 +1904,7 @@ fn browser_populate_tracks(store: &gtk::ListStore, tracks: &[Track]) {
         let genre     = t.genre.as_deref().unwrap_or("").to_string();
         let rating    = rating_stars(t.rating.unwrap_or(0)).to_string();
         let label     = t.label.as_deref().unwrap_or("").to_string();
-        let color_id  = t.color_id.map(|c| c.to_string()).unwrap_or_default();
+        let color_id  = t.color_id.as_deref().unwrap_or("").to_string();
         let track_id  = t.id.to_string();
         store.insert_with_values(
             None,

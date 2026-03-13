@@ -29,8 +29,7 @@ pub struct Track {
     pub file_path: Option<String>,
     pub track_no: Option<i32>,
     pub label: Option<String>,
-    pub color_id: Option<i32>,
-    pub comment: Option<String>,
+    pub color_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +92,6 @@ fn map_track_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         track_no:      row.get(11)?,
         label:         row.get(12)?,
         color_id:      row.get(13)?,
-        comment:       row.get(14)?,
     })
 }
 
@@ -117,7 +115,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, c.TrackNo,
-                    l.Name, c.ColorID, c.Comment
+                    l.Name, c.ColorID
              FROM djmdContent c
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
              LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
@@ -171,7 +169,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, sp.TrackNo,
-                    l.Name, c.ColorID, c.Comment
+                    l.Name, c.ColorID
              FROM djmdSongPlaylist sp
              JOIN  djmdContent  c  ON sp.ContentID = c.ID
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
@@ -285,7 +283,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, c.TrackNo,
-                    l.Name, c.ColorID, c.Comment
+                    l.Name, c.ColorID
              FROM djmdContent c
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
              LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
@@ -294,7 +292,7 @@ impl Library {
              LEFT JOIN djmdLabel   l  ON c.LabelID   = l.ID
              WHERE c.rb_local_deleted = 0
                AND (c.Title   LIKE ?1 OR a.Name  LIKE ?1 OR al.Name LIKE ?1
-                    OR g.Name LIKE ?1 OR l.Name  LIKE ?1 OR c.Comment LIKE ?1
+                    OR g.Name LIKE ?1 OR l.Name  LIKE ?1 
                     OR k.ScaleName LIKE ?1)
              ORDER BY a.Name, c.Title
              LIMIT 200",
@@ -338,7 +336,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, c.TrackNo,
-                    l.Name, c.ColorID, c.Comment
+                    l.Name, c.ColorID
              FROM djmdContent c
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
              LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
@@ -393,7 +391,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, sp.TrackNo,
-                    l.Name, c.ColorID, c.Comment
+                    l.Name, c.ColorID
              FROM djmdSongPlaylist sp
              JOIN  djmdContent  c  ON sp.ContentID = c.ID
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
@@ -484,7 +482,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, sh.TrackNo,
-                    l.Name, c.ColorID, c.Comment
+                    l.Name, c.ColorID
              FROM djmdSongHistory sh
              JOIN  djmdContent  c  ON sh.ContentID = c.ID
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
