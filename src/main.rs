@@ -51,9 +51,11 @@ impl Widgets {
         window.set_title("DJ Application");
 
         let cfg = std::rc::Rc::new(std::cell::RefCell::new(config::Config::load()));
-        let main_view    = views::MainView::new(&window);
-        let queue_fn     = main_view.queue_fn.clone();
-        let browser_view = views::BrowserView::new(&window, cfg, Some(queue_fn));
+        let main_view            = views::MainView::new(&window);
+        let queue_fn             = main_view.queue_fn.clone();
+        let current_track_db_id  = main_view.current_track_db_id.clone();
+        let on_track_end         = main_view.on_track_end.clone();
+        let browser_view = views::BrowserView::new(&window, cfg, Some(queue_fn), current_track_db_id, on_track_end);
         let menu_bar     = MenuBar::new();
         let vertical_box = gtk::Box::new(Orientation::Vertical, 0);
 

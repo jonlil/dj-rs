@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use glib::types::StaticType;
 use crate::deck::{DeckState, list_output_devices, default_device_index};
 use crate::config::{Config, PathMapping};
-use crate::rekordbox::{Library, Track, Playlist};
+use crate::rekordbox::{Library, Track, Playlist, HistorySession, TrackFilter, compatible_camelot_keys};
 use crate::dlna::{DlnaClient, Renderer, ssdp_blocked_by_vpn, lan_ip};
 
 fn fmt_time(secs: f64) -> String {
@@ -12,16 +12,31 @@ fn fmt_time(secs: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+fn rating_stars(r: i32) -> &'static str {
+    match r {
+        1 => "★",
+        2 => "★★",
+        3 => "★★★",
+        4 => "★★★★",
+        5 => "★★★★★",
+        _ => "",
+    }
+}
+
 pub struct PlayerView {
     pub container: gtk::Frame,
     pub volume_scale: gtk::Scale,
     pub state: Rc<RefCell<DeckState>>,
     pub queue_fn: Rc<dyn Fn(std::path::PathBuf)>,
+    pub current_track_db_id: Rc<RefCell<Option<i64>>>,
+    pub on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
 }
 
 impl PlayerView {
     pub fn new(window: &gtk::ApplicationWindow, deck_label: &str) -> Self {
         let state = Rc::new(RefCell::new(DeckState::new()));
+        let current_track_db_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+        let on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
 
         let frame = gtk::Frame::new(Some(deck_label));
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -336,7 +351,6 @@ impl PlayerView {
                 if let Some(path) = file_path {
                     match dlna.start_http_server(path.clone()) {
                         Ok(url) => {
-                            // If already playing, also start playback on the renderer
                             let is_playing = state.borrow().play_started_at.is_some();
                             if is_playing {
                                 match dlna.play_on_renderer(renderer.location.clone(), url) {
@@ -345,7 +359,6 @@ impl PlayerView {
                                 }
                             } else {
                                 dlna_status_lbl.set_text(&format!("⏸ {} (press Play)", renderer.friendly_name));
-                                // Pre-load the track on the renderer so Play works immediately
                                 let _ = dlna.set_uri_on_renderer(renderer.location.clone(), url);
                             }
                         }
@@ -416,14 +429,12 @@ impl PlayerView {
                 next_label.set_text("Next: —");
                 next_btn_ref.set_sensitive(false);
 
-                // Load and play locally
                 do_load(path.clone());
                 state.borrow_mut().play();
                 if state.borrow().play_started_at.is_some() {
                     play_btn.set_label("Pause");
                 }
 
-                // Play on renderer if one is active
                 if let Some(r) = active_renderer.borrow().clone() {
                     match dlna.start_http_server(path) {
                         Ok(url) => {
@@ -445,17 +456,19 @@ impl PlayerView {
 
         // --- Position update timer (always running) ---
         {
-            let state           = state.clone();
-            let queued_path     = queued_path.clone();
-            let do_load         = do_load_track.clone();
-            let position_scale  = position_scale.clone();
-            let time_label      = time_label.clone();
-            let play_btn        = play_btn.clone();
-            let next_label      = next_label.clone();
-            let next_btn        = next_btn.clone();
-            let dlna            = dlna.clone();
-            let active_renderer = active_renderer.clone();
-            let dlna_status_lbl = dlna_status_lbl.clone();
+            let state                = state.clone();
+            let queued_path          = queued_path.clone();
+            let do_load              = do_load_track.clone();
+            let position_scale       = position_scale.clone();
+            let time_label           = time_label.clone();
+            let play_btn             = play_btn.clone();
+            let next_label           = next_label.clone();
+            let next_btn             = next_btn.clone();
+            let dlna                 = dlna.clone();
+            let active_renderer      = active_renderer.clone();
+            let dlna_status_lbl      = dlna_status_lbl.clone();
+            let current_track_db_id2 = current_track_db_id.clone();
+            let on_track_end2        = on_track_end.clone();
             glib::timeout_add_local(100, move || {
 
                 // Check if track ended naturally
@@ -465,6 +478,16 @@ impl PlayerView {
                 };
 
                 if is_started && sink_empty {
+                    // Fire the on_track_end callback
+                    {
+                        let maybe_cb = on_track_end2.borrow().clone();
+                        if let Some(cb) = maybe_cb {
+                            if let Some(id) = *current_track_db_id2.borrow() {
+                                cb(id);
+                            }
+                        }
+                    }
+
                     {
                         let mut st = state.borrow_mut();
                         st.play_started_at = None;
@@ -517,13 +540,22 @@ impl PlayerView {
             });
         }
 
-        PlayerView { container: frame, volume_scale, state, queue_fn }
+        PlayerView {
+            container: frame,
+            volume_scale,
+            state,
+            queue_fn,
+            current_track_db_id,
+            on_track_end,
+        }
     }
 }
 
 pub struct MainView {
     pub container: gtk::Box,
     pub queue_fn: Rc<dyn Fn(std::path::PathBuf)>,
+    pub current_track_db_id: Rc<RefCell<Option<i64>>>,
+    pub on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
 }
 
 impl MainView {
@@ -533,6 +565,8 @@ impl MainView {
 
         let player = PlayerView::new(window, "Deck");
         let queue_fn = player.queue_fn.clone();
+        let current_track_db_id = player.current_track_db_id.clone();
+        let on_track_end = player.on_track_end.clone();
 
         {
             let state = player.state.clone();
@@ -543,7 +577,7 @@ impl MainView {
 
         container.pack_start(&player.container, true, true, 0);
 
-        MainView { container, queue_fn }
+        MainView { container, queue_fn, current_track_db_id, on_track_end }
     }
 }
 
@@ -552,14 +586,19 @@ impl MainView {
 const P_NAME:  u32 = 0;  // playlist name
 const P_COUNT: u32 = 1;  // track count (display string)
 const P_ID:    u32 = 2;  // id as string, "all" for the catch-all row
-const P_ATTR:  u32 = 3;  // attribute: "0" = playlist, "1" = folder
+const P_ATTR:  u32 = 3;  // attribute: "0" = playlist, "1" = folder, "h" = history
 
-const T_TITLE:     u32 = 0;
-const T_ARTIST:    u32 = 1;
-const T_BPM:       u32 = 2;
-const T_KEY:       u32 = 3;
-const T_DURATION:  u32 = 4;
-const T_FILE_PATH: u32 = 5;  // hidden column, not shown in TreeView
+const T_TITLE:    u32 = 0;
+const T_ARTIST:   u32 = 1;
+const T_BPM:      u32 = 2;
+const T_KEY:      u32 = 3;
+const T_DURATION: u32 = 4;
+const T_FILE_PATH: u32 = 5;  // hidden column
+const T_GENRE:    u32 = 6;
+const T_RATING:   u32 = 7;
+const T_LABEL:    u32 = 8;
+const T_COLOR:    u32 = 9;   // color_id as string, hidden
+const T_TRACK_ID: u32 = 10;  // db id as string, hidden
 
 // ─── BrowserView ─────────────────────────────────────────────────────────────
 
@@ -568,9 +607,20 @@ pub struct BrowserView {
 }
 
 impl BrowserView {
-    pub fn new(window: &gtk::ApplicationWindow, config: Rc<RefCell<Config>>, on_queue: Option<Rc<dyn Fn(std::path::PathBuf)>>) -> Self {
+    pub fn new(
+        window: &gtk::ApplicationWindow,
+        config: Rc<RefCell<Config>>,
+        on_queue: Option<Rc<dyn Fn(std::path::PathBuf)>>,
+        current_track_db_id: Rc<RefCell<Option<i64>>>,
+        on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+    ) -> Self {
         let library: Rc<RefCell<Option<Library>>> = Rc::new(RefCell::new(None));
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+        // Current playlist selection: None = All Tracks, Some(id) = playlist
+        let current_playlist_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
+        // Current key for harmonic mode
+        let harmonic_key: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // ── top bar ──────────────────────────────────────────────────────────
         let topbar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -586,10 +636,56 @@ impl BrowserView {
         topbar.pack_start(&status_lbl,   false, false, 8);
         topbar.pack_end(&search_entry,   false, false, 0);
 
+        // ── filter bar ───────────────────────────────────────────────────────
+        let filter_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        filter_bar.set_border_width(4);
+
+        filter_bar.pack_start(&gtk::Label::new(Some("BPM:")), false, false, 0);
+        let bpm_min_spin = gtk::SpinButton::with_range(0.0, 250.0, 1.0);
+        bpm_min_spin.set_value(0.0);
+        bpm_min_spin.set_tooltip_text(Some("Min BPM (0 = no filter)"));
+        filter_bar.pack_start(&bpm_min_spin, false, false, 0);
+        filter_bar.pack_start(&gtk::Label::new(Some("–")), false, false, 0);
+        let bpm_max_spin = gtk::SpinButton::with_range(0.0, 250.0, 1.0);
+        bpm_max_spin.set_value(0.0);
+        bpm_max_spin.set_tooltip_text(Some("Max BPM (0 = no filter)"));
+        filter_bar.pack_start(&bpm_max_spin, false, false, 0);
+
+        filter_bar.pack_start(&gtk::Label::new(Some("Key:")), false, false, 0);
+        let key_combo = gtk::ComboBoxText::new();
+        key_combo.append_text("Any");
+        filter_bar.pack_start(&key_combo, false, false, 0);
+
+        filter_bar.pack_start(&gtk::Label::new(Some("Genre:")), false, false, 0);
+        let genre_combo = gtk::ComboBoxText::new();
+        genre_combo.append_text("Any");
+        filter_bar.pack_start(&genre_combo, false, false, 0);
+
+        filter_bar.pack_start(&gtk::Label::new(Some("Rating:")), false, false, 0);
+        let rating_combo = gtk::ComboBoxText::new();
+        for label in &["Any", "★+", "★★+", "★★★+", "★★★★+", "★★★★★"] {
+            rating_combo.append_text(label);
+        }
+        rating_combo.set_active(Some(0));
+        filter_bar.pack_start(&rating_combo, false, false, 0);
+
+        let harmonic_btn = gtk::ToggleButton::with_label("Harmonic");
+        let harmonic_key_lbl = gtk::Label::new(Some(""));
+        harmonic_key_lbl.set_hexpand(true);
+        filter_bar.pack_start(&harmonic_btn, false, false, 0);
+        filter_bar.pack_start(&harmonic_key_lbl, false, false, 0);
+
+        let clear_btn = gtk::Button::with_label("Clear");
+        filter_bar.pack_end(&clear_btn, false, false, 0);
+
         // ── stores ───────────────────────────────────────────────────────────
         let str_t = String::static_type();
         let pl_store = gtk::ListStore::new(&[str_t, str_t, str_t, str_t]);
-        let track_store = gtk::ListStore::new(&[str_t, str_t, str_t, str_t, str_t, str_t]);
+        // 11 columns: title, artist, bpm, key, duration, file_path, genre, rating, label, color_id, track_id
+        let track_store = gtk::ListStore::new(&[
+            str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t,
+        ]);
+        let track_sort = gtk::TreeModelSort::new(&track_store);
 
         // ── playlist panel ───────────────────────────────────────────────────
         let pl_view = gtk::TreeView::new();
@@ -620,16 +716,19 @@ impl BrowserView {
 
         // ── track panel ──────────────────────────────────────────────────────
         let track_view = gtk::TreeView::new();
-        track_view.set_model(Some(&track_store));
+        track_view.set_model(Some(&track_sort));
         track_view.set_headers_visible(true);
         track_view.set_enable_search(false);
 
         for &(title, idx, expand) in &[
-            ("Title",   T_TITLE as i32,    true),
-            ("Artist",  T_ARTIST as i32,   true),
-            ("BPM",     T_BPM as i32,      false),
-            ("Key",     T_KEY as i32,      false),
-            ("Time",    T_DURATION as i32, false),
+            ("Title",  T_TITLE as i32,    true),
+            ("Artist", T_ARTIST as i32,   true),
+            ("BPM",    T_BPM as i32,      false),
+            ("Key",    T_KEY as i32,      false),
+            ("Time",   T_DURATION as i32, false),
+            ("Genre",  T_GENRE as i32,    false),
+            ("Rating", T_RATING as i32,   false),
+            ("Label",  T_LABEL as i32,    false),
         ] {
             let col = gtk::TreeViewColumn::new();
             let cell = gtk::CellRendererText::new();
@@ -638,8 +737,29 @@ impl BrowserView {
             col.set_title(title);
             col.set_expand(expand);
             col.set_resizable(true);
+            col.set_sort_column_id(idx);
             track_view.append_column(&col);
         }
+
+        // Tags label (below track list)
+        let tags_label = gtk::Label::new(Some("Tags: —"));
+        tags_label.set_xalign(0.0);
+        tags_label.set_margin_start(4);
+        tags_label.set_margin_end(4);
+
+        // Rating row for selected track
+        let rating_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        rating_row.set_margin_start(4);
+        rating_row.pack_start(&gtk::Label::new(Some("Set rating:")), false, false, 0);
+        let mut star_btns: Vec<gtk::Button> = Vec::new();
+        for i in 1..=5i32 {
+            let lbl: String = (0..i).map(|_| "★").collect();
+            let btn = gtk::Button::with_label(&lbl);
+            rating_row.pack_start(&btn, false, false, 0);
+            star_btns.push(btn);
+        }
+        let clear_rating_btn = gtk::Button::with_label("✕");
+        rating_row.pack_start(&clear_rating_btn, false, false, 0);
 
         let track_scroll = gtk::ScrolledWindow::new(
             gtk::NONE_ADJUSTMENT,
@@ -649,6 +769,12 @@ impl BrowserView {
         track_scroll.add(&track_view);
         track_scroll.set_hexpand(true);
         track_scroll.set_vexpand(true);
+
+        // Track panel vbox: scroll + tags + rating
+        let track_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        track_panel.pack_start(&track_scroll, true, true, 0);
+        track_panel.pack_start(&tags_label, false, false, 2);
+        track_panel.pack_start(&rating_row, false, false, 2);
 
         // ── drag source on track list ─────────────────────────────────────────
         {
@@ -663,16 +789,32 @@ impl BrowserView {
                 gdk::DragAction::COPY,
             );
 
-            let config = config.clone();
+            let config           = config.clone();
+            let track_store2     = track_store.clone();
+            let track_sort2      = track_sort.clone();
+            let cur_db_id        = current_track_db_id.clone();
             track_view.connect_drag_data_get(move |view, _ctx, sel, _info, _time| {
                 let selection = view.get_selection();
-                if let Some((model, iter)) = selection.get_selected() {
-                    let raw: String = model
-                        .get_value(&iter, T_FILE_PATH as i32)
+                if let Some((sort_model, sort_iter)) = selection.get_selected() {
+                    // Convert sort iter to base store iter
+                    let ts: gtk::TreeModelSort = sort_model.downcast().unwrap_or_else(|_| track_sort2.clone());
+                    let base_iter = ts.convert_iter_to_child_iter(&sort_iter);
+                    let raw: String = track_store2
+                        .get_value(&base_iter, T_FILE_PATH as i32)
                         .get::<String>()
                         .ok()
                         .flatten()
                         .unwrap_or_default();
+                    // Update current_track_db_id
+                    let id_str: String = track_store2
+                        .get_value(&base_iter, T_TRACK_ID as i32)
+                        .get::<String>()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if let Ok(id) = id_str.parse::<i64>() {
+                        *cur_db_id.borrow_mut() = Some(id);
+                    }
                     let mapped = config.borrow().apply_mappings(&raw);
                     sel.set_text(&mapped);
                 }
@@ -681,7 +823,10 @@ impl BrowserView {
 
         // ── track right-click context menu ───────────────────────────────────
         if let Some(on_queue) = on_queue {
-            let config = config.clone();
+            let config       = config.clone();
+            let track_store2 = track_store.clone();
+            let track_sort2  = track_sort.clone();
+            let cur_db_id    = current_track_db_id.clone();
             track_view.connect_button_press_event(move |view, event| {
                 if event.get_button() != 3 { return gtk::Inhibit(false); }
                 let selection = view.get_selection();
@@ -696,18 +841,32 @@ impl BrowserView {
                 let menu = gtk::Menu::new();
                 let queue_item = gtk::MenuItem::with_label("Queue");
                 {
-                    let on_queue = on_queue.clone();
-                    let config   = config.clone();
-                    let view     = view.clone();
+                    let on_queue     = on_queue.clone();
+                    let config       = config.clone();
+                    let view         = view.clone();
+                    let track_store3 = track_store2.clone();
+                    let track_sort3  = track_sort2.clone();
+                    let cur_db_id2   = cur_db_id.clone();
                     queue_item.connect_activate(move |_| {
                         let sel = view.get_selection();
-                        if let Some((model, iter)) = sel.get_selected() {
-                            let raw: String = model
-                                .get_value(&iter, T_FILE_PATH as i32)
+                        if let Some((sort_model, sort_iter)) = sel.get_selected() {
+                            let ts: gtk::TreeModelSort = sort_model.downcast().unwrap_or_else(|_| track_sort3.clone());
+                            let base_iter = ts.convert_iter_to_child_iter(&sort_iter);
+                            let raw: String = track_store3
+                                .get_value(&base_iter, T_FILE_PATH as i32)
                                 .get::<String>()
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
+                            let id_str: String = track_store3
+                                .get_value(&base_iter, T_TRACK_ID as i32)
+                                .get::<String>()
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            if let Ok(id) = id_str.parse::<i64>() {
+                                *cur_db_id2.borrow_mut() = Some(id);
+                            }
                             let mapped = config.borrow().apply_mappings(&raw);
                             on_queue(std::path::PathBuf::from(mapped));
                         }
@@ -723,38 +882,176 @@ impl BrowserView {
         // ── layout ───────────────────────────────────────────────────────────
         let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
         paned.pack1(&pl_scroll, false, false);
-        paned.pack2(&track_scroll, true, true);
+        paned.pack2(&track_panel, true, true);
         paned.set_position(220);
 
-        container.pack_start(&topbar, false, false, 0);
-        container.pack_start(&paned, true, true, 0);
+        container.pack_start(&topbar,     false, false, 0);
+        container.pack_start(&filter_bar, false, false, 0);
+        container.pack_start(&paned,      true,  true,  0);
+
+        // ── helper: build TrackFilter from current UI state ───────────────────
+        let make_filter = {
+            let bpm_min_spin2  = bpm_min_spin.clone();
+            let bpm_max_spin2  = bpm_max_spin.clone();
+            let key_combo2     = key_combo.clone();
+            let genre_combo2   = genre_combo.clone();
+            let rating_combo2  = rating_combo.clone();
+            let harmonic_btn2  = harmonic_btn.clone();
+            let harmonic_key2  = harmonic_key.clone();
+            Rc::new(move || -> TrackFilter {
+                let bpm_min_v = bpm_min_spin2.get_value() as f32;
+                let bpm_max_v = bpm_max_spin2.get_value() as f32;
+
+                // Key filter: harmonic mode overrides the key combo
+                let key_val: Option<String> = if harmonic_btn2.get_active() {
+                    // In harmonic mode we can't set a single key; caller handles it separately
+                    let k = harmonic_key2.borrow().clone();
+                    k
+                } else {
+                    let txt = key_combo2.get_active_text()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    if txt == "Any" || txt.is_empty() { None } else { Some(txt) }
+                };
+
+                let genre_val: Option<String> = {
+                    let txt = genre_combo2.get_active_text()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    if txt == "Any" || txt.is_empty() { None } else { Some(txt) }
+                };
+
+                let min_rating: Option<i32> = match rating_combo2.get_active() {
+                    Some(0) | None => None,
+                    Some(n) => Some(n as i32),
+                };
+
+                TrackFilter {
+                    bpm_min:    if bpm_min_v > 0.0 { Some(bpm_min_v) } else { None },
+                    bpm_max:    if bpm_max_v > 0.0 { Some(bpm_max_v) } else { None },
+                    key:        key_val,
+                    genre:      genre_val,
+                    min_rating,
+                }
+            })
+        };
+
+        // ── shared reload-tracks logic ────────────────────────────────────────
+        let do_reload_tracks = {
+            let library              = library.clone();
+            let track_store2         = track_store.clone();
+            let status_lbl2          = status_lbl.clone();
+            let current_playlist_id2 = current_playlist_id.clone();
+            let make_filter2         = make_filter.clone();
+            Rc::new(move || {
+                if let Some(lib) = library.borrow().as_ref() {
+                    let f = make_filter2();
+                    let is_all_active = f.bpm_min.is_none()
+                        && f.bpm_max.is_none()
+                        && f.key.is_none()
+                        && f.genre.is_none()
+                        && f.min_rating.is_none();
+
+                    let result = match *current_playlist_id2.borrow() {
+                        None => {
+                            if is_all_active {
+                                lib.tracks()
+                            } else {
+                                lib.filter_tracks(&f)
+                            }
+                        }
+                        Some(pid) => {
+                            if is_all_active {
+                                lib.playlist_tracks(pid)
+                            } else {
+                                lib.filter_playlist_tracks(pid, &f)
+                            }
+                        }
+                    };
+                    if let Ok(tracks) = result {
+                        let n = tracks.len();
+                        browser_populate_tracks(&track_store2, &tracks);
+                        status_lbl2.set_text(&format!("{} tracks", n));
+                    }
+                }
+            })
+        };
 
         // ── shared open-library logic ─────────────────────────────────────────
         let do_open_library = {
-            let library     = library.clone();
-            let pl_store    = pl_store.clone();
-            let track_store = track_store.clone();
-            let status_lbl  = status_lbl.clone();
-            let config      = config.clone();
-            let window      = window.clone();
+            let library              = library.clone();
+            let pl_store2            = pl_store.clone();
+            let track_store2         = track_store.clone();
+            let status_lbl2          = status_lbl.clone();
+            let config2              = config.clone();
+            let window2              = window.clone();
+            let on_track_end2        = on_track_end.clone();
+            let key_combo2           = key_combo.clone();
+            let genre_combo2         = genre_combo.clone();
 
             Rc::new(move |path_str: &str| {
                 match Library::open(path_str) {
                     Ok(lib) => {
-                        if let Ok(lists) = lib.playlists() {
-                            browser_populate_playlists(&pl_store, &lists);
+                        // Populate key combo
+                        if let Ok(keys) = lib.all_keys() {
+                            // Remove all except "Any"
+                            while key_combo2.get_active() != Some(0) || {
+                                key_combo2.set_active(Some(0));
+                                // remove items after index 0
+                                false
+                            } {}
+                            // Clear and re-add
+                            key_combo2.remove_all();
+                            key_combo2.append_text("Any");
+                            for k in &keys {
+                                key_combo2.append_text(k);
+                            }
+                            key_combo2.set_active(Some(0));
                         }
+                        // Populate genre combo
+                        if let Ok(genres) = lib.all_genres() {
+                            genre_combo2.remove_all();
+                            genre_combo2.append_text("Any");
+                            for g in &genres {
+                                genre_combo2.append_text(g);
+                            }
+                            genre_combo2.set_active(Some(0));
+                        }
+
+                        // Populate playlists (including history)
+                        let lists = lib.playlists().unwrap_or_default();
+                        let sessions = lib.history_sessions().unwrap_or_default();
+                        browser_populate_playlists(&pl_store2, &lists, &sessions);
+
                         if let Ok(tracks) = lib.tracks() {
-                            browser_populate_tracks(&track_store, &tracks);
-                            status_lbl.set_text(&format!("{} tracks", tracks.len()));
+                            browser_populate_tracks(&track_store2, &tracks);
+                            status_lbl2.set_text(&format!("{} tracks", tracks.len()));
                         }
-                        config.borrow_mut().db_path = Some(path_str.to_string());
-                        config.borrow().save();
+                        config2.borrow_mut().db_path = Some(path_str.to_string());
+                        config2.borrow().save();
+
+                        // Wire on_track_end callback now that library is available
+                        let lib_rc: Rc<RefCell<Option<Library>>> = {
+                            // We need a separate reference – we'll just use the outer library Rc
+                            // which we'll update below, then use a weak-ish pattern via a new Rc
+                            Rc::new(RefCell::new(None))
+                        };
+                        // We'll set this after inserting into the outer library below
+                        // (The callback will be set at the bottom of open-library)
+
                         *library.borrow_mut() = Some(lib);
+
+                        // Now set the on_track_end callback to use the library
+                        let lib_ref = library.clone();
+                        *on_track_end2.borrow_mut() = Some(Rc::new(move |id: i64| {
+                            if let Some(lib) = lib_ref.borrow().as_ref() {
+                                let _ = lib.increment_play_count(id);
+                            }
+                        }));
                     }
                     Err(e) => {
                         let d = gtk::MessageDialog::new(
-                            Some(&window),
+                            Some(&window2),
                             gtk::DialogFlags::MODAL,
                             gtk::MessageType::Error,
                             gtk::ButtonsType::Ok,
@@ -809,10 +1106,68 @@ impl BrowserView {
             });
         }
 
+        // ── filter bar callbacks ──────────────────────────────────────────────
+        {
+            let reload = do_reload_tracks.clone();
+            bpm_min_spin.connect_value_changed(move |_| reload());
+        }
+        {
+            let reload = do_reload_tracks.clone();
+            bpm_max_spin.connect_value_changed(move |_| reload());
+        }
+        {
+            let reload = do_reload_tracks.clone();
+            key_combo.connect_changed(move |_| reload());
+        }
+        {
+            let reload = do_reload_tracks.clone();
+            genre_combo.connect_changed(move |_| reload());
+        }
+        {
+            let reload = do_reload_tracks.clone();
+            rating_combo.connect_changed(move |_| reload());
+        }
+        {
+            let reload            = do_reload_tracks.clone();
+            let harmonic_key2     = harmonic_key.clone();
+            let harmonic_key_lbl2 = harmonic_key_lbl.clone();
+            harmonic_btn.connect_toggled(move |btn| {
+                if !btn.get_active() {
+                    *harmonic_key2.borrow_mut() = None;
+                    harmonic_key_lbl2.set_text("");
+                }
+                reload();
+            });
+        }
+        {
+            let reload          = do_reload_tracks.clone();
+            let bpm_min_spin2   = bpm_min_spin.clone();
+            let bpm_max_spin2   = bpm_max_spin.clone();
+            let key_combo2      = key_combo.clone();
+            let genre_combo2    = genre_combo.clone();
+            let rating_combo2   = rating_combo.clone();
+            let harmonic_btn2   = harmonic_btn.clone();
+            let harmonic_key2   = harmonic_key.clone();
+            let harmonic_key_lbl2 = harmonic_key_lbl.clone();
+            clear_btn.connect_clicked(move |_| {
+                bpm_min_spin2.set_value(0.0);
+                bpm_max_spin2.set_value(0.0);
+                key_combo2.set_active(Some(0));
+                genre_combo2.set_active(Some(0));
+                rating_combo2.set_active(Some(0));
+                if harmonic_btn2.get_active() {
+                    harmonic_btn2.set_active(false);
+                }
+                *harmonic_key2.borrow_mut() = None;
+                harmonic_key_lbl2.set_text("");
+                reload();
+            });
+        }
+
         // ── playlist right-click context menu ────────────────────────────────
         {
             let library  = library.clone();
-            let pl_store = pl_store.clone();
+            let pl_store2 = pl_store.clone();
             let pl_view2 = pl_view.clone();
             let window   = window.clone();
 
@@ -824,7 +1179,6 @@ impl BrowserView {
                     return gtk::Inhibit(false);
                 }
 
-                // Find what row (if any) was right-clicked, and its attribute
                 let (clicked_id, clicked_is_folder): (Option<i64>, bool) = {
                     let (x, y) = event.get_position();
                     let result = view.get_path_at_pos(x as i32, y as i32)
@@ -844,7 +1198,7 @@ impl BrowserView {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
-                            if id_val == "all" {
+                            if id_val == "all" || id_val == "history_header" || attr_val == "h" {
                                 None
                             } else {
                                 id_val.parse::<i64>().ok().map(|id| (id, attr_val == "1"))
@@ -862,7 +1216,7 @@ impl BrowserView {
                 let new_item = gtk::MenuItem::with_label("New Playlist…");
                 {
                     let library  = library.clone();
-                    let pl_store = pl_store.clone();
+                    let pl_store3 = pl_store2.clone();
                     let window   = window.clone();
                     new_item.connect_activate(move |_| {
                         let dialog = gtk::Dialog::new();
@@ -893,20 +1247,17 @@ impl BrowserView {
                         let result = library.borrow().as_ref().unwrap().create_playlist(name.trim(), None);
                         match result {
                             Ok(_) => {
-                                if let Ok(lists) = library.borrow().as_ref().unwrap().playlists() {
-                                    browser_populate_playlists(&pl_store, &lists);
-                                }
+                                let lib = library.borrow();
+                                let lib_ref = lib.as_ref().unwrap();
+                                let lists = lib_ref.playlists().unwrap_or_default();
+                                let sessions = lib_ref.history_sessions().unwrap_or_default();
+                                browser_populate_playlists(&pl_store3, &lists, &sessions);
                             }
                             Err(e) => {
-                                let d = gtk::MessageDialog::new(
-                                    Some(&window),
-                                    gtk::DialogFlags::MODAL,
-                                    gtk::MessageType::Error,
-                                    gtk::ButtonsType::Ok,
-                                    &format!("Failed to create playlist:\n{}", e),
-                                );
-                                d.run();
-                                d.close();
+                                let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
+                                    gtk::MessageType::Error, gtk::ButtonsType::Ok,
+                                    &format!("Failed to create playlist:\n{}", e));
+                                d.run(); d.close();
                             }
                         }
                     });
@@ -917,7 +1268,7 @@ impl BrowserView {
                 let new_folder_item = gtk::MenuItem::with_label("New Folder…");
                 {
                     let library  = library.clone();
-                    let pl_store = pl_store.clone();
+                    let pl_store3 = pl_store2.clone();
                     let window   = window.clone();
                     new_folder_item.connect_activate(move |_| {
                         let dialog = gtk::Dialog::new();
@@ -948,33 +1299,30 @@ impl BrowserView {
                         let result = library.borrow().as_ref().unwrap().create_folder(name.trim(), None);
                         match result {
                             Ok(_) => {
-                                if let Ok(lists) = library.borrow().as_ref().unwrap().playlists() {
-                                    browser_populate_playlists(&pl_store, &lists);
-                                }
+                                let lib = library.borrow();
+                                let lib_ref = lib.as_ref().unwrap();
+                                let lists = lib_ref.playlists().unwrap_or_default();
+                                let sessions = lib_ref.history_sessions().unwrap_or_default();
+                                browser_populate_playlists(&pl_store3, &lists, &sessions);
                             }
                             Err(e) => {
-                                let d = gtk::MessageDialog::new(
-                                    Some(&window),
-                                    gtk::DialogFlags::MODAL,
-                                    gtk::MessageType::Error,
-                                    gtk::ButtonsType::Ok,
-                                    &format!("Failed to create folder:\n{}", e),
-                                );
-                                d.run();
-                                d.close();
+                                let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
+                                    gtk::MessageType::Error, gtk::ButtonsType::Ok,
+                                    &format!("Failed to create folder:\n{}", e));
+                                d.run(); d.close();
                             }
                         }
                     });
                 }
                 menu.append(&new_folder_item);
 
-                // ── New Playlist in Folder (only when right-clicking a folder) ──
+                // ── New Playlist in Folder ──
                 if clicked_is_folder {
                     if let Some(folder_id) = clicked_id {
                         let new_in_folder_item = gtk::MenuItem::with_label("New Playlist in Folder…");
                         {
                             let library  = library.clone();
-                            let pl_store = pl_store.clone();
+                            let pl_store3 = pl_store2.clone();
                             let window   = window.clone();
                             new_in_folder_item.connect_activate(move |_| {
                                 let dialog = gtk::Dialog::new();
@@ -1002,23 +1350,21 @@ impl BrowserView {
                                 if response != gtk::ResponseType::Accept || name.trim().is_empty() {
                                     return;
                                 }
-                                let result = library.borrow().as_ref().unwrap().create_playlist(name.trim(), Some(folder_id));
+                                let result = library.borrow().as_ref().unwrap()
+                                    .create_playlist(name.trim(), Some(folder_id));
                                 match result {
                                     Ok(_) => {
-                                        if let Ok(lists) = library.borrow().as_ref().unwrap().playlists() {
-                                            browser_populate_playlists(&pl_store, &lists);
-                                        }
+                                        let lib = library.borrow();
+                                        let lib_ref = lib.as_ref().unwrap();
+                                        let lists = lib_ref.playlists().unwrap_or_default();
+                                        let sessions = lib_ref.history_sessions().unwrap_or_default();
+                                        browser_populate_playlists(&pl_store3, &lists, &sessions);
                                     }
                                     Err(e) => {
-                                        let d = gtk::MessageDialog::new(
-                                            Some(&window),
-                                            gtk::DialogFlags::MODAL,
-                                            gtk::MessageType::Error,
-                                            gtk::ButtonsType::Ok,
-                                            &format!("Failed to create playlist:\n{}", e),
-                                        );
-                                        d.run();
-                                        d.close();
+                                        let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
+                                            gtk::MessageType::Error, gtk::ButtonsType::Ok,
+                                            &format!("Failed to create playlist:\n{}", e));
+                                        d.run(); d.close();
                                     }
                                 }
                             });
@@ -1027,9 +1373,8 @@ impl BrowserView {
                     }
                 }
 
-                // ── Delete Playlist (only when right-clicking a real playlist) ──
+                // ── Delete Playlist ──
                 if let Some(pid) = clicked_id {
-                    // Select the row so the user sees what's being deleted
                     if let Some((path, _, _, _)) = pl_view2.get_path_at_pos(
                         event.get_position().0 as i32,
                         event.get_position().1 as i32,
@@ -1042,7 +1387,7 @@ impl BrowserView {
                     let del_item = gtk::MenuItem::with_label("Delete Playlist");
                     {
                         let library  = library.clone();
-                        let pl_store = pl_store.clone();
+                        let pl_store3 = pl_store2.clone();
                         let window   = window.clone();
                         del_item.connect_activate(move |_| {
                             let confirm = gtk::MessageDialog::new(
@@ -1060,20 +1405,17 @@ impl BrowserView {
                             let result = library.borrow().as_ref().unwrap().delete_playlist(pid);
                             match result {
                                 Ok(_) => {
-                                    if let Ok(lists) = library.borrow().as_ref().unwrap().playlists() {
-                                        browser_populate_playlists(&pl_store, &lists);
-                                    }
+                                    let lib = library.borrow();
+                                    let lib_ref = lib.as_ref().unwrap();
+                                    let lists = lib_ref.playlists().unwrap_or_default();
+                                    let sessions = lib_ref.history_sessions().unwrap_or_default();
+                                    browser_populate_playlists(&pl_store3, &lists, &sessions);
                                 }
                                 Err(e) => {
-                                    let d = gtk::MessageDialog::new(
-                                        Some(&window),
-                                        gtk::DialogFlags::MODAL,
-                                        gtk::MessageType::Error,
-                                        gtk::ButtonsType::Ok,
-                                        &format!("Failed to delete playlist:\n{}", e),
-                                    );
-                                    d.run();
-                                    d.close();
+                                    let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
+                                        gtk::MessageType::Error, gtk::ButtonsType::Ok,
+                                        &format!("Failed to delete playlist:\n{}", e));
+                                    d.run(); d.close();
                                 }
                             }
                         });
@@ -1115,7 +1457,7 @@ impl BrowserView {
                         .ok()
                         .flatten()
                         .unwrap_or_default();
-                    if id != "all" {
+                    if id != "all" && id != "history_header" {
                         sel.set_text(&id);
                     }
                 }
@@ -1123,7 +1465,7 @@ impl BrowserView {
 
             {
                 let library  = library.clone();
-                let pl_store = pl_store.clone();
+                let pl_store2 = pl_store.clone();
                 let pl_view2 = pl_view.clone();
 
                 pl_view.connect_drag_data_received(move |_view, ctx, x, y, sel, _info, time| {
@@ -1131,6 +1473,11 @@ impl BrowserView {
                         Some(s) => s.to_string(),
                         None    => { ctx.drag_finish(false, false, time); return; }
                     };
+                    // Ignore history and special rows
+                    if src_id_str.starts_with("h:") || src_id_str == "history_header" {
+                        ctx.drag_finish(false, false, time);
+                        return;
+                    }
                     let src_id: i64 = match src_id_str.parse() {
                         Ok(v)  => v,
                         Err(_) => { ctx.drag_finish(false, false, time); return; }
@@ -1154,7 +1501,9 @@ impl BrowserView {
                         .flatten()
                         .unwrap_or_default();
 
-                    if dest_id_str == "all" || dest_id_str == src_id_str {
+                    if dest_id_str == "all" || dest_id_str == src_id_str
+                        || dest_id_str == "history_header" || dest_id_str.starts_with("h:")
+                    {
                         ctx.drag_finish(false, false, time);
                         return;
                     }
@@ -1183,9 +1532,11 @@ impl BrowserView {
                             .move_playlist(src_id, Some(dest_id));
                         match result {
                             Ok(()) => {
-                                if let Ok(lists) = library.borrow().as_ref().unwrap().playlists() {
-                                    browser_populate_playlists(&pl_store, &lists);
-                                }
+                                let lib = library.borrow();
+                                let lib_ref = lib.as_ref().unwrap();
+                                let lists = lib_ref.playlists().unwrap_or_default();
+                                let sessions = lib_ref.history_sessions().unwrap_or_default();
+                                browser_populate_playlists(&pl_store2, &lists, &sessions);
                                 ctx.drag_finish(true, false, time);
                             }
                             Err(_) => { ctx.drag_finish(false, false, time); }
@@ -1196,8 +1547,6 @@ impl BrowserView {
                             Err(_) => { ctx.drag_finish(false, false, time); return; }
                         };
 
-                        // Collect all IDs from the model in visual order,
-                        // excluding "all" and the item being dragged
                         let mut ordered: Vec<i64> = Vec::new();
                         if let Some(iter) = model.get_iter_first() {
                             loop {
@@ -1207,7 +1556,7 @@ impl BrowserView {
                                     .ok()
                                     .flatten()
                                     .unwrap_or_default();
-                                if id_s != "all" {
+                                if id_s != "all" && id_s != "history_header" && !id_s.starts_with("h:") {
                                     if let Ok(id) = id_s.parse::<i64>() {
                                         if id != src_id {
                                             ordered.push(id);
@@ -1232,9 +1581,11 @@ impl BrowserView {
                             .reorder_playlists(&ordered);
                         match result {
                             Ok(()) => {
-                                if let Ok(lists) = library.borrow().as_ref().unwrap().playlists() {
-                                    browser_populate_playlists(&pl_store, &lists);
-                                }
+                                let lib = library.borrow();
+                                let lib_ref = lib.as_ref().unwrap();
+                                let lists = lib_ref.playlists().unwrap_or_default();
+                                let sessions = lib_ref.history_sessions().unwrap_or_default();
+                                browser_populate_playlists(&pl_store2, &lists, &sessions);
                                 ctx.drag_finish(true, false, time);
                             }
                             Err(_) => { ctx.drag_finish(false, false, time); }
@@ -1250,7 +1601,6 @@ impl BrowserView {
             let saved_path = config.borrow().db_path.clone();
 
             if let Some(path) = saved_path {
-                // Defer until the main loop is running so the window is visible
                 glib::idle_add_local(move || {
                     do_open(&path);
                     glib::Continue(false)
@@ -1260,9 +1610,12 @@ impl BrowserView {
 
         // ── playlist selection ────────────────────────────────────────────────
         {
-            let library     = library.clone();
-            let track_store = track_store.clone();
-            let status_lbl  = status_lbl.clone();
+            let library              = library.clone();
+            let track_store2         = track_store.clone();
+            let status_lbl2          = status_lbl.clone();
+            let current_playlist_id2 = current_playlist_id.clone();
+            let make_filter2         = make_filter.clone();
+            let pl_store2            = pl_store.clone();
 
             pl_view.get_selection().connect_changed(move |sel| {
                 let (model, iter) = match sel.get_selected() {
@@ -1275,30 +1628,141 @@ impl BrowserView {
                     .ok()
                     .flatten()
                     .unwrap_or_default();
+                let attr: String = model
+                    .get_value(&iter, P_ATTR as i32)
+                    .get::<String>()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+
+                // Not selectable
+                if id == "history_header" {
+                    return;
+                }
 
                 if let Some(lib) = library.borrow().as_ref() {
+                    let f = make_filter2();
                     let result = if id == "all" {
+                        *current_playlist_id2.borrow_mut() = None;
                         lib.tracks()
+                    } else if attr == "h" {
+                        // History session — parse id "h:123"
+                        let hid: i64 = id.trim_start_matches("h:").parse().unwrap_or(0);
+                        *current_playlist_id2.borrow_mut() = None; // History isn't a playlist
+                        lib.history_tracks(hid)
                     } else {
                         match id.parse::<i64>() {
-                            Ok(pid) => lib.playlist_tracks(pid),
+                            Ok(pid) => {
+                                *current_playlist_id2.borrow_mut() = Some(pid);
+                                lib.playlist_tracks(pid)
+                            }
                             Err(_)  => return,
                         }
                     };
                     if let Ok(tracks) = result {
                         let n = tracks.len();
-                        browser_populate_tracks(&track_store, &tracks);
-                        status_lbl.set_text(&format!("{} tracks", n));
+                        browser_populate_tracks(&track_store2, &tracks);
+                        status_lbl2.set_text(&format!("{} tracks", n));
                     }
+                }
+            });
+        }
+
+        // ── track selection: My Tags + Rating ────────────────────────────────
+        {
+            let library      = library.clone();
+            let track_store2 = track_store.clone();
+            let track_sort2  = track_sort.clone();
+            let tags_label2  = tags_label.clone();
+            // Clone star buttons for the rating callback
+            let star_btns_rc: Vec<gtk::Button> = star_btns.clone();
+            let clear_rating_btn2 = clear_rating_btn.clone();
+
+            track_view.get_selection().connect_changed(move |sel| {
+                if let Some((sort_model, sort_iter)) = sel.get_selected() {
+                    let ts: gtk::TreeModelSort = sort_model.downcast().unwrap_or_else(|_| track_sort2.clone());
+                    let base_iter = ts.convert_iter_to_child_iter(&sort_iter);
+
+                    let id_str: String = track_store2
+                        .get_value(&base_iter, T_TRACK_ID as i32)
+                        .get::<String>()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let track_id: i64 = id_str.parse().unwrap_or(0);
+
+                    if let Some(lib) = library.borrow().as_ref() {
+                        if let Ok(tags) = lib.song_my_tags(track_id) {
+                            if tags.is_empty() {
+                                tags_label2.set_text("Tags: —");
+                            } else {
+                                tags_label2.set_text(&format!("Tags: {}", tags.join(", ")));
+                            }
+                        }
+                    }
+
+                    // Wire rating buttons for this track
+                    for (i, btn) in star_btns_rc.iter().enumerate() {
+                        let rating_val = (i + 1) as i32;
+                        let library2   = library.clone();
+                        let track_store3 = track_store2.clone();
+                        let track_sort3  = track_sort2.clone();
+                        let sel2 = sel.clone();
+                        btn.connect_clicked(move |_| {
+                            if let Some((sm, si)) = sel2.get_selected() {
+                                let ts2: gtk::TreeModelSort = sm.downcast().unwrap_or_else(|_| track_sort3.clone());
+                                let bi = ts2.convert_iter_to_child_iter(&si);
+                                let tid_str: String = track_store3
+                                    .get_value(&bi, T_TRACK_ID as i32)
+                                    .get::<String>()
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default();
+                                let tid: i64 = tid_str.parse().unwrap_or(0);
+                                if let Some(lib) = library2.borrow().as_ref() {
+                                    let _ = lib.set_rating(tid, rating_val);
+                                    // Update the store
+                                    track_store3.set_value(&bi, T_RATING, &rating_stars(rating_val).to_value());
+                                }
+                            }
+                        });
+                    }
+                    // Clear rating button
+                    {
+                        let library2     = library.clone();
+                        let track_store3 = track_store2.clone();
+                        let track_sort3  = track_sort2.clone();
+                        let sel2 = sel.clone();
+                        clear_rating_btn2.connect_clicked(move |_| {
+                            if let Some((sm, si)) = sel2.get_selected() {
+                                let ts2: gtk::TreeModelSort = sm.downcast().unwrap_or_else(|_| track_sort3.clone());
+                                let bi = ts2.convert_iter_to_child_iter(&si);
+                                let tid_str: String = track_store3
+                                    .get_value(&bi, T_TRACK_ID as i32)
+                                    .get::<String>()
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default();
+                                let tid: i64 = tid_str.parse().unwrap_or(0);
+                                if let Some(lib) = library2.borrow().as_ref() {
+                                    let _ = lib.set_rating(tid, 0);
+                                    track_store3.set_value(&bi, T_RATING, &"".to_value());
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    tags_label.set_text("Tags: —");
                 }
             });
         }
 
         // ── search ────────────────────────────────────────────────────────────
         {
-            let library     = library.clone();
-            let track_store = track_store.clone();
-            let status_lbl  = status_lbl.clone();
+            let library              = library.clone();
+            let track_store2         = track_store.clone();
+            let status_lbl2          = status_lbl.clone();
+            let current_playlist_id2 = current_playlist_id.clone();
 
             search_entry.connect_changed(move |entry| {
                 let text: String = entry.get_text().to_string();
@@ -1306,13 +1770,16 @@ impl BrowserView {
                 if let Some(lib) = library.borrow().as_ref() {
                     let result: rusqlite::Result<Vec<crate::rekordbox::Track>> =
                         if text.is_empty() {
-                            lib.tracks()
+                            match *current_playlist_id2.borrow() {
+                                None      => lib.tracks(),
+                                Some(pid) => lib.playlist_tracks(pid),
+                            }
                         } else {
                             lib.search_tracks(&text)
                         };
                     if let Ok(tracks) = result {
-                        browser_populate_tracks(&track_store, &tracks);
-                        status_lbl.set_text(&format!("{} tracks", tracks.len()));
+                        browser_populate_tracks(&track_store2, &tracks);
+                        status_lbl2.set_text(&format!("{} tracks", tracks.len()));
                     }
                 }
             });
@@ -1336,7 +1803,6 @@ fn show_settings_dialog(window: &gtk::ApplicationWindow, config: &Rc<RefCell<Con
     content.set_spacing(6);
     content.set_border_width(12);
 
-    // ── heading ──
     let heading = gtk::Label::new(Some("Path Mappings"));
     heading.set_xalign(0.0);
     content.pack_start(&heading, false, false, 0);
@@ -1349,7 +1815,6 @@ fn show_settings_dialog(window: &gtk::ApplicationWindow, config: &Rc<RefCell<Con
     hint.set_line_wrap(true);
     content.pack_start(&hint, false, false, 0);
 
-    // ── scrolled rows area ──
     let rows_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let scroll = gtk::ScrolledWindow::new(gtk::NONE_ADJUSTMENT, gtk::NONE_ADJUSTMENT);
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -1357,7 +1822,6 @@ fn show_settings_dialog(window: &gtk::ApplicationWindow, config: &Rc<RefCell<Con
     scroll.add(&rows_box);
     content.pack_start(&scroll, true, true, 0);
 
-    // Track entry pairs so we can collect values on Save
     let pairs: Rc<RefCell<Vec<(gtk::Entry, gtk::Entry)>>> = Rc::new(RefCell::new(Vec::new()));
 
     let add_row = {
@@ -1399,12 +1863,10 @@ fn show_settings_dialog(window: &gtk::ApplicationWindow, config: &Rc<RefCell<Con
         })
     };
 
-    // Populate existing mappings
     for m in &config.borrow().path_mappings {
         add_row(&m.from, &m.to);
     }
 
-    // ── Add row button ──
     let add_btn = gtk::Button::with_label("+ Add mapping");
     add_btn.set_halign(gtk::Align::Start);
     {
@@ -1431,7 +1893,11 @@ fn show_settings_dialog(window: &gtk::ApplicationWindow, config: &Rc<RefCell<Con
     }
 }
 
-fn browser_populate_playlists(store: &gtk::ListStore, playlists: &[Playlist]) {
+fn browser_populate_playlists(
+    store: &gtk::ListStore,
+    playlists: &[Playlist],
+    sessions: &[HistorySession],
+) {
     store.clear();
     store.insert_with_values(
         None,
@@ -1457,6 +1923,25 @@ fn browser_populate_playlists(store: &gtk::ListStore, playlists: &[Playlist]) {
             &[&name.as_str(), &count.as_str(), &id.as_str(), &attr.as_str()],
         );
     }
+
+    if !sessions.is_empty() {
+        // History header (not selectable — we just make it non-interactive visually)
+        store.insert_with_values(
+            None,
+            &[P_NAME, P_COUNT, P_ID, P_ATTR],
+            &[&"— History —", &"", &"history_header", &"h"],
+        );
+        for s in sessions {
+            let id   = format!("h:{}", s.id);
+            let name = format!("  {}", s.name);
+            let cnt  = s.track_count.to_string();
+            store.insert_with_values(
+                None,
+                &[P_NAME, P_COUNT, P_ID, P_ATTR],
+                &[&name.as_str(), &cnt.as_str(), &id.as_str(), &"h"],
+            );
+        }
+    }
 }
 
 fn browser_fmt_duration(secs: i32) -> String {
@@ -1471,9 +1956,15 @@ fn browser_populate_tracks(store: &gtk::ListStore, tracks: &[Track]) {
         let artist    = t.artist.as_deref().unwrap_or("").to_string();
         let duration  = t.duration_secs.map(browser_fmt_duration).unwrap_or_default();
         let file_path = t.file_path.as_deref().unwrap_or("").to_string();
+        let genre     = t.genre.as_deref().unwrap_or("").to_string();
+        let rating    = rating_stars(t.rating.unwrap_or(0)).to_string();
+        let label     = t.label.as_deref().unwrap_or("").to_string();
+        let color_id  = t.color_id.map(|c| c.to_string()).unwrap_or_default();
+        let track_id  = t.id.to_string();
         store.insert_with_values(
             None,
-            &[T_TITLE, T_ARTIST, T_BPM, T_KEY, T_DURATION, T_FILE_PATH],
+            &[T_TITLE, T_ARTIST, T_BPM, T_KEY, T_DURATION,
+              T_FILE_PATH, T_GENRE, T_RATING, T_LABEL, T_COLOR, T_TRACK_ID],
             &[
                 &t.title.as_str(),
                 &artist.as_str(),
@@ -1481,6 +1972,11 @@ fn browser_populate_tracks(store: &gtk::ListStore, tracks: &[Track]) {
                 &key.as_str(),
                 &duration.as_str(),
                 &file_path.as_str(),
+                &genre.as_str(),
+                &rating.as_str(),
+                &label.as_str(),
+                &color_id.as_str(),
+                &track_id.as_str(),
             ],
         );
     }
