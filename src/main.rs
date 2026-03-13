@@ -2,6 +2,10 @@ extern crate gtk;
 extern crate gio;
 extern crate glib;
 
+mod config;
+mod deck;
+mod dlna;
+mod rekordbox;
 mod views;
 
 use gtk::prelude::*;
@@ -12,7 +16,8 @@ use glib::clone;
 use gtk::{
     ApplicationWindow,
     Orientation,
-    MenuItem
+    MenuItem,
+    Paned,
 };
 
 use std::rc::Rc;
@@ -35,21 +40,31 @@ impl Application {
 pub struct Widgets {
     pub window: ApplicationWindow,
     pub main_view: views::MainView,
+    pub browser_view: views::BrowserView,
     pub vertical_box: gtk::Box,
 }
 
 impl Widgets {
     pub fn new(application: &gtk::Application) -> Self {
-        let main_view = views::MainView::new();
-        let menu_bar = MenuBar::new();
-        let vertical_box = gtk::Box::new(Orientation::Vertical, 10);
         let window = ApplicationWindow::new(application);
-
-        window.set_default_size(640, 640);
+        window.set_default_size(1200, 800);
         window.set_title("DJ Application");
 
+        let cfg = std::rc::Rc::new(std::cell::RefCell::new(config::Config::load()));
+        let main_view    = views::MainView::new(&window);
+        let queue_fn     = main_view.queue_fn.clone();
+        let browser_view = views::BrowserView::new(&window, cfg, Some(queue_fn));
+        let menu_bar     = MenuBar::new();
+        let vertical_box = gtk::Box::new(Orientation::Vertical, 0);
+
+        // Split window vertically: decks on top, library browser on bottom
+        let content_paned = Paned::new(Orientation::Vertical);
+        content_paned.pack1(&main_view.container, false, false);
+        content_paned.pack2(&browser_view.container, true, true);
+        content_paned.set_position(240);
+
         vertical_box.pack_start(&menu_bar.container, false, false, 0);
-        vertical_box.pack_start(&main_view.container, true, true, 0);
+        vertical_box.pack_start(&content_paned, true, true, 0);
 
         window.add(&vertical_box);
         window.show_all();
@@ -61,6 +76,7 @@ impl Widgets {
         Widgets {
             window,
             main_view,
+            browser_view,
             vertical_box,
         }
     }
