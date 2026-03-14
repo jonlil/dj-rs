@@ -172,9 +172,8 @@ mid-playback is seamless via `Player::change_sink()`.
 
 ### Phase 4 — other player fixes (do alongside or after Phase 3)
 
-- [ ] Duration detection: use `ffprobe` instead of `rodio` total_duration
-      (fixes "0:00 / ?" and broken TV metadata duration)
-- [ ] Track load resets play button to "Play" and sends `State{playing:false}`
+- [x] Duration detection: use DB value (`djmdContent.Length`) instead of `rodio` total_duration
+- [x] Track load resets play button to "Play" and sends `State{playing:false}`
 - [ ] Playlist folder grouping: investigate and fix Seq ordering
 
 ---

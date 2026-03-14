@@ -115,9 +115,9 @@ Buttons update live from `SinkRegistry`. Switching mid-playback is seamless.
 
 ## TODO
 
-- [ ] Wire BPM and Key into `PlayerView` (data already in DB, just not displayed)
-- [ ] Replace time-elapsed label with time-remaining
+- [x] Wire BPM and Key into `PlayerView`
+- [x] Replace time-elapsed label with time-remaining
+- [x] Pass BPM, Key, Artist, duration properly through `do_load_track`
 - [ ] Album art: add `id3` or `audiotags` crate, extract cover, render in `gtk::Image`
 - [ ] Waveform `DrawingArea`: placeholder grey bar now; ANLZ rendering later
 - [ ] Cue button: resolve cue position on load (fallback chain above), jump on press
-- [ ] Pass BPM, Key, Artist properly through `do_load_track` (currently only filename used)
