@@ -14,6 +14,7 @@ mod spotify;
 mod views;
 
 use gtk::prelude::*;
+use gdk::prelude::*;
 use gio::prelude::*;
 
 use glib::clone;
@@ -58,10 +59,9 @@ impl Widgets {
         let cfg = std::rc::Rc::new(std::cell::RefCell::new(config::Config::load()));
         let bridge = server::start_server(
             7879,
-            cfg.borrow().db_path.clone(),
             cfg.borrow().clone(),
         );
-        let main_view            = views::MainView::new(&window, bridge);
+        let main_view            = views::MainView::new(&window, bridge, cfg.clone());
         let queue_fn             = main_view.queue_fn.clone();
         let current_track_db_id  = main_view.current_track_db_id.clone();
         let on_track_end         = main_view.on_track_end.clone();
@@ -132,6 +132,18 @@ fn main() {
     .expect("Failed to initialize Application");
 
     application.connect_startup(|app| {
+        let css = gtk::CssProvider::new();
+        let _ = css.load_from_data(b"
+            treeview row { min-height: 28px; }
+            list row { border-bottom: 1px solid @borders; }
+        ");
+        if let Some(screen) = gdk::Screen::get_default() {
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
         Application::new(app);
     });
 

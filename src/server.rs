@@ -40,7 +40,6 @@ struct AppState {
     events:       broadcast::Sender<WsEvent>,
     seek_slot:    Arc<std::sync::Mutex<Option<f64>>>,
     client_count: Arc<AtomicUsize>,
-    db_path:      Option<String>,
     config:       crate::config::Config,
 }
 
@@ -74,7 +73,6 @@ impl ServerBridge {
 
 pub fn start_server(
     port: u16,
-    db_path: Option<String>,
     config: crate::config::Config,
 ) -> Arc<ServerBridge> {
     let (tx, _) = broadcast::channel::<WsEvent>(128);
@@ -88,7 +86,7 @@ pub fn start_server(
         client_count: client_count.clone(),
     });
 
-    let state = Arc::new(AppState { events: tx, seek_slot, client_count, db_path, config });
+    let state = Arc::new(AppState { events: tx, seek_slot, client_count, config });
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -231,8 +229,8 @@ async fn stream_handler(
 }
 
 fn resolve_track_path(state: &AppState, id: i64) -> Option<String> {
-    let db_path = state.db_path.as_deref()?;
-    let lib = crate::rekordbox::Library::open(db_path).ok()?;
+    let db_path = state.config.resolved_db_path()?;
+    let lib = crate::rekordbox::Library::open(&db_path).ok()?;
     let raw = lib.track_file_path(id)?;
     let mapped = state.config.apply_mappings(&raw);
     eprintln!("[stream] id={id} raw={raw:?} mapped={mapped:?}");

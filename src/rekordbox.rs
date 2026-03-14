@@ -30,6 +30,7 @@ pub struct Track {
     pub track_no: Option<i32>,
     pub label: Option<String>,
     pub color_id: Option<String>,
+    pub image_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,7 @@ fn map_track_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         track_no:      row.get(11)?,
         label:         row.get(12)?,
         color_id:      row.get(13)?,
+        image_path:    row.get(14)?,
     })
 }
 
@@ -115,7 +117,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, c.TrackNo,
-                    l.Name, c.ColorID
+                    l.Name, c.ColorID, c.ImagePath
              FROM djmdContent c
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
              LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
@@ -162,6 +164,15 @@ impl Library {
         Ok(playlists)
     }
 
+    /// Update the `FolderPath` for a track (e.g. after transcoding to FLAC).
+    pub fn update_track_path(&self, id: i64, new_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE djmdContent SET FolderPath = ? WHERE ID = ?",
+            rusqlite::params![new_path, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Return the raw `FolderPath` for a single track (before path-mapping).
     pub fn track_file_path(&self, id: i64) -> Option<String> {
         self.conn.query_row(
@@ -178,7 +189,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, sp.TrackNo,
-                    l.Name, c.ColorID
+                    l.Name, c.ColorID, c.ImagePath
              FROM djmdSongPlaylist sp
              JOIN  djmdContent  c  ON sp.ContentID = c.ID
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
@@ -323,7 +334,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, c.TrackNo,
-                    l.Name, c.ColorID
+                    l.Name, c.ColorID, c.ImagePath
              FROM djmdContent c
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
              LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
@@ -376,7 +387,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, c.TrackNo,
-                    l.Name, c.ColorID
+                    l.Name, c.ColorID, c.ImagePath
              FROM djmdContent c
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
              LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
@@ -431,7 +442,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, sp.TrackNo,
-                    l.Name, c.ColorID
+                    l.Name, c.ColorID, c.ImagePath
              FROM djmdSongPlaylist sp
              JOIN  djmdContent  c  ON sp.ContentID = c.ID
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
@@ -522,7 +533,7 @@ impl Library {
                     a.Name, al.Name, g.Name, k.ScaleName,
                     c.BPM, c.Length, c.Rating, c.DJPlayCount,
                     c.FolderPath, sh.TrackNo,
-                    l.Name, c.ColorID
+                    l.Name, c.ColorID, c.ImagePath
              FROM djmdSongHistory sh
              JOIN  djmdContent  c  ON sh.ContentID = c.ID
              LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID

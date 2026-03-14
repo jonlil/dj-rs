@@ -36,6 +36,21 @@ impl Config {
         }
     }
 
+    /// Resolve the library database path.
+    /// Uses `db_path` if explicitly configured, otherwise falls back to
+    /// `~/.local/share/dj-rs/master.db` if that file exists.
+    pub fn resolved_db_path(&self) -> Option<String> {
+        if let Some(ref p) = self.db_path {
+            return Some(p.clone());
+        }
+        let default = default_db_path();
+        if default.exists() {
+            Some(default.to_string_lossy().into_owned())
+        } else {
+            None
+        }
+    }
+
     /// Apply stored path mappings to a file path.
     /// Returns the first match, or the original path if nothing matches.
     pub fn apply_mappings(&self, path: &str) -> String {
@@ -46,6 +61,24 @@ impl Config {
         }
         path.to_string()
     }
+}
+
+/// Default location for the Rekordbox library database on Linux:
+/// `~/.local/share/dj-rs/master.db`
+pub fn default_db_path() -> PathBuf {
+    let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("/home/.local/share"));
+    path.push("dj-rs");
+    path.push("master.db");
+    path
+}
+
+/// Default location for the music library on Linux: `~/Music`
+pub fn default_music_dir() -> PathBuf {
+    dirs::audio_dir().unwrap_or_else(|| {
+        let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
+        path.push("Music");
+        path
+    })
 }
 
 fn config_path() -> Option<PathBuf> {
