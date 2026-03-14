@@ -1,9 +1,33 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use std::fs::File;
-use std::io::BufReader;
+use std::io::Cursor;
 use rodio::{Decoder, Sink, Source, OutputStream, OutputStreamHandle};
 use cpal::traits::{DeviceTrait, HostTrait};
+
+/// Open an audio output stream on the default device, skipping devices that
+/// look like cameras/webcams. Never iterates all devices to avoid probing USB
+/// audio on webcams (which lights up the camera indicator).
+pub fn open_audio_stream() -> Result<(OutputStream, OutputStreamHandle), String> {
+    let bad_keywords = ["cam", "webcam", "video", "capture"];
+    let host = cpal::default_host();
+
+    // Try each available host's default device — PipeWire/PulseAudio first
+    for host_id in cpal::available_hosts() {
+        if let Ok(h) = cpal::host_from_id(host_id) {
+            if let Some(dev) = h.default_output_device() {
+                let name = dev.name().unwrap_or_default().to_lowercase();
+                if bad_keywords.iter().any(|k| name.contains(k)) {
+                    continue;
+                }
+                if let Ok(pair) = OutputStream::try_from_device(&dev) {
+                    return Ok(pair);
+                }
+            }
+        }
+    }
+
+    OutputStream::try_default().map_err(|e| e.to_string())
+}
 
 // --- Device enumeration ---
 
@@ -53,6 +77,42 @@ pub fn default_device_index(entries: &[DeviceEntry]) -> usize {
     0
 }
 
+/// Read a file into memory for decoding.
+/// Returns `(cursor, warning)` — warning is set for formats that need conversion.
+/// M4A/AAC are pre-transcoded to WAV via ffmpeg because symphonia's ISOMP4 prober
+/// returns a SeekError that rodio treats as unreachable!() — causing a hard crash.
+fn read_file(path: &PathBuf) -> Result<(Cursor<Vec<u8>>, Option<String>), String> {
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if matches!(ext.as_str(), "m4a" | "aac" | "m4p") {
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-i", path.to_str().ok_or("invalid path")?,
+                "-f", "wav", "-loglevel", "error", "pipe:1",
+            ])
+            .output()
+            .map_err(|e| format!("ffmpeg: {e}"))?;
+        if !out.status.success() {
+            return Err("Failed to decode M4A with ffmpeg".to_string());
+        }
+        let warning = Some(format!(
+            "⚠ M4A/AAC file — playing via ffmpeg. Convert to FLAC for USB export (Pioneer CDJ/XDJ may not support this format)."
+        ));
+        return Ok((Cursor::new(out.stdout), warning));
+    }
+
+    std::fs::read(path)
+        .map(|b| (Cursor::new(b), None))
+        .map_err(|e| e.to_string())
+}
+
+fn make_decoder(cursor: Cursor<Vec<u8>>) -> Result<Decoder<Cursor<Vec<u8>>>, String> {
+    Decoder::new(cursor).map_err(|e| e.to_string())
+}
+
 // --- Deck audio state ---
 
 pub struct DeckState {
@@ -67,7 +127,7 @@ pub struct DeckState {
 
 impl DeckState {
     pub fn new() -> Self {
-        let (stream, stream_handle) = OutputStream::try_default()
+        let (stream, stream_handle) = open_audio_stream()
             .expect("Failed to open audio output");
         let sink = Sink::try_new(&stream_handle)
             .expect("Failed to create audio sink");
@@ -100,26 +160,24 @@ impl DeckState {
         })
     }
 
-    pub fn load(&mut self, path: PathBuf) -> Result<(), String> {
-        let new_sink = Sink::try_new(&self.stream_handle)
-            .map_err(|e| e.to_string())?;
-        new_sink.pause();
-
-        let file = File::open(&path).map_err(|e| e.to_string())?;
-        let decoder = Decoder::new(BufReader::new(file))
+    /// Returns `Ok(Some(warning))` on success with a format warning, `Ok(None)` on clean success.
+    pub fn load(&mut self, path: PathBuf) -> Result<Option<String>, String> {
+        let (cursor, warning) = read_file(&path)?;
+        let decoder = make_decoder(cursor)
             .map_err(|e| e.to_string())?;
 
         self.duration_secs = decoder.total_duration()
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        new_sink.append(decoder);
-        self.sink = new_sink;
+        // Stop clears the queue and pauses — reuse the same sink to avoid device transitions
+        self.sink.stop();
+        self.sink.append(decoder);
 
         self.file_path = Some(path);
         self.accumulated_secs = 0.0;
         self.play_started_at = None;
-        Ok(())
+        Ok(warning)
     }
 
     pub fn play(&mut self) {
@@ -140,15 +198,13 @@ impl DeckState {
     pub fn stop(&mut self) {
         self.accumulated_secs = 0.0;
         self.play_started_at = None;
+        self.sink.stop();
+        // Reload the file so the track can be played again from the start
         if let Some(path) = self.file_path.clone() {
-            if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
-                new_sink.pause();
-                if let Ok(file) = File::open(&path) {
-                    if let Ok(decoder) = Decoder::new(BufReader::new(file)) {
-                        new_sink.append(decoder);
-                    }
+            if let Ok((cursor, _)) = read_file(&path) {
+                if let Ok(decoder) = make_decoder(cursor) {
+                    self.sink.append(decoder);
                 }
-                self.sink = new_sink;
             }
         }
     }
@@ -169,16 +225,14 @@ impl DeckState {
         new_sink.pause();
 
         if let Some(ref path) = file_path {
-            if let Ok(file) = File::open(path) {
-                if let Ok(decoder) = Decoder::new(BufReader::new(file)) {
-                    // Skip to preserved position
+            if let Ok((cursor, _)) = read_file(path) {
+                if let Ok(decoder) = make_decoder(cursor) {
                     let positioned = decoder.skip_duration(Duration::from_secs_f64(position));
                     new_sink.append(positioned);
                 }
             }
         }
 
-        // Replace resources — sink first so the old stream can safely drop last
         self.sink = new_sink;
         self.stream_handle = new_handle;
         self.stream = new_stream;
@@ -197,24 +251,12 @@ impl DeckState {
     /// Seek to `pos` seconds, preserving play/pause state.
     pub fn seek_to(&mut self, pos: f64) -> Result<(), String> {
         let was_playing = self.play_started_at.is_some();
-        let path = self.file_path.clone().ok_or("No track loaded")?;
 
-        let new_sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
-        new_sink.pause();
+        let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
 
-        let file = File::open(&path).map_err(|e| e.to_string())?;
-        let decoder = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
-        let positioned = decoder.skip_duration(Duration::from_secs_f64(pos));
-        new_sink.append(positioned);
-
-        self.sink = new_sink;
         self.accumulated_secs = pos;
-        self.play_started_at = None;
+        self.play_started_at = if was_playing { Some(Instant::now()) } else { None };
 
-        if was_playing {
-            self.play_started_at = Some(Instant::now());
-            self.sink.play();
-        }
         Ok(())
     }
 
