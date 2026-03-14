@@ -28,7 +28,7 @@ pub struct PlayerView {
     pub container: gtk::Frame,
     pub volume_scale: gtk::Scale,
     pub state: Rc<RefCell<DeckState>>,
-    pub queue_fn: Rc<dyn Fn(std::path::PathBuf)>,
+    pub queue_fn: Rc<dyn Fn(Track)>,
     pub current_track_db_id: Rc<RefCell<Option<i64>>>,
     pub on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
 }
@@ -43,36 +43,92 @@ impl PlayerView {
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
         vbox.set_border_width(8);
 
-        // Track info
+        // ── Info row: [album art] [title / BPM] [artist / Key] ──────────────
+
+        // Album art placeholder — grey square, replaced later with actual art
+        let art_placeholder = gtk::DrawingArea::new();
+        art_placeholder.set_size_request(80, 80);
+        art_placeholder.connect_draw(|w, cr| {
+            let alloc = w.get_allocation();
+            cr.set_source_rgb(0.25, 0.25, 0.25);
+            cr.rectangle(0.0, 0.0, alloc.width as f64, alloc.height as f64);
+            cr.fill();
+            gtk::Inhibit(false)
+        });
+
         let track_label = gtk::Label::new(Some("No track loaded"));
         track_label.set_xalign(0.0);
+        track_label.set_hexpand(true);
 
-        // Waveform area — placeholder until ANLZ parsing is implemented
-        let waveform_area = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let bpm_label = gtk::Label::new(None::<&str>);
+        bpm_label.set_xalign(1.0);
+
+        let artist_label = gtk::Label::new(None::<&str>);
+        artist_label.set_xalign(0.0);
+        artist_label.set_hexpand(true);
+
+        let key_label = gtk::Label::new(None::<&str>);
+        key_label.set_xalign(1.0);
+
+        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        title_row.pack_start(&track_label, true,  true,  0);
+        title_row.pack_end  (&bpm_label,   false, false, 0);
+
+        let artist_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        artist_row.pack_start(&artist_label, true,  true,  0);
+        artist_row.pack_end  (&key_label,    false, false, 0);
+
+        let meta_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        meta_box.pack_start(&title_row,  false, false, 0);
+        meta_box.pack_start(&artist_row, false, false, 0);
+
+        let info_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        info_row.pack_start(&art_placeholder, false, false, 0);
+        info_row.pack_start(&meta_box,        true,  true,  0);
+
+        // ── Waveform row: [waveform placeholder] [-M:SS] ─────────────────────
+
+        // Waveform placeholder — grey bar; replaced later with ANLZ colour waveform
+        let waveform_area = gtk::DrawingArea::new();
         waveform_area.set_size_request(-1, 80);
+        waveform_area.set_hexpand(true);
+        waveform_area.connect_draw(|w, cr| {
+            let alloc = w.get_allocation();
+            cr.set_source_rgb(0.15, 0.15, 0.15);
+            cr.rectangle(0.0, 0.0, alloc.width as f64, alloc.height as f64);
+            cr.fill();
+            gtk::Inhibit(false)
+        });
 
-        // Position slider (fraction 0.0–1.0)
+        // Time display (remaining)
+        let time_label = gtk::Label::new(Some("-0:00"));
+        time_label.set_xalign(1.0);
+
+        let wave_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        wave_row.pack_start(&waveform_area, true,  true,  0);
+        wave_row.pack_end  (&time_label,    false, false, 4);
+
+        // ── Position slider ───────────────────────────────────────────────────
+
         let pos_adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 0.001, 0.01, 0.0);
         let position_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&pos_adj));
         position_scale.set_draw_value(false);
         position_scale.set_hexpand(true);
         position_scale.set_sensitive(false);
 
-        // Time display
-        let time_label = gtk::Label::new(Some("0:00 / 0:00"));
+        // ── Controls: [Cue] [▶/❚❚]  +  TV toggle (right) ────────────────────
 
-        // Controls: Play/Pause + Cue + TV output toggle
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        controls.set_homogeneous(true);
-        let play_btn = gtk::Button::with_label("Play");
+        let play_btn = gtk::Button::with_label("▶  Play");
         let cue_btn  = gtk::Button::with_label("Cue");
         let tv_btn   = gtk::ToggleButton::with_label("TV");
-        tv_btn.set_sensitive(false); // enabled only when a TV client is connected
-        controls.pack_start(&play_btn, true, true, 0);
-        controls.pack_start(&cue_btn,  true, true, 0);
-        controls.pack_start(&tv_btn,   true, true, 0);
+        tv_btn.set_sensitive(false);
 
-        // Volume scale — not shown in UI but available for level control
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        controls.pack_start(&cue_btn,  false, false, 0);
+        controls.pack_start(&play_btn, false, false, 0);
+        controls.pack_end  (&tv_btn,   false, false, 0);
+
+        // Volume scale (hidden, used programmatically)
         let vol_adj = gtk::Adjustment::new(1.0, 0.0, 1.5, 0.01, 0.1, 0.0);
         let volume_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&vol_adj));
 
@@ -90,41 +146,68 @@ impl PlayerView {
             });
         }
 
-        vbox.pack_start(&track_label,    false, false, 0);
-        vbox.pack_start(&waveform_area,  false, false, 0);
+        // ── Assemble ──────────────────────────────────────────────────────────
+
+        vbox.pack_start(&info_row,      false, false, 0);
+        vbox.pack_start(&wave_row,      false, false, 0);
         vbox.pack_start(&position_scale, false, false, 0);
-        vbox.pack_start(&time_label,     false, false, 0);
         vbox.pack_start(&controls,       false, false, 0);
 
         frame.add(&vbox);
 
         // Shared load-track logic (drag-and-drop + queue auto-advance)
         let do_load_track = {
-            let state          = state.clone();
-            let track_label    = track_label.clone();
-            let position_scale = position_scale.clone();
-            let time_label     = time_label.clone();
-            let bridge_load    = bridge.clone();
-            Rc::new(move |path: std::path::PathBuf| {
-                let name = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
+            let state              = state.clone();
+            let track_label        = track_label.clone();
+            let artist_label       = artist_label.clone();
+            let bpm_label          = bpm_label.clone();
+            let key_label          = key_label.clone();
+            let position_scale     = position_scale.clone();
+            let time_label         = time_label.clone();
+            let play_btn_load      = play_btn.clone();
+            let current_db_id_load = current_track_db_id.clone();
+            let bridge_load        = bridge.clone();
+            Rc::new(move |track: Track| {
+                let path = match track.file_path.as_deref() {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None    => return,
+                };
+                let title  = track.title.clone();
+                let artist = track.artist.as_deref().unwrap_or("").to_string();
+                let bpm_str = track.bpm_display()
+                    .map(|b| format!("BPM: {:.1}", b))
+                    .unwrap_or_default();
+                let key_str = track.key.as_deref()
+                    .map(|k| format!("Key: {}", k))
+                    .unwrap_or_default();
+                let db_duration = track.duration_secs.map(|s| s as f64).unwrap_or(0.0);
                 if state.borrow_mut().load(path).is_ok() {
-                    track_label.set_text(&name);
-                    let dur = state.borrow().duration_secs;
+                    // DB duration is more reliable than rodio's total_duration
+                    if db_duration > 0.0 {
+                        state.borrow_mut().duration_secs = db_duration;
+                    }
+                    if track.id != 0 {
+                        *current_db_id_load.borrow_mut() = Some(track.id);
+                    }
+                    track_label.set_text(&title);
+                    artist_label.set_text(&artist);
+                    bpm_label.set_text(&bpm_str);
+                    key_label.set_text(&key_str);
+                    play_btn_load.set_label("▶  Play");
                     position_scale.set_sensitive(true);
+                    let dur = state.borrow().duration_secs;
                     if dur > 0.0 {
-                        time_label.set_text(&format!("0:00 / {}", fmt_time(dur)));
+                        time_label.set_text(&format!("-{}", fmt_time(dur)));
                     } else {
-                        time_label.set_text("0:00 / ?");
+                        time_label.set_text("-?");
                     }
                     bridge_load.send(WsEvent::Metadata {
-                        title:    name,
-                        artist:   String::new(),
+                        title,
+                        artist,
                         duration: dur,
                     });
                     bridge_load.send(WsEvent::Position { pos: 0.0 });
+                    bridge_load.send(WsEvent::State { playing: false });
                 } else {
                     track_label.set_text("Error loading file");
                 }
@@ -141,7 +224,17 @@ impl PlayerView {
                     Some(s) => s.to_string(),
                     None    => return,
                 };
-                do_load(std::path::PathBuf::from(path_str));
+                let title = std::path::Path::new(&path_str)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                do_load(Track {
+                    id: 0, title, artist: None, album: None, genre: None,
+                    key: None, bpm: None, duration_secs: None, rating: None,
+                    play_count: None, file_path: Some(path_str), track_no: None,
+                    label: None, color_id: None,
+                });
             });
         }
 
@@ -156,12 +249,12 @@ impl PlayerView {
                 let is_playing = state.borrow().play_started_at.is_some();
                 if is_playing {
                     state.borrow_mut().pause();
-                    play_btn_ref.set_label("Play");
+                    play_btn_ref.set_label("▶  Play");
                     bridge_play.send(WsEvent::State { playing: false });
                 } else {
                     state.borrow_mut().play();
                     if state.borrow().play_started_at.is_some() {
-                        play_btn_ref.set_label("Pause");
+                        play_btn_ref.set_label("❚❚  Pause");
                         if *tv_output_play.borrow() {
                             // Keep local audio muted; tell TV to stream
                             state.borrow().sink.set_volume(0.0);
@@ -185,11 +278,11 @@ impl PlayerView {
             let bridge_cue     = bridge.clone();
             cue_btn.connect_clicked(move |_| {
                 state.borrow_mut().stop();
-                play_btn.set_label("Play");
+                play_btn.set_label("▶  Play");
                 position_scale.set_value(0.0);
                 let dur = state.borrow().duration_secs;
                 time_label.set_text(&format!(
-                    "0:00 / {}",
+                    "-{}",
                     if dur > 0.0 { fmt_time(dur) } else { "?".into() }
                 ));
                 bridge_cue.send(WsEvent::State    { playing: false });
@@ -222,19 +315,19 @@ impl PlayerView {
         }
 
         // Internal queued-track state (for auto-advance; no UI shown)
-        let queued_path: Rc<RefCell<Option<std::path::PathBuf>>> = Rc::new(RefCell::new(None));
+        let queued_track: Rc<RefCell<Option<Track>>> = Rc::new(RefCell::new(None));
 
-        let queue_fn: Rc<dyn Fn(std::path::PathBuf)> = {
-            let queued_path = queued_path.clone();
-            Rc::new(move |path: std::path::PathBuf| {
-                *queued_path.borrow_mut() = Some(path);
+        let queue_fn: Rc<dyn Fn(Track)> = {
+            let queued_track = queued_track.clone();
+            Rc::new(move |track: Track| {
+                *queued_track.borrow_mut() = Some(track);
             })
         };
 
         // Position update + track-end + auto-advance timer
         {
             let state                = state.clone();
-            let queued_path          = queued_path.clone();
+            let queued_track         = queued_track.clone();
             let do_load              = do_load_track.clone();
             let position_scale       = position_scale.clone();
             let time_label           = time_label.clone();
@@ -267,11 +360,8 @@ impl PlayerView {
                     let dur = state.borrow().duration_secs;
                     let fraction = if dur > 0.0 { (seek_pos / dur).min(1.0) } else { 0.0 };
                     position_scale.set_value(fraction);
-                    time_label.set_text(&format!(
-                        "{} / {}",
-                        fmt_time(seek_pos),
-                        if dur > 0.0 { fmt_time(dur) } else { "?".into() }
-                    ));
+                    let remaining = if dur > 0.0 { (dur - seek_pos).max(0.0) } else { 0.0 };
+                    time_label.set_text(&format!("-{}", fmt_time(remaining)));
                     bridge_timer.send(WsEvent::Position { pos: seek_pos });
                     // When TV is the output, restart the stream at the new position
                     if *tv_output_timer.borrow() {
@@ -300,18 +390,18 @@ impl PlayerView {
                         st.play_started_at = None;
                         st.accumulated_secs = 0.0;
                     }
-                    play_btn.set_label("Play");
+                    play_btn.set_label("▶  Play");
                     position_scale.set_value(0.0);
                     let dur = state.borrow().duration_secs;
-                    time_label.set_text(&format!("0:00 / {}", fmt_time(dur)));
+                    time_label.set_text(&format!("-{}", fmt_time(dur)));
                     bridge_timer.send(WsEvent::State    { playing: false });
                     bridge_timer.send(WsEvent::Position { pos: 0.0 });
 
-                    if let Some(path) = queued_path.borrow_mut().take() {
-                        do_load(path);
+                    if let Some(track) = queued_track.borrow_mut().take() {
+                        do_load(track);
                         state.borrow_mut().play();
                         if state.borrow().play_started_at.is_some() {
-                            play_btn.set_label("Pause");
+                            play_btn.set_label("❚❚  Pause");
                             if *tv_output_timer.borrow() {
                                 state.borrow().sink.set_volume(0.0);
                                 if let Some(id) = *current_track_db_id2.borrow() {
@@ -332,11 +422,8 @@ impl PlayerView {
                     };
                     let fraction = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
                     position_scale.set_value(fraction);
-                    time_label.set_text(&format!(
-                        "{} / {}",
-                        fmt_time(pos),
-                        if dur > 0.0 { fmt_time(dur) } else { "?".into() }
-                    ));
+                    let remaining = if dur > 0.0 { (dur - pos).max(0.0) } else { 0.0 };
+                    time_label.set_text(&format!("-{}", fmt_time(remaining)));
 
                     // Broadcast position to TV every ~1 second
                     if tick % 10 == 0 {
@@ -361,7 +448,7 @@ impl PlayerView {
 
 pub struct MainView {
     pub container: gtk::Box,
-    pub queue_fn: Rc<dyn Fn(std::path::PathBuf)>,
+    pub queue_fn: Rc<dyn Fn(Track)>,
     pub current_track_db_id: Rc<RefCell<Option<i64>>>,
     pub on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
 }
@@ -399,7 +486,9 @@ const T_GENRE:    u32 = 6;
 const T_RATING:   u32 = 7;
 const T_LABEL:    u32 = 8;
 const T_COLOR:    u32 = 9;   // color_id as string, hidden
-const T_TRACK_ID: u32 = 10;  // db id as string, hidden
+const T_TRACK_ID:      u32 = 10;  // db id as string, hidden
+const T_BPM_RAW:      u32 = 11;  // raw bpm i32 as string, hidden
+const T_DURATION_RAW: u32 = 12;  // raw duration seconds i32 as string, hidden
 
 // ─── BrowserView ─────────────────────────────────────────────────────────────
 
@@ -411,7 +500,7 @@ impl BrowserView {
     pub fn new(
         window: &gtk::ApplicationWindow,
         config: Rc<RefCell<Config>>,
-        on_queue: Option<Rc<dyn Fn(std::path::PathBuf)>>,
+        on_queue: Option<Rc<dyn Fn(Track)>>,
         current_track_db_id: Rc<RefCell<Option<i64>>>,
         on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
     ) -> Self {
@@ -482,9 +571,9 @@ impl BrowserView {
         // ── stores ───────────────────────────────────────────────────────────
         let str_t = String::static_type();
         let pl_store = gtk::ListStore::new(&[str_t, str_t, str_t, str_t]);
-        // 11 columns: title, artist, bpm, key, duration, file_path, genre, rating, label, color_id, track_id
+        // 13 columns: title, artist, bpm, key, duration, file_path, genre, rating, label, color_id, track_id, bpm_raw, duration_raw
         let track_store = gtk::ListStore::new(&[
-            str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t,
+            str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t,
         ]);
 
         // ── playlist panel ───────────────────────────────────────────────────
@@ -634,17 +723,34 @@ impl BrowserView {
                     queue_item.connect_activate(move |_| {
                         let sel = view.get_selection();
                         if let Some((model, iter)) = sel.get_selected() {
-                            let raw: String = model
-                                .get_value(&iter, T_FILE_PATH as i32)
-                                .get::<String>().ok().flatten().unwrap_or_default();
-                            let id_str: String = model
-                                .get_value(&iter, T_TRACK_ID as i32)
-                                .get::<String>().ok().flatten().unwrap_or_default();
-                            if let Ok(id) = id_str.parse::<i64>() {
-                                *cur_db_id2.borrow_mut() = Some(id);
-                            }
+                            let get_str = |col: u32| -> String {
+                                model.get_value(&iter, col as i32)
+                                    .get::<String>().ok().flatten().unwrap_or_default()
+                            };
+                            let raw      = get_str(T_FILE_PATH);
+                            let id_str   = get_str(T_TRACK_ID);
+                            let title    = get_str(T_TITLE);
+                            let artist   = get_str(T_ARTIST);
+                            let key      = get_str(T_KEY);
+                            let genre    = get_str(T_GENRE);
+                            let bpm_raw  = get_str(T_BPM_RAW).parse::<i32>().unwrap_or(0);
+                            let dur_raw  = get_str(T_DURATION_RAW).parse::<i32>().unwrap_or(0);
+                            let id: i64  = id_str.parse().unwrap_or(0);
+                            if id != 0 { *cur_db_id2.borrow_mut() = Some(id); }
                             let mapped = config.borrow().apply_mappings(&raw);
-                            on_queue(std::path::PathBuf::from(mapped));
+                            on_queue(Track {
+                                id,
+                                title,
+                                artist: if artist.is_empty() { None } else { Some(artist) },
+                                album:  None,
+                                genre:  if genre.is_empty() { None } else { Some(genre) },
+                                key:    if key.is_empty() { None } else { Some(key) },
+                                bpm:    if bpm_raw > 0 { Some(bpm_raw) } else { None },
+                                duration_secs: if dur_raw > 0 { Some(dur_raw) } else { None },
+                                rating: None, play_count: None,
+                                file_path: Some(mapped),
+                                track_no: None, label: None, color_id: None,
+                            });
                         }
                     });
                 }
@@ -1731,10 +1837,13 @@ fn browser_populate_tracks(store: &gtk::ListStore, tracks: &[Track]) {
         let label     = t.label.as_deref().unwrap_or("").to_string();
         let color_id  = t.color_id.as_deref().unwrap_or("").to_string();
         let track_id  = t.id.to_string();
+        let bpm_raw   = t.bpm.unwrap_or(0).to_string();
+        let dur_raw   = t.duration_secs.unwrap_or(0).to_string();
         store.insert_with_values(
             None,
             &[T_TITLE, T_ARTIST, T_BPM, T_KEY, T_DURATION,
-              T_FILE_PATH, T_GENRE, T_RATING, T_LABEL, T_COLOR, T_TRACK_ID],
+              T_FILE_PATH, T_GENRE, T_RATING, T_LABEL, T_COLOR, T_TRACK_ID,
+              T_BPM_RAW, T_DURATION_RAW],
             &[
                 &t.title.as_str(),
                 &artist.as_str(),
@@ -1747,6 +1856,8 @@ fn browser_populate_tracks(store: &gtk::ListStore, tracks: &[Track]) {
                 &label.as_str(),
                 &color_id.as_str(),
                 &track_id.as_str(),
+                &bpm_raw.as_str(),
+                &dur_raw.as_str(),
             ],
         );
     }

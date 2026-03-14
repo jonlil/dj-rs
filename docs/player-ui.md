@@ -93,7 +93,7 @@ setting and saving custom cues.
 |---|---|---|
 | Title, Artist | ✓ DB | |
 | BPM, Key | ✓ DB | |
-| Duration | ✗ (rodio returns None for most formats) | ffprobe integration |
+| Duration | ✗ (`queue_fn` drops `Track`, only `PathBuf` passed through) | Pass full `Track` through `queue_fn` |
 | Album art | ✗ | ID3/FLAC tag extraction |
 | Waveform | ✗ | ANLZ `.EXT` parsing (`PWV5` tag) |
 | Cue from stored points | ✗ | `djmdCue` query + wire into Player |
