@@ -524,6 +524,7 @@ dependencies = [
  "gio 0.9.1",
  "glib 0.10.3",
  "gtk",
+ "indexmap",
  "local-ip-address",
  "pango 0.22.0",
  "rodio",
