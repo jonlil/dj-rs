@@ -29,10 +29,19 @@ impl GigType {
     }
 }
 
+/// Top-level Rekordbox folder names that belong to gig output and should be
+/// hidden from the main playlist browser. Derived from GigType so it stays
+/// in sync automatically. Swap this slice for a config value to make it
+/// user-configurable in the future.
+pub const GIG_FOLDERS: &[&str] = &["CORPORATE", "VENUES", "PRIVATE"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gig {
     pub id: String,
     pub gig_type: GigType,
+    /// Free-form tags for filtering/categorising, e.g. ["wedding", "outdoor"]
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Event name, e.g. "Kick-off 2026" or "Wedding"
     pub name: String,
     /// Contact person or client — used as playlist prefix

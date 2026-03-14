@@ -1110,6 +1110,7 @@ impl BrowserView {
                 let gig = crate::gig::Gig {
                     id:                   id.clone(),
                     gig_type:             crate::gig::GigType::Private,
+                    tags:                 Vec::new(),
                     name:                 String::new(),
                     contact:              String::new(),
                     date:                 String::new(),
@@ -2046,6 +2047,10 @@ fn browser_populate_playlists(store: &gtk::TreeStore, playlists: &[Playlist]) {
     ) {
         if let Some(nodes) = children.get(&parent_id) {
             for pl in nodes {
+                // Hide top-level gig output folders from the browsing tree
+                if parent_id.is_none() && crate::gig::GIG_FOLDERS.contains(&pl.name.as_str()) {
+                    continue;
+                }
                 let name = if pl.attribute == 1 {
                     format!("▸ {}", pl.name)
                 } else {
@@ -2282,6 +2287,7 @@ fn show_gig_prep_dialog(
         end_time:             end_entry.get_text().to_string(),
         location:             location_entry.get_text().to_string(),
         notes:                notes_text,
+        tags:                 Vec::new(),
         spotify_playlist_url: spotify_url.clone(),
         rekordbox_playlist_id: None,
     };
