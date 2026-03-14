@@ -1,4 +1,5 @@
 use gtk::prelude::*;
+use std::rc::Rc;
 use super::utils::find_widget;
 
 pub(super) fn build_gig_workspace() -> gtk::Box {
@@ -159,7 +160,35 @@ pub(super) fn build_gig_workspace() -> gtk::Box {
         notebook.append_page(&vbox, Some(&gtk::Label::new(Some("Match"))));
     }
 
-    // ── Tab 4: Finalize ───────────────────────────────────────────────────────
+    // ── Tab 4: Buy List ───────────────────────────────────────────────────────
+    {
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        vbox.set_border_width(12);
+
+        let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let buy_status = gtk::Label::new(None);
+        buy_status.set_widget_name("gig_buy_status");
+        buy_status.set_xalign(0.0);
+        buy_status.set_hexpand(true);
+        let copy_btn = gtk::Button::with_label("Copy shopping list");
+        copy_btn.set_widget_name("gig_buy_copy_btn");
+        top_bar.pack_start(&buy_status, true,  true,  0);
+        top_bar.pack_start(&copy_btn,  false, false, 0);
+
+        let buy_list = gtk::ListBox::new();
+        buy_list.set_widget_name("gig_buy_list");
+        buy_list.set_selection_mode(gtk::SelectionMode::None);
+        let scroll = gtk::ScrolledWindow::new(gtk::NONE_ADJUSTMENT, gtk::NONE_ADJUSTMENT);
+        scroll.set_vexpand(true);
+        scroll.add(&buy_list);
+
+        vbox.pack_start(&top_bar, false, false, 0);
+        vbox.pack_start(&scroll,  true,  true,  0);
+
+        notebook.append_page(&vbox, Some(&gtk::Label::new(Some("Buy List"))));
+    }
+
+    // ── Tab 5: Finalize ───────────────────────────────────────────────────────
     {
         let scroll = gtk::ScrolledWindow::new(gtk::NONE_ADJUSTMENT, gtk::NONE_ADJUSTMENT);
         scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -179,14 +208,9 @@ pub(super) fn build_gig_workspace() -> gtk::Box {
         create_btn.set_widget_name("gig_create_btn");
         create_btn.set_halign(gtk::Align::Start);
 
-        let shopping_btn = gtk::Button::with_label("Copy shopping list");
-        shopping_btn.set_widget_name("gig_shopping_btn");
-        shopping_btn.set_halign(gtk::Align::Start);
-
         vbox.pack_start(&dest_lbl,      false, false, 0);
         vbox.pack_start(&create_status, false, false, 0);
         vbox.pack_start(&create_btn,    false, false, 0);
-        vbox.pack_start(&shopping_btn,  false, false, 0);
 
         scroll.add(&vbox);
         notebook.append_page(&scroll, Some(&gtk::Label::new(Some("Finalize"))));
@@ -266,6 +290,9 @@ pub(super) fn load_gig_into_workspace(
         }
     }
 
+    // Refresh buy list
+    populate_buy_list(workspace, &gig.id);
+
     // Clear previous match results
     if let Some(w) = find_widget(workspace, "gig_match_list") {
         if let Ok(lb) = w.downcast::<gtk::ListBox>() {
@@ -293,6 +320,73 @@ pub(super) fn load_gig_into_workspace(
     }
 }
 
+/// Refresh the Buy List tab from the persisted gig data.
+pub(super) fn populate_buy_list(workspace: &gtk::Box, gig_id: &str) {
+    let store = crate::gig::GigStore::load();
+    let gig = match store.gigs.iter().find(|g| g.id == gig_id) {
+        Some(g) => g.clone(),
+        None    => return,
+    };
+
+    // Update list
+    if let Some(w) = find_widget(workspace, "gig_buy_list") {
+        if let Ok(lb) = w.downcast::<gtk::ListBox>() {
+            for child in lb.get_children() { lb.remove(&child); }
+
+            for track in &gig.pending_buy_tracks {
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                row_box.set_margin_start(4);
+                row_box.set_margin_end(4);
+                let lbl = gtk::Label::new(Some(&format!("{} – {}", track.title, track.artist)));
+                lbl.set_xalign(0.0);
+                lbl.set_hexpand(true);
+                row_box.pack_start(&lbl, true, true, 0);
+                let row = gtk::ListBoxRow::new();
+                row.set_selectable(false);
+                row.add(&row_box);
+                lb.add(&row);
+            }
+            lb.show_all();
+        }
+    }
+
+    // Update status label
+    if let Some(w) = find_widget(workspace, "gig_buy_status") {
+        if let Ok(lbl) = w.downcast::<gtk::Label>() {
+            let n = gig.pending_buy_tracks.len();
+            let status = if n == 0 { "No tracks queued for purchase".to_string() }
+                         else      { format!("{n} track(s) to buy") };
+            lbl.set_text(&status);
+        }
+    }
+
+    // Wire copy button
+    if !gig.pending_buy_tracks.is_empty() {
+        let tracks = gig.pending_buy_tracks.clone();
+        if let Some(w) = find_widget(workspace, "gig_buy_copy_btn") {
+            if let Ok(btn) = w.downcast::<gtk::Button>() {
+                // Disconnect old handlers by replacing the button label (forces a new connection)
+                btn.connect_clicked(move |b| {
+                    let lines: Vec<String> = tracks.iter().map(|t| {
+                        let q = format!("{} {}", t.artist, t.title)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join("+");
+                        format!(
+                            "**{} – {}**\nBeatport: https://www.beatport.com/search?q={}\nTraxsource: https://www.traxsource.com/search?term={}",
+                            t.artist, t.title, q, q,
+                        )
+                    }).collect();
+                    let text = lines.join("\n\n");
+                    let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+                    clipboard.set_text(&text);
+                    b.set_label("✓ Copied!");
+                });
+            }
+        }
+    }
+}
+
 pub(super) fn set_match_status(workspace: &gtk::Box, msg: &str) {
     if let Some(w) = find_widget(workspace, "gig_match_status") {
         if let Ok(lbl) = w.downcast::<gtk::Label>() {
@@ -301,12 +395,13 @@ pub(super) fn set_match_status(workspace: &gtk::Box, msg: &str) {
     }
 }
 
-/// Populate the Match tab with results and wire up Accept/Skip toggles.
+/// Populate the Match tab with results and wire up Accept/Skip toggles + play buttons.
 pub(super) fn populate_match_results(
     workspace: &gtk::Box,
     gig_id:    &str,
     results:   &[crate::matcher::MatchResult],
     window:    &gtk::ApplicationWindow,
+    player:    &Rc<crate::librespot_player::LibrespotPlayer>,
 ) {
     let match_list = match find_widget(workspace, "gig_match_list") {
         Some(w) => match w.downcast::<gtk::ListBox>() {
@@ -336,6 +431,13 @@ pub(super) fn populate_match_results(
         match_list.add(&row);
     }
 
+    // Load accepted state once — None means gig not yet tracked (default accept all)
+    let initial_accepted: Option<std::collections::HashSet<i64>> = {
+        let store = crate::gig::GigStore::load();
+        store.gigs.iter().find(|g| g.id == gig_id)
+            .map(|g| g.accepted_track_ids.iter().cloned().collect())
+    };
+
     // One row per matched track with Accept/Skip toggle
     for r in &matched {
         let local = r.matched.as_ref().unwrap();
@@ -357,13 +459,9 @@ pub(super) fn populate_match_results(
         local_lbl.set_xalign(0.0);
         local_lbl.set_width_chars(20);
 
-        // Load current accepted state
-        let accepted = {
-            let store = crate::gig::GigStore::load();
-            store.gigs.iter().find(|g| g.id == gig_id)
-                .map(|g| g.accepted_track_ids.contains(&track_id))
-                .unwrap_or(true)
-        };
+        let accepted = initial_accepted.as_ref()
+            .map(|ids| ids.contains(&track_id))
+            .unwrap_or(true);
 
         let toggle = gtk::ToggleButton::new();
         toggle.set_label(if accepted { "✓ Accept" } else { "Skip" });
@@ -386,8 +484,24 @@ pub(super) fn populate_match_results(
             }
         });
 
+        let play_btn  = gtk::Button::with_label("▶");
+        let track_uri = format!("spotify:track:{}", r.spotify.spotify_id);
+        let player_c  = player.clone();
+        let btn_c     = play_btn.clone();
+        let title_c   = r.spotify.title.clone();
+        let artist_c  = r.spotify.artist.clone();
+        let duration_ms = r.spotify.duration_ms;
+        play_btn.connect_clicked(move |btn| {
+            if btn.get_label().as_deref() == Some("▶") {
+                player_c.play(track_uri.clone(), title_c.clone(), artist_c.clone(), duration_ms, btn_c.clone());
+            } else {
+                player_c.stop();
+            }
+        });
+
         row_box.pack_start(&label,      true,  true,  0);
         row_box.pack_start(&local_lbl,  false, false, 0);
+        row_box.pack_start(&play_btn,   false, false, 0);
         row_box.pack_start(&toggle,     false, false, 0);
 
         let row = gtk::ListBoxRow::new();
@@ -409,24 +523,105 @@ pub(super) fn populate_match_results(
         match_list.add(&row);
     }
 
+    // Load current buy/deny decisions for missing tracks
+    let (buy_ids, deny_ids): (std::collections::HashSet<String>, std::collections::HashSet<String>) = {
+        let store = crate::gig::GigStore::load();
+        store.gigs.iter().find(|g| g.id == gig_id)
+            .map(|g| (
+                g.pending_buy_tracks.iter().map(|t| t.spotify_id.clone()).collect(),
+                g.denied_spotify_ids.iter().cloned().collect(),
+            ))
+            .unwrap_or_default()
+    };
+
     for r in &missing {
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         row_box.set_margin_start(4);
         row_box.set_margin_end(4);
 
-        let label = gtk::Label::new(Some(&format!(
-            "{} – {}",
-            r.spotify.title,
-            r.spotify.artist,
-        )));
+        let label = gtk::Label::new(Some(&format!("{} – {}", r.spotify.title, r.spotify.artist)));
         label.set_xalign(0.0);
         label.set_hexpand(true);
 
-        let missing_lbl = gtk::Label::new(Some("not in library"));
-        missing_lbl.set_xalign(0.0);
+        let play_btn  = gtk::Button::with_label("▶");
+        let track_uri = format!("spotify:track:{}", r.spotify.spotify_id);
+        let player_c  = player.clone();
+        let btn_c     = play_btn.clone();
+        let title_c   = r.spotify.title.clone();
+        let artist_c  = r.spotify.artist.clone();
+        let duration_ms = r.spotify.duration_ms;
+        play_btn.connect_clicked(move |btn| {
+            if btn.get_label().as_deref() == Some("▶") {
+                player_c.play(track_uri.clone(), title_c.clone(), artist_c.clone(), duration_ms, btn_c.clone());
+            } else {
+                player_c.stop();
+            }
+        });
 
-        row_box.pack_start(&label,       true,  true,  0);
-        row_box.pack_start(&missing_lbl, false, false, 0);
+        // Explicit Buy / Deny buttons — persists across re-runs
+        let already_bought = buy_ids.contains(&r.spotify.spotify_id);
+        let already_denied = deny_ids.contains(&r.spotify.spotify_id);
+
+        let buy_btn  = gtk::Button::with_label(if already_bought { "✓ Buy" } else { "Buy" });
+        let deny_btn = gtk::Button::with_label(if already_denied { "✗ Deny" } else { "Deny" });
+
+        let gig_id_c    = gig_id.to_string();
+        let spotify_id  = r.spotify.spotify_id.clone();
+        let title_c     = r.spotify.title.clone();
+        let artist_c    = r.spotify.artist.clone();
+        let workspace_c = workspace.clone();
+
+        // Buy button
+        {
+            let gig_id_c    = gig_id_c.clone();
+            let spotify_id  = spotify_id.clone();
+            let title_c     = title_c.clone();
+            let artist_c    = artist_c.clone();
+            let workspace_c = workspace_c.clone();
+            let buy_btn_c   = buy_btn.clone();
+            let deny_btn_c  = deny_btn.clone();
+            buy_btn.connect_clicked(move |_| {
+                buy_btn_c.set_label("✓ Buy");
+                deny_btn_c.set_label("Deny");
+                let mut store = crate::gig::GigStore::load();
+                if let Some(gig) = store.gigs.iter_mut().find(|g| g.id == gig_id_c) {
+                    gig.denied_spotify_ids.retain(|id| id != &spotify_id);
+                    if !gig.pending_buy_tracks.iter().any(|t| t.spotify_id == spotify_id) {
+                        gig.pending_buy_tracks.push(crate::gig::PendingBuyTrack {
+                            spotify_id: spotify_id.clone(),
+                            title:      title_c.clone(),
+                            artist:     artist_c.clone(),
+                        });
+                    }
+                    store.save();
+                }
+                populate_buy_list(&workspace_c, &gig_id_c);
+            });
+        }
+
+        // Deny button
+        {
+            let buy_btn_c   = buy_btn.clone();
+            let deny_btn_c  = deny_btn.clone();
+            deny_btn.connect_clicked(move |_| {
+                deny_btn_c.set_label("✗ Deny");
+                buy_btn_c.set_label("Buy");
+                let mut store = crate::gig::GigStore::load();
+                if let Some(gig) = store.gigs.iter_mut().find(|g| g.id == gig_id_c) {
+                    gig.pending_buy_tracks.retain(|t| t.spotify_id != spotify_id);
+                    if !gig.denied_spotify_ids.contains(&spotify_id) {
+                        gig.denied_spotify_ids.push(spotify_id.clone());
+                    }
+                    store.save();
+                }
+                populate_buy_list(&workspace_c, &gig_id_c);
+            });
+        }
+
+        row_box.pack_start(&label,    true,  true,  0);
+        row_box.pack_start(&play_btn, false, false, 0);
+        row_box.pack_start(&buy_btn,  false, false, 0);
+        row_box.pack_start(&deny_btn, false, false, 0);
 
         let row = gtk::ListBoxRow::new();
         row.set_selectable(false);
@@ -434,18 +629,23 @@ pub(super) fn populate_match_results(
         match_list.add(&row);
     }
 
-    // Wire up initial accepted_track_ids: add all matched tracks
+    // Wire up initial accepted_track_ids: add all matched tracks.
+    // Also prune pending_buy_tracks to only those still in the missing set
+    // (tracks added to the library fall off automatically).
     {
+        let missing_ids: std::collections::HashSet<String> = missing.iter()
+            .map(|r| r.spotify.spotify_id.clone())
+            .collect();
         let mut store = crate::gig::GigStore::load();
         if let Some(gig) = store.gigs.iter_mut().find(|g| g.id == gig_id) {
             let current: std::collections::HashSet<i64> = gig.accepted_track_ids.iter().cloned().collect();
-            // Add newly matched tracks that aren't already tracked
             for r in &matched {
                 let id = r.matched.as_ref().unwrap().id;
                 if !current.contains(&id) {
                     gig.accepted_track_ids.push(id);
                 }
             }
+            gig.pending_buy_tracks.retain(|t| missing_ids.contains(&t.spotify_id));
             store.save();
         }
     }
@@ -457,20 +657,7 @@ pub(super) fn populate_match_results(
         matched_count, missing_count,
     ));
 
-    // Shopping list button in Finalize tab
-    if !missing.is_empty() {
-        let missing_spotify: Vec<_> = missing.iter().map(|r| &r.spotify).collect();
-        let shopping = crate::matcher::shopping_list(&missing_spotify);
-        if let Some(w) = find_widget(workspace, "gig_shopping_btn") {
-            if let Ok(btn) = w.downcast::<gtk::Button>() {
-                btn.connect_clicked(move |b| {
-                    let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
-                    clipboard.set_text(&shopping);
-                    b.set_label("✓ Copied!");
-                });
-            }
-        }
-    }
+    populate_buy_list(workspace, gig_id);
 
     match_list.show_all();
 }

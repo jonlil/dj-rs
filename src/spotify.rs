@@ -9,7 +9,7 @@ use std::net::TcpListener;
 
 pub const CLIENT_ID: &str = "40c148a5aa614c38b6032a73ba2f030f";
 const REDIRECT_URI: &str = "http://127.0.0.1:8888/callback";
-const SCOPES: &str = "playlist-read-private playlist-read-collaborative";
+const SCOPES: &str = "streaming playlist-read-private playlist-read-collaborative user-modify-playback-state user-read-playback-state";
 
 // ── PKCE helpers ─────────────────────────────────────────────────────────────
 
@@ -146,12 +146,13 @@ struct TokenResponse {
 
 // ── Spotify API types ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpotifyTrack {
-    pub spotify_id: String,
-    pub title:      String,
-    pub artist:     String,   // primary artist only
+    pub spotify_id:  String,
+    pub title:       String,
+    pub artist:      String,   // primary artist only
     pub duration_ms: u32,
+    pub preview_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +172,7 @@ struct TrackObject {
     name:         String,
     duration_ms:  u32,
     artists:      Vec<ArtistObject>,
+    preview_url:  Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -187,7 +189,7 @@ pub fn fetch_playlist(access_token: &str, playlist_url: &str) -> Result<Vec<Spot
     let client = Client::new();
     let mut tracks = Vec::new();
     let mut url = format!(
-        "https://api.spotify.com/v1/playlists/{}/tracks?limit=100&fields=items(track(id,name,duration_ms,artists)),next",
+        "https://api.spotify.com/v1/playlists/{}/tracks?limit=100&fields=items(track(id,name,duration_ms,artists,preview_url)),next",
         playlist_id
     );
 
@@ -224,6 +226,7 @@ pub fn fetch_playlist(access_token: &str, playlist_url: &str) -> Result<Vec<Spot
                     title:       track.name,
                     artist,
                     duration_ms: track.duration_ms,
+                    preview_url: track.preview_url,
                 });
             }
         }
@@ -253,4 +256,73 @@ fn extract_playlist_id(input: &str) -> Result<String, String> {
         return Ok(input.to_string());
     }
     Err(format!("Could not extract playlist ID from: {input}"))
+}
+
+// ── Spotify Connect ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpotifyDevice {
+    pub id:        Option<String>,
+    pub name:      String,
+    pub is_active: bool,
+}
+
+#[derive(Deserialize)]
+struct DevicesResponse {
+    devices: Vec<SpotifyDevice>,
+}
+
+/// Returns all available Spotify Connect devices.
+pub fn get_devices(access_token: &str) -> Result<Vec<SpotifyDevice>, String> {
+    let client = Client::new();
+    let resp = client
+        .get("https://api.spotify.com/v1/me/player/devices")
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("Spotify API error {status}: {body}"));
+    }
+    let r: DevicesResponse = resp.json().map_err(|e| e.to_string())?;
+    Ok(r.devices)
+}
+
+/// Tells the given Spotify Connect device to play a track URI.
+pub fn start_track_playback(access_token: &str, device_id: &str, track_uri: &str) -> Result<(), String> {
+    let client = Client::new();
+    let body = serde_json::json!({ "uris": [track_uri] });
+    let resp = client
+        .put(format!("https://api.spotify.com/v1/me/player/play?device_id={device_id}"))
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() && resp.status().as_u16() != 204 {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("Spotify API error {status}: {body}"));
+    }
+    Ok(())
+}
+
+/// Pauses playback on the given device.
+pub fn pause_playback(access_token: &str, device_id: &str) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .put(format!("https://api.spotify.com/v1/me/player/pause?device_id={device_id}"))
+        .bearer_auth(access_token)
+        .header("Content-Length", "0")
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() && resp.status().as_u16() != 204 {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("Spotify API error {status}: {body}"));
+    }
+    Ok(())
 }

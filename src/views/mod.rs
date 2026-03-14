@@ -1,6 +1,6 @@
 use gtk::prelude::*;
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use glib::types::StaticType;
 use crate::deck::DeckState;
@@ -18,7 +18,8 @@ mod dialogs;
 use utils::fmt_time;
 use browser::{browser_populate_playlists, browser_populate_history, browser_populate_tracks};
 use gig_sidebar::{populate_gig_sidebar_from_library, populate_contacts_and_gigs};
-use gig_workspace::{build_gig_workspace, load_gig_into_workspace, set_match_status, populate_match_results};
+use gig_workspace::{build_gig_workspace, load_gig_into_workspace, set_match_status, populate_match_results, populate_buy_list};
+use crate::librespot_player::LibrespotPlayer;
 use contact_view::{build_contact_view, load_contact_into_view};
 use dialogs::show_settings_dialog;
 
@@ -52,10 +53,11 @@ pub struct PlayerView {
     pub queue_fn: Rc<dyn Fn(Track)>,
     pub current_track_db_id: Rc<RefCell<Option<i64>>>,
     pub on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+    pub spotify_player: Rc<LibrespotPlayer>,
 }
 
 impl PlayerView {
-    pub fn new(_window: &gtk::ApplicationWindow, deck_label: &str, bridge: Arc<ServerBridge>) -> Self {
+    pub fn new(_window: &gtk::ApplicationWindow, deck_label: &str, bridge: Arc<ServerBridge>, spotify_player: Rc<LibrespotPlayer>) -> Self {
         let state = Rc::new(RefCell::new(DeckState::new()));
         let current_track_db_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
         let on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
@@ -188,7 +190,12 @@ impl PlayerView {
             let play_btn_load      = play_btn.clone();
             let current_db_id_load = current_track_db_id.clone();
             let bridge_load        = bridge.clone();
+            let spotify_load       = spotify_player.clone();
             Rc::new(move |track: Track| {
+                // Stop Spotify if it was playing so the deck takes over
+                if spotify_load.is_active() {
+                    spotify_load.stop();
+                }
                 let path = match track.file_path.as_deref() {
                     Some(p) => std::path::PathBuf::from(p),
                     None    => return,
@@ -266,7 +273,19 @@ impl PlayerView {
             let bridge_play           = bridge.clone();
             let tv_output_play        = tv_output.clone();
             let current_track_db_play = current_track_db_id.clone();
+            let spotify_play          = spotify_player.clone();
             play_btn.connect_clicked(move |_| {
+                // When Spotify is active, the deck button controls librespot
+                if spotify_play.is_active() {
+                    if spotify_play.is_paused() {
+                        spotify_play.resume();
+                        play_btn_ref.set_label("❚❚  Pause");
+                    } else {
+                        spotify_play.pause();
+                        play_btn_ref.set_label("▶  Play");
+                    }
+                    return;
+                }
                 let is_playing = state.borrow().play_started_at.is_some();
                 if is_playing {
                     state.borrow_mut().pause();
@@ -335,6 +354,41 @@ impl PlayerView {
             });
         }
 
+        // Seek slider — user-initiated scrub
+        {
+            let state                = state.clone();
+            let time_label           = time_label.clone();
+            let bridge_seek          = bridge.clone();
+            let tv_output_sk         = tv_output.clone();
+            let current_db_sk        = current_track_db_id.clone();
+            let spotify_player_seek  = spotify_player.clone();
+            let time_label_seek      = time_label.clone();
+            position_scale.connect_change_value(move |_scale, _scroll, value| {
+                if spotify_player_seek.is_active() {
+                    let dur = spotify_player_seek.track_info().2;
+                    if dur <= 0.0 { return gtk::Inhibit(false); }
+                    let pos = (value * dur).clamp(0.0, dur);
+                    spotify_player_seek.seek(pos);
+                    let remaining = (dur - pos).max(0.0);
+                    time_label_seek.set_text(&format!("-{}", fmt_time(remaining)));
+                    return gtk::Inhibit(false);
+                }
+                let dur = state.borrow().duration_secs;
+                if dur <= 0.0 { return gtk::Inhibit(false); }
+                let pos = (value * dur).clamp(0.0, dur);
+                let _ = state.borrow_mut().seek_to(pos);
+                let remaining = (dur - pos).max(0.0);
+                time_label.set_text(&format!("-{}", fmt_time(remaining)));
+                bridge_seek.send(WsEvent::Position { pos });
+                if *tv_output_sk.borrow() {
+                    if let Some(id) = *current_db_sk.borrow() {
+                        bridge_seek.send(WsEvent::Stream { id, seek: pos });
+                    }
+                }
+                gtk::Inhibit(false)
+            });
+        }
+
         // Internal queued-track state (for auto-advance; no UI shown)
         let queued_track: Rc<RefCell<Option<Track>>> = Rc::new(RefCell::new(None));
 
@@ -353,15 +407,40 @@ impl PlayerView {
             let position_scale       = position_scale.clone();
             let time_label           = time_label.clone();
             let play_btn             = play_btn.clone();
+            let track_label          = track_label.clone();
+            let artist_label         = artist_label.clone();
             let current_track_db_id2 = current_track_db_id.clone();
             let on_track_end2        = on_track_end.clone();
             let bridge_timer         = bridge.clone();
             let tv_output_timer      = tv_output.clone();
             let tv_btn_timer         = tv_btn.clone();
             let volume_scale_timer   = volume_scale.clone();
+            let spotify_player_timer = spotify_player.clone();
             let mut tick: u32        = 0;
             glib::timeout_add_local(100, move || {
                 tick += 1;
+
+                // If Spotify (librespot) is the active audio source, update deck display from it
+                if spotify_player_timer.is_active() {
+                    let (title, artist, dur) = spotify_player_timer.track_info();
+                    let cur_text = track_label.get_text();
+                    if cur_text != title {
+                        track_label.set_text(&title);
+                        artist_label.set_text(&artist);
+                        position_scale.set_sensitive(true);
+                    }
+                    // Sync play/pause button label with librespot state
+                    let expected_label = if spotify_player_timer.is_paused() { "▶  Play" } else { "❚❚  Pause" };
+                    if play_btn.get_label().as_deref() != Some(expected_label) {
+                        play_btn.set_label(expected_label);
+                    }
+                    let pos = spotify_player_timer.current_position_secs();
+                    let fraction = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
+                    position_scale.set_value(fraction);
+                    let remaining = if dur > 0.0 { (dur - pos).max(0.0) } else { 0.0 };
+                    time_label.set_text(&format!("-{}", fmt_time(remaining)));
+                    return glib::Continue(true);
+                }
 
                 // Keep TV button in sync with connection state
                 let tv_live = bridge_timer.tv_connected();
@@ -463,6 +542,7 @@ impl PlayerView {
             queue_fn,
             current_track_db_id,
             on_track_end,
+            spotify_player,
         }
     }
 }
@@ -472,6 +552,7 @@ pub struct MainView {
     pub queue_fn: Rc<dyn Fn(Track)>,
     pub current_track_db_id: Rc<RefCell<Option<i64>>>,
     pub on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+    pub spotify_player: Rc<LibrespotPlayer>,
 }
 
 impl MainView {
@@ -479,14 +560,15 @@ impl MainView {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         container.set_border_width(8);
 
-        let player = PlayerView::new(window, "Deck", bridge);
+        let spotify_player = LibrespotPlayer::new();
+        let player = PlayerView::new(window, "Deck", bridge, spotify_player.clone());
         let queue_fn = player.queue_fn.clone();
         let current_track_db_id = player.current_track_db_id.clone();
         let on_track_end = player.on_track_end.clone();
 
         container.pack_start(&player.container, true, true, 0);
 
-        MainView { container, queue_fn, current_track_db_id, on_track_end }
+        MainView { container, queue_fn, current_track_db_id, on_track_end, spotify_player }
     }
 }
 
@@ -503,6 +585,7 @@ impl BrowserView {
         on_queue: Option<Rc<dyn Fn(Track)>>,
         current_track_db_id: Rc<RefCell<Option<i64>>>,
         on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>,
+        spotify_player: Rc<LibrespotPlayer>,
     ) -> Self {
         let library: Rc<RefCell<Option<Library>>> = Rc::new(RefCell::new(None));
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -851,8 +934,63 @@ impl BrowserView {
         }
 
         // ── gig workspace ────────────────────────────────────────────────────
-        let gig_workspace    = build_gig_workspace();
-        let contact_view     = build_contact_view();
+        let gig_workspace  = build_gig_workspace();
+        let preview_player = spotify_player;
+        let contact_view   = build_contact_view();
+
+        // Auto-populate Match tab from cache when the user switches to it
+        {
+            let gig_workspace_c  = gig_workspace.clone();
+            let library_c        = library.clone();
+            let config_c         = config.clone();
+            let preview_player_c = preview_player.clone();
+            let window_c         = window.clone();
+
+            if let Some(nb) = utils::find_widget(&gig_workspace, "gig_notebook") {
+                if let Ok(notebook) = nb.downcast::<gtk::Notebook>() {
+                    notebook.connect_switch_page(move |_, _, page_num| {
+                        if page_num != 2 { return; } // Match tab is index 2
+
+                        let wname  = gig_workspace_c.get_widget_name().to_string();
+                        let gig_id = match wname.strip_prefix("gig_workspace:") {
+                            Some(id) if !id.is_empty() => id.to_string(),
+                            _ => return,
+                        };
+
+                        // Only load from cache if the list is currently empty
+                        let is_empty = utils::find_widget(&gig_workspace_c, "gig_match_list")
+                            .and_then(|w| w.downcast::<gtk::ListBox>().ok())
+                            .map(|lb| lb.get_children().is_empty())
+                            .unwrap_or(true);
+                        if !is_empty { return; }
+
+                        let store = crate::gig::GigStore::load();
+                        let gig   = match store.gigs.iter().find(|g| g.id == gig_id) {
+                            Some(g) => g.clone(),
+                            None    => return,
+                        };
+                        if gig.cached_spotify_tracks.is_empty() { return; }
+
+                        let lib_opt = library_c.borrow();
+                        let lib = match lib_opt.as_ref() {
+                            Some(l) => l,
+                            None    => return,
+                        };
+                        let all_tracks = lib.tracks().unwrap_or_default();
+                        let results    = crate::matcher::match_tracks(&gig.cached_spotify_tracks, &all_tracks);
+
+                        if let Some(token) = config_c.borrow().spotify_access_token.clone() {
+                            preview_player_c.set_token(token);
+                        }
+                        set_match_status(&gig_workspace_c, &format!(
+                            "Cached: {} tracks — click Run Match to refresh",
+                            gig.cached_spotify_tracks.len(),
+                        ));
+                        populate_match_results(&gig_workspace_c, &gig_id, &results, &window_c, &preview_player_c);
+                    });
+                }
+            }
+        }
 
         // Right panel: stack switching between track list, contact view, and gig workspace
         let right_stack = gtk::Stack::new();
@@ -904,6 +1042,7 @@ impl BrowserView {
         // ── contact view: auto-save on field change ───────────────────────────
         {
             let contact_view2 = contact_view.clone();
+            let flash_timer: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
             let save = Rc::new(move || {
                 // Derive contact ID from the view's widget name
                 let view_name = contact_view2.get_widget_name().to_string();
@@ -942,15 +1081,19 @@ impl BrowserView {
                         }
                     }
                     store.save();
-                    // Flash "Saved" indicator
+                    // Flash "Saved" indicator — cancel any pending timer first
                     if let Some(w) = utils::find_widget(&contact_view2, "contact_saved_lbl") {
                         if let Ok(lbl) = w.downcast::<gtk::Label>() {
                             lbl.set_text("✓ Saved");
+                            if let Some(src) = flash_timer.take() {
+                                glib::source_remove(src);
+                            }
                             let lbl_c = lbl.clone();
-                            glib::timeout_add_local(2000, move || {
+                            let src = glib::timeout_add_local(2000, move || {
                                 lbl_c.set_text("");
                                 glib::Continue(false)
                             });
+                            flash_timer.set(Some(src));
                         }
                     }
                 }
@@ -981,6 +1124,7 @@ impl BrowserView {
         // ── gig workspace: auto-save on field change ─────────────────────────
         {
             let gig_workspace2 = gig_workspace.clone();
+            let flash_timer: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
             let save = Rc::new(move || {
                 let wname = gig_workspace2.get_widget_name().to_string();
                 let gig_id = match wname.strip_prefix("gig_workspace:") {
@@ -1022,15 +1166,19 @@ impl BrowserView {
                         }
                     }
                     store.save();
-                    // Flash "Saved" indicator
+                    // Flash "Saved" indicator — cancel any pending timer first
                     if let Some(w) = utils::find_widget(&gig_workspace2, "gig_saved_lbl") {
                         if let Ok(lbl) = w.downcast::<gtk::Label>() {
                             lbl.set_text("✓ Saved");
+                            if let Some(src) = flash_timer.take() {
+                                glib::source_remove(src);
+                            }
                             let lbl_c = lbl.clone();
-                            glib::timeout_add_local(2000, move || {
+                            let src = glib::timeout_add_local(2000, move || {
                                 lbl_c.set_text("");
                                 glib::Continue(false)
                             });
+                            flash_timer.set(Some(src));
                         }
                     }
                 }
@@ -1060,6 +1208,7 @@ impl BrowserView {
             let config2        = config.clone();
             let library2       = library.clone();
             let window2        = window.clone();
+            let preview2       = preview_player.clone();
 
             if let Some(w) = utils::find_widget(&gig_workspace, "gig_run_match") {
                 w.downcast::<gtk::Button>().unwrap()
@@ -1130,9 +1279,18 @@ impl BrowserView {
                                 set_match_status(&gig_workspace2, &format!("Spotify fetch failed: {e}"));
                             }
                             Ok(spotify_tracks) => {
+                                // Persist tracks to cache so the Match tab loads instantly next time
+                                {
+                                    let mut store = crate::gig::GigStore::load();
+                                    if let Some(g) = store.gigs.iter_mut().find(|g| g.id == gig_id) {
+                                        g.cached_spotify_tracks = spotify_tracks.clone();
+                                        store.save();
+                                    }
+                                }
                                 let all_tracks = lib.tracks().unwrap_or_default();
                                 let results    = crate::matcher::match_tracks(&spotify_tracks, &all_tracks);
-                                populate_match_results(&gig_workspace2, &gig_id, &results, &window2);
+                                preview2.set_token(token.clone());
+                                populate_match_results(&gig_workspace2, &gig_id, &results, &window2, &preview2);
                             }
                         }
                     });
@@ -1249,8 +1407,11 @@ impl BrowserView {
                             tags:                 Vec::new(),
                             notes:                String::new(),
                             spotify_playlist_url: None,
-                            accepted_track_ids:   Vec::new(),
-                            rekordbox_folder_id:  None,
+                            cached_spotify_tracks: Vec::new(),
+                            accepted_track_ids:    Vec::new(),
+                            pending_buy_tracks:    Vec::new(),
+                            denied_spotify_ids:    Vec::new(),
+                            rekordbox_folder_id:   None,
                         };
                         let mut store = crate::gig::GigStore::load();
                         store.gigs.push(gig.clone());

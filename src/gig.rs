@@ -45,6 +45,14 @@ pub struct Contact {
     pub rekordbox_folder_id: Option<i64>,
 }
 
+/// A missing track the DJ has decided to purchase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingBuyTrack {
+    pub spotify_id: String,
+    pub title:      String,
+    pub artist:     String,
+}
+
 /// Represents one specific gig / event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gig {
@@ -71,11 +79,33 @@ pub struct Gig {
     #[serde(default)]
     pub notes: String,
     pub spotify_playlist_url: Option<String>,
-    /// Track IDs (djmdContent) accepted in the Match tab
+    /// Cached Spotify playlist tracks (last successful fetch)
+    #[serde(default)]
+    pub cached_spotify_tracks: Vec<crate::spotify::SpotifyTrack>,
+    /// Track IDs (djmdContent) accepted in the Match tab (matched tracks → playlist)
     #[serde(default)]
     pub accepted_track_ids: Vec<i64>,
+    /// Missing tracks the DJ has decided to buy
+    #[serde(default)]
+    pub pending_buy_tracks: Vec<PendingBuyTrack>,
+    /// Spotify IDs of missing tracks reviewed and skipped (so re-runs don't re-prompt)
+    #[serde(default)]
+    pub denied_spotify_ids: Vec<String>,
     /// ID of the event folder (or playlist) in djmdPlaylist
     pub rekordbox_folder_id: Option<i64>,
+}
+
+impl Gig {
+    /// Short display label: "Name (date)", "Name", or the date alone when name is empty.
+    pub fn format_label(&self) -> String {
+        if self.name.is_empty() {
+            self.date.as_deref().unwrap_or("New Gig").to_string()
+        } else if let Some(date) = &self.date {
+            format!("{} ({})", self.name, date)
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
