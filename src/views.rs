@@ -1,10 +1,12 @@
 use gtk::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::sync::Arc;
 use glib::types::StaticType;
 use crate::deck::DeckState;
 use crate::config::{Config, PathMapping};
 use crate::rekordbox::{Library, Track, Playlist, HistorySession, TrackFilter, compatible_camelot_keys};
+use crate::server::{ServerBridge, WsEvent};
 
 fn fmt_time(secs: f64) -> String {
     let s = secs as u64;
@@ -32,7 +34,7 @@ pub struct PlayerView {
 }
 
 impl PlayerView {
-    pub fn new(_window: &gtk::ApplicationWindow, deck_label: &str) -> Self {
+    pub fn new(_window: &gtk::ApplicationWindow, deck_label: &str, bridge: Arc<ServerBridge>) -> Self {
         let state = Rc::new(RefCell::new(DeckState::new()));
         let current_track_db_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
         let on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
@@ -59,17 +61,34 @@ impl PlayerView {
         // Time display
         let time_label = gtk::Label::new(Some("0:00 / 0:00"));
 
-        // Controls: Play/Pause + Cue
+        // Controls: Play/Pause + Cue + TV output toggle
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         controls.set_homogeneous(true);
         let play_btn = gtk::Button::with_label("Play");
         let cue_btn  = gtk::Button::with_label("Cue");
+        let tv_btn   = gtk::ToggleButton::with_label("TV");
+        tv_btn.set_sensitive(false); // enabled only when a TV client is connected
         controls.pack_start(&play_btn, true, true, 0);
         controls.pack_start(&cue_btn,  true, true, 0);
+        controls.pack_start(&tv_btn,   true, true, 0);
 
-        // Volume scale — not shown in UI but kept for MainView wiring
+        // Volume scale — not shown in UI but available for level control
         let vol_adj = gtk::Adjustment::new(1.0, 0.0, 1.5, 0.01, 0.1, 0.0);
         let volume_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&vol_adj));
+
+        // TV output active state (shared across closures on the GTK thread)
+        let tv_output: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+        // Wire volume slider so it respects TV-output mute
+        {
+            let state = state.clone();
+            let tv_output_vol = tv_output.clone();
+            volume_scale.connect_value_changed(move |scale| {
+                if !*tv_output_vol.borrow() {
+                    state.borrow().sink.set_volume(scale.get_value() as f32);
+                }
+            });
+        }
 
         vbox.pack_start(&track_label,    false, false, 0);
         vbox.pack_start(&waveform_area,  false, false, 0);
@@ -85,6 +104,7 @@ impl PlayerView {
             let track_label    = track_label.clone();
             let position_scale = position_scale.clone();
             let time_label     = time_label.clone();
+            let bridge_load    = bridge.clone();
             Rc::new(move |path: std::path::PathBuf| {
                 let name = path.file_name()
                     .and_then(|n| n.to_str())
@@ -99,6 +119,12 @@ impl PlayerView {
                     } else {
                         time_label.set_text("0:00 / ?");
                     }
+                    bridge_load.send(WsEvent::Metadata {
+                        title:    name,
+                        artist:   String::new(),
+                        duration: dur,
+                    });
+                    bridge_load.send(WsEvent::Position { pos: 0.0 });
                 } else {
                     track_label.set_text("Error loading file");
                 }
@@ -121,17 +147,30 @@ impl PlayerView {
 
         // Play/Pause button
         {
-            let state        = state.clone();
-            let play_btn_ref = play_btn.clone();
+            let state                 = state.clone();
+            let play_btn_ref          = play_btn.clone();
+            let bridge_play           = bridge.clone();
+            let tv_output_play        = tv_output.clone();
+            let current_track_db_play = current_track_db_id.clone();
             play_btn.connect_clicked(move |_| {
                 let is_playing = state.borrow().play_started_at.is_some();
                 if is_playing {
                     state.borrow_mut().pause();
                     play_btn_ref.set_label("Play");
+                    bridge_play.send(WsEvent::State { playing: false });
                 } else {
                     state.borrow_mut().play();
                     if state.borrow().play_started_at.is_some() {
                         play_btn_ref.set_label("Pause");
+                        if *tv_output_play.borrow() {
+                            // Keep local audio muted; tell TV to stream
+                            state.borrow().sink.set_volume(0.0);
+                            let pos = state.borrow().current_position_secs();
+                            if let Some(id) = *current_track_db_play.borrow() {
+                                bridge_play.send(WsEvent::Stream { id, seek: pos });
+                            }
+                        }
+                        bridge_play.send(WsEvent::State { playing: true });
                     }
                 }
             });
@@ -143,6 +182,7 @@ impl PlayerView {
             let play_btn       = play_btn.clone();
             let position_scale = position_scale.clone();
             let time_label     = time_label.clone();
+            let bridge_cue     = bridge.clone();
             cue_btn.connect_clicked(move |_| {
                 state.borrow_mut().stop();
                 play_btn.set_label("Play");
@@ -152,6 +192,32 @@ impl PlayerView {
                     "0:00 / {}",
                     if dur > 0.0 { fmt_time(dur) } else { "?".into() }
                 ));
+                bridge_cue.send(WsEvent::State    { playing: false });
+                bridge_cue.send(WsEvent::Position { pos: 0.0 });
+            });
+        }
+
+        // TV output toggle: mute local sink and stream to TV when active
+        {
+            let state               = state.clone();
+            let tv_output_btn       = tv_output.clone();
+            let bridge_tv           = bridge.clone();
+            let current_track_db_tv = current_track_db_id.clone();
+            let volume_scale_tv     = volume_scale.clone();
+            tv_btn.connect_toggled(move |btn| {
+                let active = btn.get_active();
+                *tv_output_btn.borrow_mut() = active;
+                if active {
+                    state.borrow().sink.set_volume(0.0);
+                    if state.borrow().play_started_at.is_some() {
+                        let pos = state.borrow().current_position_secs();
+                        if let Some(id) = *current_track_db_tv.borrow() {
+                            bridge_tv.send(WsEvent::Stream { id, seek: pos });
+                        }
+                    }
+                } else {
+                    state.borrow().sink.set_volume(volume_scale_tv.get_value() as f32);
+                }
             });
         }
 
@@ -175,7 +241,46 @@ impl PlayerView {
             let play_btn             = play_btn.clone();
             let current_track_db_id2 = current_track_db_id.clone();
             let on_track_end2        = on_track_end.clone();
+            let bridge_timer         = bridge.clone();
+            let tv_output_timer      = tv_output.clone();
+            let tv_btn_timer         = tv_btn.clone();
+            let volume_scale_timer   = volume_scale.clone();
+            let mut tick: u32        = 0;
             glib::timeout_add_local(100, move || {
+                tick += 1;
+
+                // Keep TV button in sync with connection state
+                let tv_live = bridge_timer.tv_connected();
+                if tv_btn_timer.get_sensitive() != tv_live {
+                    tv_btn_timer.set_sensitive(tv_live);
+                }
+                // If TV disconnected while it was the active output, fall back to local
+                if !tv_live && *tv_output_timer.borrow() {
+                    *tv_output_timer.borrow_mut() = false;
+                    tv_btn_timer.set_active(false);
+                    state.borrow().sink.set_volume(volume_scale_timer.get_value() as f32);
+                }
+
+                // Apply any seek requested by the TV
+                if let Some(seek_pos) = bridge_timer.take_seek() {
+                    let _ = state.borrow_mut().seek_to(seek_pos);
+                    let dur = state.borrow().duration_secs;
+                    let fraction = if dur > 0.0 { (seek_pos / dur).min(1.0) } else { 0.0 };
+                    position_scale.set_value(fraction);
+                    time_label.set_text(&format!(
+                        "{} / {}",
+                        fmt_time(seek_pos),
+                        if dur > 0.0 { fmt_time(dur) } else { "?".into() }
+                    ));
+                    bridge_timer.send(WsEvent::Position { pos: seek_pos });
+                    // When TV is the output, restart the stream at the new position
+                    if *tv_output_timer.borrow() {
+                        if let Some(id) = *current_track_db_id2.borrow() {
+                            bridge_timer.send(WsEvent::Stream { id, seek: seek_pos });
+                        }
+                    }
+                }
+
                 let (is_started, sink_empty) = {
                     let st = state.borrow();
                     (st.play_started_at.is_some(), st.sink.empty())
@@ -199,12 +304,21 @@ impl PlayerView {
                     position_scale.set_value(0.0);
                     let dur = state.borrow().duration_secs;
                     time_label.set_text(&format!("0:00 / {}", fmt_time(dur)));
+                    bridge_timer.send(WsEvent::State    { playing: false });
+                    bridge_timer.send(WsEvent::Position { pos: 0.0 });
 
                     if let Some(path) = queued_path.borrow_mut().take() {
                         do_load(path);
                         state.borrow_mut().play();
                         if state.borrow().play_started_at.is_some() {
                             play_btn.set_label("Pause");
+                            if *tv_output_timer.borrow() {
+                                state.borrow().sink.set_volume(0.0);
+                                if let Some(id) = *current_track_db_id2.borrow() {
+                                    bridge_timer.send(WsEvent::Stream { id, seek: 0.0 });
+                                }
+                            }
+                            bridge_timer.send(WsEvent::State { playing: true });
                         }
                     }
 
@@ -223,6 +337,11 @@ impl PlayerView {
                         fmt_time(pos),
                         if dur > 0.0 { fmt_time(dur) } else { "?".into() }
                     ));
+
+                    // Broadcast position to TV every ~1 second
+                    if tick % 10 == 0 {
+                        bridge_timer.send(WsEvent::Position { pos });
+                    }
                 }
 
                 glib::Continue(true)
@@ -248,21 +367,14 @@ pub struct MainView {
 }
 
 impl MainView {
-    pub fn new(window: &gtk::ApplicationWindow) -> Self {
+    pub fn new(window: &gtk::ApplicationWindow, bridge: Arc<ServerBridge>) -> Self {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         container.set_border_width(8);
 
-        let player = PlayerView::new(window, "Deck");
+        let player = PlayerView::new(window, "Deck", bridge);
         let queue_fn = player.queue_fn.clone();
         let current_track_db_id = player.current_track_db_id.clone();
         let on_track_end = player.on_track_end.clone();
-
-        {
-            let state = player.state.clone();
-            player.volume_scale.connect_value_changed(move |scale| {
-                state.borrow().sink.set_volume(scale.get_value() as f32);
-            });
-        }
 
         container.pack_start(&player.container, true, true, 0);
 

@@ -162,6 +162,15 @@ impl Library {
         Ok(playlists)
     }
 
+    /// Return the raw `FolderPath` for a single track (before path-mapping).
+    pub fn track_file_path(&self, id: i64) -> Option<String> {
+        self.conn.query_row(
+            "SELECT FolderPath FROM djmdContent WHERE ID = ? AND rb_local_deleted = 0",
+            rusqlite::params![id.to_string()],
+            |row| row.get(0),
+        ).ok().flatten()
+    }
+
     pub fn playlist_tracks(&self, playlist_id: i64) -> Result<Vec<Track>> {
         let id_str = playlist_id.to_string();
         let mut stmt = self.conn.prepare(

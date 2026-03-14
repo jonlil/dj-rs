@@ -33,6 +33,6 @@ else
 fi
 
 echo "==> Signing and packaging..."
-"$TIZEN" package -t wgt -s "$CERT_PROFILE" -- "$DIST"
+"$TIZEN" package -t wgt -- "$DIST"
 mv "$DIST"/*.wgt "./$WGT" 2>/dev/null || true
 echo "==> Done: $WGT"

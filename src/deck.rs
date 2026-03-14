@@ -194,6 +194,30 @@ impl DeckState {
         Ok(())
     }
 
+    /// Seek to `pos` seconds, preserving play/pause state.
+    pub fn seek_to(&mut self, pos: f64) -> Result<(), String> {
+        let was_playing = self.play_started_at.is_some();
+        let path = self.file_path.clone().ok_or("No track loaded")?;
+
+        let new_sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
+        new_sink.pause();
+
+        let file = File::open(&path).map_err(|e| e.to_string())?;
+        let decoder = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+        let positioned = decoder.skip_duration(Duration::from_secs_f64(pos));
+        new_sink.append(positioned);
+
+        self.sink = new_sink;
+        self.accumulated_secs = pos;
+        self.play_started_at = None;
+
+        if was_playing {
+            self.play_started_at = Some(Instant::now());
+            self.sink.play();
+        }
+        Ok(())
+    }
+
     pub fn current_position_secs(&self) -> f64 {
         match self.play_started_at {
             Some(t) => {

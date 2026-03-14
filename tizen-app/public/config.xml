@@ -8,6 +8,7 @@
                      package="djrsremote"
                      required_version="3.0"/>
   <tizen:privilege name="http://tizen.org/privilege/internet"/>
+  <access origin="*" subdomains="true"/>
   <tizen:profile name="tv"/>
   <content src="index.html"/>
   <name>dj-rs</name>

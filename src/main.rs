@@ -6,6 +6,7 @@ mod config;
 mod deck;
 mod dlna;
 mod rekordbox;
+mod server;
 mod views;
 
 use gtk::prelude::*;
@@ -51,7 +52,12 @@ impl Widgets {
         window.set_title("DJ Application");
 
         let cfg = std::rc::Rc::new(std::cell::RefCell::new(config::Config::load()));
-        let main_view            = views::MainView::new(&window);
+        let bridge = server::start_server(
+            7879,
+            cfg.borrow().db_path.clone(),
+            cfg.borrow().clone(),
+        );
+        let main_view            = views::MainView::new(&window, bridge);
         let queue_fn             = main_view.queue_fn.clone();
         let current_track_db_id  = main_view.current_track_db_id.clone();
         let on_track_end         = main_view.on_track_end.clone();

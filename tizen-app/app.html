@@ -56,6 +56,22 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Tap-to-play overlay ───────────────────────────────────────── */
+#tap-overlay {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.6);
+    z-index: 20;
+    cursor: pointer;
+}
+#tap-overlay span {
+    font-size: 80px;
+    color: #1DB954;
+}
+
 /* ── Top bar ───────────────────────────────────────────────────── */
 #top-bar {
     position: absolute;
@@ -204,12 +220,20 @@ body {
 </head>
 <body>
 
+<!-- Hidden audio player for TV-output mode -->
+<audio id="player" style="display:none"></audio>
+
+<!-- Tap-to-play overlay (shown when autoplay is blocked) -->
+<div id="tap-overlay">
+    <span>&#9654;</span>
+</div>
+
 <!-- Scanning overlay -->
 <div id="scanning">
     <div id="scan-logo">dj-rs</div>
     <div class="spinner"></div>
     <div id="scan-msg">Scanning for dj-rs on local network…</div>
-    <div id="scan-detail">checking 192.168.x.1–254 on port 7879</div>
+    <div id="scan-detail">checking 192.168.1.1–254 on port 7879</div>
 </div>
 
 <!-- Top bar -->
@@ -266,7 +290,8 @@ var state = {
     playing: false,
     ws: null,
     ticker: null,
-    desktopBase: null
+    desktopBase: null,
+    pendingStreamUrl: null   // set when autoplay is blocked
 };
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
@@ -317,6 +342,27 @@ function setDisconnected() {
     document.getElementById('conn-host').textContent = '';
 }
 
+// ── Unlock audio on any user interaction (click or remote OK key) ─────────────
+function unlockAudio() {
+    document.getElementById('tap-overlay').style.display = 'none';
+    var audio = document.getElementById('player');
+    if (state.pendingStreamUrl) {
+        audio.src = state.pendingStreamUrl;
+        state.pendingStreamUrl = null;
+    }
+    if (audio.src) { audio.play(); }
+}
+
+document.getElementById('tap-overlay').addEventListener('click', unlockAudio);
+
+document.addEventListener('keydown', function(e) {
+    // Remote OK/Enter = 13, Play = 415, also catch any key while overlay is visible
+    var overlayVisible = document.getElementById('tap-overlay').style.display === 'flex';
+    if (overlayVisible) {
+        unlockAudio();
+    }
+});
+
 // ── Seek bar click ────────────────────────────────────────────────────────────
 document.getElementById('seek-track').addEventListener('click', function(e) {
     var rect = this.getBoundingClientRect();
@@ -340,6 +386,7 @@ function connectWs(base) {
     ws.onmessage = function(e) {
         try {
             var msg = JSON.parse(e.data);
+            var audio = document.getElementById('player');
             if (msg.type === 'metadata') {
                 document.getElementById('track-title').textContent = msg.title || 'Unknown';
                 document.getElementById('track-artist').textContent = msg.artist || '—';
@@ -351,6 +398,23 @@ function connectWs(base) {
                 updateSeek();
             } else if (msg.type === 'state') {
                 setPlaying(msg.playing);
+                if (!msg.playing) {
+                    audio.pause();
+                } else if (audio.src) {
+                    audio.play();
+                }
+            } else if (msg.type === 'stream') {
+                var url = state.desktopBase + '/stream/' + msg.id + '?seek=' + (msg.seek || 0);
+                audio.src = url;
+                audio.load();
+                var p = audio.play();
+                if (p !== undefined) {
+                    p.catch(function() {
+                        // Autoplay blocked — store URL, show tap-to-play overlay
+                        state.pendingStreamUrl = url;
+                        document.getElementById('tap-overlay').style.display = 'flex';
+                    });
+                }
             }
         } catch(err) {}
     };
@@ -363,27 +427,9 @@ function connectWs(base) {
     };
 }
 
-// ── Discovery: subnet scan via XHR ───────────────────────────────────────────
-function getLocalIp(cb) {
-    try {
-        var pc = new RTCPeerConnection({ iceServers: [] });
-        pc.createDataChannel('');
-        pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
-        pc.onicecandidate = function(e) {
-            if (!e || !e.candidate) return;
-            var m = e.candidate.candidate.match(/([0-9]{1,3}(\.[0-9]{1,3}){3})/);
-            if (m && !m[1].startsWith('0.') && !m[1].startsWith('169.')) {
-                pc.close();
-                cb(m[1]);
-            }
-        };
-        setTimeout(function() { cb(null); }, 3000);
-    } catch(err) { cb(null); }
-}
-
-function scanSubnet(localIp, done) {
-    var parts = localIp.split('.');
-    var subnet = parts[0] + '.' + parts[1] + '.' + parts[2] + '.';
+// ── Discovery: scan 192.168.1.0/24 ───────────────────────────────────────────
+function discover() {
+    var subnet = '192.168.1.';
     var found = false;
     var pending = 254;
 
@@ -400,40 +446,43 @@ function scanSubnet(localIp, done) {
                 if (xhr.readyState === 4) {
                     if (xhr.status === 200 && xhr.responseText.indexOf('dj-rs') !== -1) {
                         found = true;
-                        done('http://' + ip + ':7879');
+                        state.desktopBase = 'http://' + ip + ':7879';
+                        connectWs(state.desktopBase);
                     } else {
                         pending--;
-                        if (pending === 0 && !found) done(null);
+                        if (pending === 0 && !found) {
+                            document.getElementById('scan-msg').textContent = 'dj-rs not found — retrying…';
+                            setTimeout(discover, 5000);
+                        }
                     }
                 }
             };
             xhr.ontimeout = xhr.onerror = function() {
                 if (found) return;
                 pending--;
-                if (pending === 0 && !found) done(null);
+                if (pending === 0 && !found) {
+                    document.getElementById('scan-msg').textContent = 'dj-rs not found — retrying…';
+                    setTimeout(discover, 5000);
+                }
             };
             xhr.send();
         })(subnet + i);
     }
 }
 
-function discover() {
-    getLocalIp(function(ip) {
-        if (!ip) {
-            document.getElementById('scan-msg').textContent = 'Could not detect local IP';
-            return;
-        }
-        scanSubnet(ip, function(base) {
-            if (!base) {
-                document.getElementById('scan-msg').textContent = 'dj-rs not found — retrying…';
-                setTimeout(discover, 5000);
-                return;
-            }
-            state.desktopBase = base;
-            connectWs(base);
-        });
+// ── Audio element error logging ───────────────────────────────────────────────
+(function() {
+    var audio = document.getElementById('player');
+    audio.addEventListener('error', function() {
+        var err = audio.error ? ('code ' + audio.error.code + ': ' + audio.error.message) : 'unknown';
+        document.getElementById('scan-detail').textContent = 'audio error: ' + err;
+        document.getElementById('scanning').classList.remove('hidden');
+        console.error('audio error', err, 'src=', audio.src);
     });
-}
+    audio.addEventListener('canplay', function() {
+        console.log('audio canplay, src=', audio.src);
+    });
+})();
 
 discover();
 </script>
