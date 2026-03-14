@@ -517,16 +517,32 @@ impl BrowserView {
         // ── top bar ──────────────────────────────────────────────────────────
         let topbar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         topbar.set_border_width(4);
-        let open_btn      = gtk::Button::with_label("Open Library…");
-        let reload_btn    = gtk::Button::with_label("↺ Reload");
-        let settings_btn  = gtk::Button::with_label("Settings…");
-        let status_lbl    = gtk::Label::new(Some("No library loaded"));
-        let search_entry  = gtk::Entry::new();
+
+        // ⋮ menu button for Open Library + Settings
+        let menu_btn = gtk::MenuButton::new();
+        menu_btn.set_label("☰");
+        menu_btn.set_relief(gtk::ReliefStyle::None);
+        menu_btn.set_tooltip_text(Some("Menu"));
+        let menu = gtk::Menu::new();
+        let open_btn     = gtk::MenuItem::with_label("Open Library…");
+        let settings_btn = gtk::MenuItem::with_label("Settings…");
+        menu.append(&open_btn);
+        menu.append(&settings_btn);
+        menu.show_all();
+        menu_btn.set_popup(Some(&menu));
+
+        // Small reload button
+        let reload_btn = gtk::Button::with_label("↺");
+        reload_btn.set_relief(gtk::ReliefStyle::None);
+        reload_btn.set_tooltip_text(Some("Reload library"));
+
+        let status_lbl   = gtk::Label::new(Some("No library loaded"));
+        let search_entry = gtk::Entry::new();
         search_entry.set_placeholder_text(Some("Search tracks…"));
         search_entry.set_hexpand(true);
-        topbar.pack_start(&open_btn,     false, false, 0);
+
+        topbar.pack_start(&menu_btn,     false, false, 0);
         topbar.pack_start(&reload_btn,   false, false, 0);
-        topbar.pack_start(&settings_btn, false, false, 0);
         topbar.pack_start(&status_lbl,   false, false, 8);
         topbar.pack_end(&search_entry,   false, false, 0);
 
@@ -653,7 +669,7 @@ impl BrowserView {
 
         let new_gig_btn = gtk::Button::with_label("+");
         new_gig_btn.set_relief(gtk::ReliefStyle::None);
-        new_gig_btn.set_tooltip_text(Some("New Gig"));
+        new_gig_btn.set_tooltip_text(Some("New Contact"));
 
         let gigs_footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         gigs_footer.pack_start(&new_gig_btn, false, false, 0);
@@ -662,7 +678,7 @@ impl BrowserView {
         let gigs_vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
         gigs_vbox.pack_start(&gig_list_box, false, false, 0);
         gigs_vbox.pack_start(&gigs_footer,  false, false, 0);
-        let gigs_expander = gtk::Expander::new(Some("Gigs"));
+        let gigs_expander = gtk::Expander::new(Some("Contacts"));
         gigs_expander.set_expanded(true);
         gigs_expander.add(&gigs_vbox);
 
@@ -837,16 +853,40 @@ impl BrowserView {
         }
 
         // ── gig workspace ────────────────────────────────────────────────────
-        let gig_workspace = build_gig_workspace();
+        let gig_workspace    = build_gig_workspace();
+        let contact_view     = build_contact_view();
 
-        // Right panel: stack switching between track list and gig workspace
+        // Right panel: stack switching between track list, contact view, and gig workspace
         let right_stack = gtk::Stack::new();
         right_stack.add_named(&track_panel,    "tracks");
+        right_stack.add_named(&contact_view,   "contact");
         right_stack.add_named(&gig_workspace,  "gig");
         right_stack.set_visible_child_name("tracks");
 
-        // Wire up back button in gig workspace
+        // Wire up back button in gig workspace — returns to contact view
         if let Some(back_btn) = find_widget(&gig_workspace, "gig_back_btn") {
+            let right_stack_c   = right_stack.clone();
+            let gig_workspace_c = gig_workspace.clone();
+            let contact_view_c  = contact_view.clone();
+            back_btn.downcast::<gtk::Button>().unwrap()
+                .connect_clicked(move |_| {
+                    // The workspace widget name is "gig_workspace:{contact_id}" when a gig is loaded
+                    let wname = gig_workspace_c.get_widget_name().to_string();
+                    if let Some(contact_id) = wname.strip_prefix("gig_workspace:") {
+                        let store = crate::gig::GigStore::load();
+                        if let Some(contact) = store.contacts.iter().find(|c| c.id == contact_id) {
+                            let gigs = store.gigs_for_contact(contact_id);
+                            load_contact_into_view(&contact_view_c, contact, &gigs);
+                            right_stack_c.set_visible_child_name("contact");
+                            return;
+                        }
+                    }
+                    right_stack_c.set_visible_child_name("tracks");
+                });
+        }
+
+        // Wire up back button in contact view
+        if let Some(back_btn) = find_widget(&contact_view, "contact_back_btn") {
             let right_stack_c  = right_stack.clone();
             let gig_list_box_c = gig_list_box.clone();
             back_btn.downcast::<gtk::Button>().unwrap()
@@ -854,6 +894,146 @@ impl BrowserView {
                     gig_list_box_c.unselect_all();
                     right_stack_c.set_visible_child_name("tracks");
                 });
+        }
+
+        // ── contact view: auto-save on field change ───────────────────────────
+        {
+            let contact_view2 = contact_view.clone();
+            let save = Rc::new(move || {
+                // Derive contact ID from the view's widget name
+                let view_name = contact_view2.get_widget_name().to_string();
+                let contact_id = match view_name.strip_prefix("contact_view:") {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => return,
+                };
+                let mut store = crate::gig::GigStore::load();
+                if let Some(contact) = store.contacts.iter_mut().find(|c| c.id == contact_id) {
+                    // Read name
+                    if let Some(w) = find_widget(&contact_view2, "contact_name") {
+                        if let Ok(e) = w.downcast::<gtk::Entry>() {
+                            contact.name = e.get_text().to_string();
+                        }
+                    }
+                    // Read type
+                    if let Some(w) = find_widget(&contact_view2, "contact_type") {
+                        if let Ok(combo) = w.downcast::<gtk::ComboBoxText>() {
+                            contact.customer_type = match combo.get_active_id().as_deref() {
+                                Some("corporate") => crate::gig::CustomerType::Corporate,
+                                Some("venue")     => crate::gig::CustomerType::Venue,
+                                _                 => crate::gig::CustomerType::Private,
+                            };
+                        }
+                    }
+                    // Read notes
+                    if let Some(w) = find_widget(&contact_view2, "contact_notes") {
+                        if let Ok(tv) = w.downcast::<gtk::TextView>() {
+                            if let Some(buf) = tv.get_buffer() {
+                                contact.notes = buf.get_text(
+                                    &buf.get_start_iter(),
+                                    &buf.get_end_iter(),
+                                    false,
+                                ).map(|s| s.to_string()).unwrap_or_default();
+                            }
+                        }
+                    }
+                    store.save();
+                }
+            });
+
+            if let Some(w) = find_widget(&contact_view, "contact_name") {
+                if let Ok(e) = w.downcast::<gtk::Entry>() {
+                    let save = save.clone();
+                    e.connect_changed(move |_| save());
+                }
+            }
+            if let Some(w) = find_widget(&contact_view, "contact_type") {
+                if let Ok(combo) = w.downcast::<gtk::ComboBoxText>() {
+                    let save = save.clone();
+                    combo.connect_changed(move |_| save());
+                }
+            }
+            if let Some(w) = find_widget(&contact_view, "contact_notes") {
+                if let Ok(tv) = w.downcast::<gtk::TextView>() {
+                    if let Some(buf) = tv.get_buffer() {
+                        let save = save.clone();
+                        buf.connect_changed(move |_| save());
+                    }
+                }
+            }
+        }
+
+        // ── contact view: "Add New Gig" button ───────────────────────────────
+        {
+            let contact_view2     = contact_view.clone();
+            let gig_workspace2    = gig_workspace.clone();
+            let right_stack2      = right_stack.clone();
+            let gig_list_box2     = gig_list_box.clone();
+            let expanded_contacts2 = expanded_contacts.clone();
+            let library2          = library.clone();
+
+            if let Some(w) = find_widget(&contact_view, "contact_add_gig_btn") {
+                w.downcast::<gtk::Button>().unwrap()
+                    .connect_clicked(move |_| {
+                        let view_name = contact_view2.get_widget_name().to_string();
+                        let contact_id = match view_name.strip_prefix("contact_view:") {
+                            Some(id) if !id.is_empty() => id.to_string(),
+                            _ => return,
+                        };
+                        let gig = crate::gig::Gig {
+                            id:                   uuid::Uuid::new_v4().to_string(),
+                            contact_id:           contact_id.clone(),
+                            name:                 String::new(),
+                            date:                 None,
+                            tags:                 Vec::new(),
+                            notes:                String::new(),
+                            spotify_playlist_url: None,
+                            rekordbox_folder_id:  None,
+                        };
+                        let mut store = crate::gig::GigStore::load();
+                        store.gigs.push(gig.clone());
+                        store.save();
+                        // Refresh sidebar
+                        let playlists = library2.borrow().as_ref()
+                            .and_then(|lib| lib.playlists().ok())
+                            .unwrap_or_default();
+                        populate_gig_sidebar_from_library(
+                            &gig_list_box2,
+                            &store,
+                            &playlists,
+                            &expanded_contacts2.borrow(),
+                        );
+                        // Open gig workspace
+                        if let Some(contact) = store.contacts.iter().find(|c| c.id == contact_id) {
+                            load_gig_into_workspace(&gig_workspace2, &gig, contact);
+                            right_stack2.set_visible_child_name("gig");
+                        }
+                    });
+            }
+        }
+
+        // ── contact view: gig list selection ─────────────────────────────────
+        {
+            let gig_workspace2 = gig_workspace.clone();
+            let right_stack2   = right_stack.clone();
+
+            if let Some(w) = find_widget(&contact_view, "contact_gig_list") {
+                if let Ok(lb) = w.downcast::<gtk::ListBox>() {
+                    lb.connect_row_selected(move |_, row| {
+                        if let Some(row) = row {
+                            let name = row.get_widget_name().to_string();
+                            if let Some(gig_id) = name.strip_prefix("gig:") {
+                                let store = crate::gig::GigStore::load();
+                                if let Some(gig) = store.gigs.iter().find(|g| g.id == gig_id) {
+                                    if let Some(contact) = store.contact_for_gig(gig) {
+                                        load_gig_into_workspace(&gig_workspace2, gig, contact);
+                                        right_stack2.set_visible_child_name("gig");
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
         }
 
         // ── layout ───────────────────────────────────────────────────────────
@@ -1058,12 +1238,12 @@ impl BrowserView {
             });
         }
 
-        // ── open library button ───────────────────────────────────────────────
+        // ── open library menu item ────────────────────────────────────────────
         {
             let do_open = do_open_library.clone();
             let window  = window.clone();
 
-            open_btn.connect_clicked(move |_| {
+            open_btn.connect_activate(move |_| {
                 let dialog = gtk::FileChooserDialog::new(
                     Some("Open Rekordbox Database"),
                     Some(&window),
@@ -1090,12 +1270,12 @@ impl BrowserView {
             });
         }
 
-        // ── settings button ───────────────────────────────────────────────────
+        // ── settings menu item ────────────────────────────────────────────────
         {
             let config = config.clone();
             let window = window.clone();
 
-            settings_btn.connect_clicked(move |_| {
+            settings_btn.connect_activate(move |_| {
                 show_settings_dialog(&window, &config);
             });
         }
@@ -1123,6 +1303,7 @@ impl BrowserView {
                     id:                  new_id(),
                     name:                "New Contact".to_string(),
                     customer_type:       crate::gig::CustomerType::Private,
+                    notes:               String::new(),
                     rekordbox_folder_id: None,
                 };
                 let gig = crate::gig::Gig {
@@ -1161,6 +1342,7 @@ impl BrowserView {
         {
             let right_stack          = right_stack.clone();
             let gig_workspace        = gig_workspace.clone();
+            let contact_view2        = contact_view.clone();
             let library              = library.clone();
             let track_store2         = track_store.clone();
             let status_lbl2          = status_lbl.clone();
@@ -1191,6 +1373,12 @@ impl BrowserView {
                             &playlists,
                             &expanded_contacts2.borrow(),
                         );
+                        // Open contact view
+                        if let Some(contact) = store.contacts.iter().find(|c| c.id == contact_id) {
+                            let gigs = store.gigs_for_contact(contact_id);
+                            load_contact_into_view(&contact_view2, contact, &gigs);
+                            right_stack.set_visible_child_name("contact");
+                        }
                     } else if let Some(gig_id) = name.strip_prefix("gig:") {
                         // Gig event folder → show gig workspace
                         let store = crate::gig::GigStore::load();
@@ -2352,6 +2540,7 @@ fn show_gig_prep_dialog(
         id:                  uuid::Uuid::new_v4().to_string(),
         name:                contact_entry.get_text().to_string(),
         customer_type,
+        notes:               String::new(),
         rekordbox_folder_id: None,
     };
 
@@ -2720,7 +2909,7 @@ fn build_gig_workspace() -> gtk::Box {
     header_bar.set_margin_top(6);
     header_bar.set_margin_bottom(4);
 
-    let back_btn = gtk::Button::with_label("← Library");
+    let back_btn = gtk::Button::with_label("← Contact");
     back_btn.set_relief(gtk::ReliefStyle::None);
     back_btn.set_widget_name("gig_back_btn");
 
@@ -2891,6 +3080,9 @@ fn load_gig_into_workspace(
     gig: &crate::gig::Gig,
     contact: &crate::gig::Contact,
 ) {
+    // Stamp contact ID on the workspace so the back button knows where to return
+    workspace.set_widget_name(&format!("gig_workspace:{}", contact.id));
+
     // Update header
     if let Some(w) = workspace.get_children().into_iter().find(|c| c.get_widget_name() == "gig_header") {
         if let Ok(lbl) = w.downcast::<gtk::Label>() {
@@ -2963,6 +3155,179 @@ fn load_gig_into_workspace(
                 "Add a Spotify URL or run match manually".to_string()
             };
             lbl.set_text(&status);
+        }
+    }
+}
+
+// ── Contact view ──────────────────────────────────────────────────────────────
+
+fn build_contact_view() -> gtk::Box {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    // Header bar
+    let header_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    header_bar.set_margin_start(6);
+    header_bar.set_margin_top(6);
+    header_bar.set_margin_bottom(4);
+
+    let back_btn = gtk::Button::with_label("← Library");
+    back_btn.set_relief(gtk::ReliefStyle::None);
+    back_btn.set_widget_name("contact_back_btn");
+
+    let header = gtk::Label::new(Some("Contact"));
+    header.set_widget_name("contact_header");
+    header.set_xalign(0.0);
+    header.set_use_markup(true);
+    header.set_hexpand(true);
+
+    let add_gig_btn = gtk::Button::with_label("+ New Gig");
+    add_gig_btn.set_widget_name("contact_add_gig_btn");
+    add_gig_btn.set_relief(gtk::ReliefStyle::None);
+
+    header_bar.pack_start(&back_btn,    false, false, 0);
+    header_bar.pack_start(&header,      true,  true,  4);
+    header_bar.pack_end  (&add_gig_btn, false, false, 0);
+
+    outer.pack_start(&header_bar, false, false, 0);
+    outer.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 0);
+
+    let scroll = gtk::ScrolledWindow::new(gtk::NONE_ADJUSTMENT, gtk::NONE_ADJUSTMENT);
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_border_width(12);
+
+    // ── Fields ────────────────────────────────────────────────────────────────
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(8);
+
+    macro_rules! field_lbl { ($t:expr) => {{
+        let l = gtk::Label::new(Some($t));
+        l.set_xalign(1.0);
+        l
+    }}; }
+
+    let name_entry = gtk::Entry::new();
+    name_entry.set_widget_name("contact_name");
+    name_entry.set_placeholder_text(Some("Contact name"));
+    name_entry.set_hexpand(true);
+
+    let type_combo = gtk::ComboBoxText::new();
+    type_combo.set_widget_name("contact_type");
+    type_combo.append(Some("private"),   "Private");
+    type_combo.append(Some("venue"),     "Venue");
+    type_combo.append(Some("corporate"), "Corporate");
+    type_combo.set_active_id(Some("private"));
+
+    grid.attach(&field_lbl!("Name"),         0, 0, 1, 1);
+    grid.attach(&name_entry,                 1, 0, 1, 1);
+    grid.attach(&field_lbl!("Type"),         0, 1, 1, 1);
+    grid.attach(&type_combo,                 1, 1, 1, 1);
+
+    content.pack_start(&grid, false, false, 0);
+
+    // ── Notes ─────────────────────────────────────────────────────────────────
+    let notes_lbl = gtk::Label::new(Some("Music preferences / notes"));
+    notes_lbl.set_xalign(0.0);
+
+    let notes_view = gtk::TextView::new();
+    notes_view.set_widget_name("contact_notes");
+    notes_view.set_wrap_mode(gtk::WrapMode::Word);
+    notes_view.set_accepts_tab(false);
+
+    let notes_scroll = gtk::ScrolledWindow::new(gtk::NONE_ADJUSTMENT, gtk::NONE_ADJUSTMENT);
+    notes_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    notes_scroll.set_min_content_height(100);
+    notes_scroll.add(&notes_view);
+
+    content.pack_start(&notes_lbl,    false, false, 0);
+    content.pack_start(&notes_scroll, false, false, 0);
+
+    // ── Gig list ──────────────────────────────────────────────────────────────
+    let gigs_lbl = gtk::Label::new(Some("Gigs"));
+    gigs_lbl.set_xalign(0.0);
+    gigs_lbl.set_margin_top(4);
+
+    let gig_list = gtk::ListBox::new();
+    gig_list.set_widget_name("contact_gig_list");
+    gig_list.set_selection_mode(gtk::SelectionMode::Single);
+
+    content.pack_start(&gigs_lbl, false, false, 0);
+    content.pack_start(&gig_list, false, false, 0);
+
+    scroll.add(&content);
+    outer.pack_start(&scroll, true, true, 0);
+    outer
+}
+
+fn load_contact_into_view(
+    view:    &gtk::Box,
+    contact: &crate::gig::Contact,
+    gigs:    &[&crate::gig::Gig],
+) {
+    // Header
+    if let Some(w) = find_widget(view, "contact_header") {
+        if let Ok(lbl) = w.downcast::<gtk::Label>() {
+            lbl.set_markup(&format!(
+                "<b>{}</b>  <small>{}</small>",
+                glib::markup_escape_text(&contact.name),
+                contact.customer_type.label(),
+            ));
+        }
+    }
+
+    // Store the contact ID on the view widget for auto-save
+    view.set_widget_name(&format!("contact_view:{}", contact.id));
+
+    if let Some(w) = find_widget(view, "contact_name") {
+        if let Ok(e) = w.downcast::<gtk::Entry>() {
+            e.set_text(&contact.name);
+        }
+    }
+
+    if let Some(w) = find_widget(view, "contact_type") {
+        if let Ok(combo) = w.downcast::<gtk::ComboBoxText>() {
+            let id = match contact.customer_type {
+                crate::gig::CustomerType::Corporate => "corporate",
+                crate::gig::CustomerType::Venue     => "venue",
+                crate::gig::CustomerType::Private   => "private",
+            };
+            combo.set_active_id(Some(id));
+        }
+    }
+
+    if let Some(w) = find_widget(view, "contact_notes") {
+        if let Ok(tv) = w.downcast::<gtk::TextView>() {
+            if let Some(buf) = tv.get_buffer() {
+                buf.set_text(&contact.notes);
+            }
+        }
+    }
+
+    // Populate gig list
+    if let Some(w) = find_widget(view, "contact_gig_list") {
+        if let Ok(lb) = w.downcast::<gtk::ListBox>() {
+            for child in lb.get_children() { lb.remove(&child); }
+            for gig in gigs {
+                let row = gtk::ListBoxRow::new();
+                row.set_widget_name(&format!("gig:{}", gig.id));
+                let label_text = if gig.name.is_empty() {
+                    gig.date.as_deref().unwrap_or("Unnamed gig").to_string()
+                } else if let Some(date) = &gig.date {
+                    format!("{} ({})", gig.name, date)
+                } else {
+                    gig.name.clone()
+                };
+                let lbl = gtk::Label::new(Some(&label_text));
+                lbl.set_xalign(0.0);
+                lbl.set_margin_start(8);
+                lbl.set_margin_top(4);
+                lbl.set_margin_bottom(4);
+                row.add(&lbl);
+                lb.add(&row);
+            }
+            lb.show_all();
         }
     }
 }

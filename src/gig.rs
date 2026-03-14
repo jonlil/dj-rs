@@ -38,6 +38,9 @@ pub struct Contact {
     pub id: String,
     pub name: String,
     pub customer_type: CustomerType,
+    /// General music preferences / vibe notes for this contact
+    #[serde(default)]
+    pub notes: String,
     /// ID of the contact folder in djmdPlaylist
     pub rekordbox_folder_id: Option<i64>,
 }
@@ -98,6 +101,13 @@ impl GigStore {
     pub fn add_gig(&mut self, gig: Gig) {
         self.gigs.push(gig);
         self.save();
+    }
+
+    pub fn update_contact(&mut self, contact: Contact) {
+        if let Some(existing) = self.contacts.iter_mut().find(|c| c.id == contact.id) {
+            *existing = contact;
+            self.save();
+        }
     }
 
     pub fn update_gig(&mut self, gig: Gig) {
