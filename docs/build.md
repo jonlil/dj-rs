@@ -38,14 +38,15 @@ The cert password is in `tizen-app/.env.tizen` (gitignored).
 If the `djrs-dev` profile or password files are missing:
 
 ```bash
-# Author cert password file
+# Author cert password file — use the password you set when creating the djrs-dev profile
 echo -n "<your-author-cert-password>" > ~/tizen-studio-data/keystore/author/djrs-author.pwd
 
-# Distributor cert password file
-mkdir -p ~/tizen-studio-data/tools/certificate-generator/certificates/distributor
+# Distributor cert password file — standard Tizen distributor signer password
 echo -n "<tizen-distributor-signer-password>" \
   > ~/tizen-studio-data/tools/certificate-generator/certificates/distributor/tizen-distributor-signer.pwd
 ```
+
+Passwords are stored in `tizen-app/.env.tizen` (gitignored). See that file for the values.
 
 ## Server endpoints
 
