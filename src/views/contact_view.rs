@@ -172,14 +172,7 @@ pub(super) fn load_contact_into_view(
             for gig in gigs.iter().filter(|g| g.rekordbox_folder_id.map_or(true, |rid| !pool_ids.contains(&rid))) {
                 let row = gtk::ListBoxRow::new();
                 row.set_widget_name(&format!("gig:{}", gig.id));
-                let label_text = if gig.name.is_empty() {
-                    gig.date.as_deref().unwrap_or("Unnamed gig").to_string()
-                } else if let Some(date) = &gig.date {
-                    format!("{} ({})", gig.name, date)
-                } else {
-                    gig.name.clone()
-                };
-                let lbl = gtk::Label::new(Some(&label_text));
+                let lbl = gtk::Label::new(Some(&gig.format_label()));
                 lbl.set_xalign(0.0);
                 lbl.set_margin_start(8);
                 lbl.set_margin_top(4);

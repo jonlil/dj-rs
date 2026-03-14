@@ -323,8 +323,11 @@ pub(super) fn show_gig_prep_dialog(
         tags:                 Vec::new(),
         notes:                notes_text,
         spotify_playlist_url: spotify_url.clone(),
-        accepted_track_ids:   Vec::new(),
-        rekordbox_folder_id:  None,
+        cached_spotify_tracks: Vec::new(),
+        accepted_track_ids:    Vec::new(),
+        pending_buy_tracks:    Vec::new(),
+        denied_spotify_ids:    Vec::new(),
+        rekordbox_folder_id:   None,
     };
 
     // If a Spotify URL was given and the library is open, run the match flow

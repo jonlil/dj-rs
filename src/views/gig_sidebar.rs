@@ -146,14 +146,7 @@ pub(super) fn make_pool_row(pl: &crate::rekordbox::Playlist) -> gtk::ListBoxRow 
 pub(super) fn make_gig_row_simple(gig: &crate::gig::Gig) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_widget_name(&format!("gig:{}", gig.id));
-    let label_text = if gig.name.is_empty() {
-        gig.date.as_deref().unwrap_or("New Gig").to_string()
-    } else if let Some(date) = &gig.date {
-        format!("{} ({})", gig.name, date)
-    } else {
-        gig.name.clone()
-    };
-    let lbl = gtk::Label::new(Some(&label_text));
+    let lbl = gtk::Label::new(Some(&gig.format_label()));
     lbl.set_xalign(0.0);
     lbl.set_margin_start(18);
     lbl.set_margin_top(3);
