@@ -141,10 +141,24 @@ sort proxy silently disconnects from the view, producing an empty track list.
 
 ---
 
+## Playlist sidebar
+
+The playlist panel uses a `gtk::TreeStore` (not `ListStore`) so folders can be
+expanded and collapsed natively. Folders start collapsed via `pl_view.collapse_all()`
+after each populate.
+
+`browser_populate_playlists` builds the tree using an `IndexMap<Option<i64>,
+Vec<&Playlist>>` keyed by `parent_id`. `IndexMap` is required — a plain
+`HashMap` loses the `ORDER BY Seq` ordering from the DB query.
+
+History sessions live in a separate **History** tab (`gtk::Notebook`). They are
+populated by `browser_populate_history` into their own `ListStore` / `TreeView`.
+
+---
+
 ## Known issues / TODO
 
 - Cue point display in player (data is read via `cues_for_track()`, not shown)
 - Smart playlists (`Attribute = 2`) not evaluated — shown as regular playlists
 - Drag track from browser into a playlist not yet implemented
-- History session auto-populates in playlist panel but `do_reload_tracks`
-  ignores filter when loading history
+- History sessions are in their own sidebar tab; selecting a session loads its tracks

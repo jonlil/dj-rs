@@ -22,7 +22,7 @@
 - Filter bar: BPM range spinners, Key/Genre combos, Rating dropdown, Harmonic toggle
 - Harmonic filter: Camelot wheel ±1 key matching (`compatible_camelot_keys()`)
 - My Tags: selected track's tags shown in label below list (djmdMyTag + djmdSongMyTag)
-- History sessions: shown in playlist panel as "— History —" section
+- History sessions: own **History** tab in a `gtk::Notebook` sidebar
 - Extended search: genre, label, key in addition to title/artist/album
 
 **Playlist management**
@@ -57,3 +57,5 @@
 - `glib::idle_add_local` callbacks must not block. Any infinite loop or blocking call prevents the GTK main loop from processing expose events, so the window never renders.
 - `set_active(Some(0))` on a `ComboBoxText` fires `connect_changed` synchronously, even if the library hasn't been opened yet. Guard all filter callbacks with `library.borrow().as_ref()` checks.
 - `connect_changed` on selection callbacks: guard with `sel.get_selected()` returning `None` when model is cleared.
+- Use `gtk::TreeStore` (not `ListStore`) for hierarchical data — it gives native expand/collapse with expander arrows. Call `tree_view.collapse_all()` after populate to start collapsed.
+- `IndexMap` is required when insertion order must be preserved (e.g. DB results ordered by `Seq`). A plain `HashMap` silently shuffles entries.
