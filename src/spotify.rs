@@ -167,7 +167,7 @@ struct PlaylistItem {
 
 #[derive(Deserialize)]
 struct TrackObject {
-    id:           String,
+    id:           Option<String>,  // null for local tracks
     name:         String,
     duration_ms:  u32,
     artists:      Vec<ArtistObject>,
@@ -192,16 +192,27 @@ pub fn fetch_playlist(access_token: &str, playlist_url: &str) -> Result<Vec<Spot
     );
 
     loop {
-        let page: PlaylistTracksPage = client
+        let resp = client
             .get(&url)
             .bearer_auth(access_token)
             .send()
-            .map_err(|e| e.to_string())?
-            .json()
             .map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(format!("Spotify API error {}: {}", status, body));
+        }
+
+        let page: PlaylistTracksPage = resp.json().map_err(|e| e.to_string())?;
 
         for item in page.items {
             if let Some(track) = item.track {
+                // Skip local tracks (no Spotify ID)
+                let spotify_id = match track.id {
+                    Some(id) => id,
+                    None     => continue,
+                };
                 let artist = track.artists
                     .into_iter()
                     .next()
@@ -209,7 +220,7 @@ pub fn fetch_playlist(access_token: &str, playlist_url: &str) -> Result<Vec<Spot
                     .unwrap_or_default();
 
                 tracks.push(SpotifyTrack {
-                    spotify_id:  track.id,
+                    spotify_id,
                     title:       track.name,
                     artist,
                     duration_ms: track.duration_ms,

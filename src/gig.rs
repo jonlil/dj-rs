@@ -55,6 +55,15 @@ pub struct Gig {
     /// YYYY-MM-DD or null
     #[serde(default)]
     pub date: Option<String>,
+    /// Get-in / start time, HH:MM
+    #[serde(default)]
+    pub start_time: Option<String>,
+    /// End time, HH:MM
+    #[serde(default)]
+    pub end_time: Option<String>,
+    /// Venue name or address
+    #[serde(default)]
+    pub location: Option<String>,
     /// Free-form tags, e.g. ["wedding", "outdoor"]
     #[serde(default)]
     pub tags: Vec<String>,
@@ -62,6 +71,9 @@ pub struct Gig {
     #[serde(default)]
     pub notes: String,
     pub spotify_playlist_url: Option<String>,
+    /// Track IDs (djmdContent) accepted in the Match tab
+    #[serde(default)]
+    pub accepted_track_ids: Vec<i64>,
     /// ID of the event folder (or playlist) in djmdPlaylist
     pub rekordbox_folder_id: Option<i64>,
 }
