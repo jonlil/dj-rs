@@ -4,72 +4,70 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum GigType {
+pub enum CustomerType {
     Corporate,
     Venue,
     Private,
 }
 
-impl GigType {
+impl CustomerType {
     pub fn label(&self) -> &'static str {
         match self {
-            GigType::Corporate => "Corporate",
-            GigType::Venue     => "Venue",
-            GigType::Private   => "Private",
+            CustomerType::Corporate => "Corporate",
+            CustomerType::Venue     => "Venue",
+            CustomerType::Private   => "Private",
         }
     }
 
-    /// Top-level Rekordbox folder name for this gig type.
     pub fn playlist_folder(&self) -> &'static str {
         match self {
-            GigType::Corporate => "CORPORATE",
-            GigType::Venue     => "VENUES",
-            GigType::Private   => "PRIVATE",
+            CustomerType::Corporate => "CORPORATE",
+            CustomerType::Venue     => "VENUES",
+            CustomerType::Private   => "PRIVATE",
         }
     }
 }
 
-/// Top-level Rekordbox folder names that belong to gig output and should be
-/// hidden from the main playlist browser. Derived from GigType so it stays
-/// in sync automatically. Swap this slice for a config value to make it
-/// user-configurable in the future.
+/// Top-level Rekordbox folder names that belong to gig output — hidden from
+/// the main playlist browser.
 pub const GIG_FOLDERS: &[&str] = &["CORPORATE", "VENUES", "PRIVATE"];
 
+/// Represents the ongoing relationship with a client, venue, or company.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contact {
+    pub id: String,
+    pub name: String,
+    pub customer_type: CustomerType,
+    /// ID of the contact folder in djmdPlaylist
+    pub rekordbox_folder_id: Option<i64>,
+}
+
+/// Represents one specific gig / event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gig {
     pub id: String,
-    pub gig_type: GigType,
-    /// Free-form tags for filtering/categorising, e.g. ["wedding", "outdoor"]
+    pub contact_id: String,
+    /// Event name, e.g. "Wedding", "Kick-off 2026"
+    pub name: String,
+    /// YYYY-MM-DD or null
+    #[serde(default)]
+    pub date: Option<String>,
+    /// Free-form tags, e.g. ["wedding", "outdoor"]
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Event name, e.g. "Kick-off 2026" or "Wedding"
-    pub name: String,
-    /// Contact person or client — used as playlist prefix
-    pub contact: String,
-    /// YYYY-MM-DD
-    pub date: String,
-    /// HH:MM
-    pub start_time: String,
-    /// HH:MM
-    pub end_time: String,
-    /// Venue name or address, free text
-    pub location: String,
     /// Music preferences, vibe notes, client wishes
+    #[serde(default)]
     pub notes: String,
     pub spotify_playlist_url: Option<String>,
-    /// ID of the auto-created Rekordbox playlist, once generated
-    pub rekordbox_playlist_id: Option<i64>,
-}
-
-impl Gig {
-    /// Playlist name used inside Rekordbox: "{contact} - {name}"
-    pub fn playlist_name(&self) -> String {
-        format!("{} - {}", self.contact, self.name)
-    }
+    /// ID of the event folder (or playlist) in djmdPlaylist
+    pub rekordbox_folder_id: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GigStore {
+    #[serde(default)]
+    pub contacts: Vec<Contact>,
+    #[serde(default)]
     pub gigs: Vec<Gig>,
 }
 
@@ -92,16 +90,29 @@ impl GigStore {
         }
     }
 
-    pub fn add(&mut self, gig: Gig) {
+    pub fn add_contact(&mut self, contact: Contact) {
+        self.contacts.push(contact);
+        self.save();
+    }
+
+    pub fn add_gig(&mut self, gig: Gig) {
         self.gigs.push(gig);
         self.save();
     }
 
-    pub fn update(&mut self, gig: Gig) {
+    pub fn update_gig(&mut self, gig: Gig) {
         if let Some(existing) = self.gigs.iter_mut().find(|g| g.id == gig.id) {
             *existing = gig;
             self.save();
         }
+    }
+
+    pub fn gigs_for_contact<'a>(&'a self, contact_id: &str) -> Vec<&'a Gig> {
+        self.gigs.iter().filter(|g| g.contact_id == contact_id).collect()
+    }
+
+    pub fn contact_for_gig(&self, gig: &Gig) -> Option<&Contact> {
+        self.contacts.iter().find(|c| c.id == gig.contact_id)
     }
 }
 

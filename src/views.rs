@@ -6,7 +6,7 @@ use std::sync::Arc;
 use glib::types::StaticType;
 use crate::deck::DeckState;
 use crate::config::{Config, PathMapping};
-use crate::gig::{Gig, GigStore, GigType};
+use crate::gig::{Contact, CustomerType, Gig, GigStore};
 use crate::rekordbox::{Library, Track, Playlist, HistorySession, TrackFilter, compatible_camelot_keys};
 use crate::server::{ServerBridge, WsEvent};
 
@@ -964,6 +964,7 @@ impl BrowserView {
             let key_combo2           = key_combo.clone();
             let genre_combo2         = genre_combo.clone();
             let pl_view2             = pl_view.clone();
+            let gig_list_box2        = gig_list_box.clone();
 
             Rc::new(move |path_str: &str| {
                 match Library::open(path_str) {
@@ -992,6 +993,11 @@ impl BrowserView {
                         browser_populate_playlists(&pl_store2, &lists);
                         browser_populate_history(&hist_store2, &sessions);
                         pl_view2.collapse_all();
+                        populate_gig_sidebar_from_library(
+                            &gig_list_box2,
+                            &crate::gig::GigStore::load(),
+                            &lists,
+                        );
 
                         if let Ok(tracks) = lib.tracks() {
                             browser_populate_tracks(&track_store2, &tracks);
@@ -1092,57 +1098,89 @@ impl BrowserView {
         // ── gig list: populate from store ─────────────────────────────────────
         {
             let gig_list_box = gig_list_box.clone();
-            populate_gig_list(&gig_list_box, &crate::gig::GigStore::load().gigs);
+            populate_contacts_and_gigs(&gig_list_box, &crate::gig::GigStore::load());
         }
 
-        // ── new gig button ────────────────────────────────────────────────────
+        // ── new contact+gig button ────────────────────────────────────────────
         {
-            let gig_list_box = gig_list_box.clone();
-            let right_stack  = right_stack.clone();
+            let gig_list_box  = gig_list_box.clone();
+            let right_stack   = right_stack.clone();
             let gig_workspace = gig_workspace.clone();
 
             new_gig_btn.connect_clicked(move |_| {
-                let id = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .to_string();
+                let new_id = || uuid::Uuid::new_v4().to_string();
+                let contact = crate::gig::Contact {
+                    id:                  new_id(),
+                    name:                "New Contact".to_string(),
+                    customer_type:       crate::gig::CustomerType::Private,
+                    rekordbox_folder_id: None,
+                };
                 let gig = crate::gig::Gig {
-                    id:                   id.clone(),
-                    gig_type:             crate::gig::GigType::Private,
-                    tags:                 Vec::new(),
+                    id:                   new_id(),
+                    contact_id:           contact.id.clone(),
                     name:                 String::new(),
-                    contact:              String::new(),
-                    date:                 String::new(),
-                    start_time:           String::new(),
-                    end_time:             String::new(),
-                    location:             String::new(),
+                    date:                 None,
+                    tags:                 Vec::new(),
                     notes:                String::new(),
                     spotify_playlist_url: None,
-                    rekordbox_playlist_id: None,
+                    rekordbox_folder_id:  None,
                 };
-                crate::gig::GigStore::load().add(gig.clone());
-                let row = make_gig_row(&gig);
-                gig_list_box.add(&row);
-                gig_list_box.show_all();
-                gig_list_box.select_row(Some(&row));
-                load_gig_into_workspace(&gig_workspace, &gig);
+                let mut store = crate::gig::GigStore::load();
+                store.contacts.push(contact.clone());
+                store.gigs.push(gig.clone());
+                store.save();
+                populate_contacts_and_gigs(&gig_list_box, &store);
+                // Select the new gig row
+                let row_name = format!("gig:{}", gig.id);
+                for child in gig_list_box.get_children() {
+                    if let Ok(row) = child.downcast::<gtk::ListBoxRow>() {
+                        if row.get_widget_name() == row_name {
+                            gig_list_box.select_row(Some(&row));
+                            break;
+                        }
+                    }
+                }
+                load_gig_into_workspace(&gig_workspace, &gig, &contact);
                 right_stack.set_visible_child_name("gig");
             });
         }
 
         // ── gig list selection ────────────────────────────────────────────────
         {
-            let right_stack   = right_stack.clone();
-            let gig_workspace = gig_workspace.clone();
+            let right_stack          = right_stack.clone();
+            let gig_workspace        = gig_workspace.clone();
+            let library              = library.clone();
+            let track_store2         = track_store.clone();
+            let status_lbl2          = status_lbl.clone();
+            let current_playlist_id2 = current_playlist_id.clone();
 
             gig_list_box.connect_row_selected(move |_, row| {
                 if let Some(row) = row {
-                    let id = row.get_widget_name().to_string();
-                    let store = crate::gig::GigStore::load();
-                    if let Some(gig) = store.gigs.iter().find(|g| g.id == id) {
-                        load_gig_into_workspace(&gig_workspace, gig);
-                        right_stack.set_visible_child_name("gig");
+                    let name = row.get_widget_name().to_string();
+                    if let Some(gig_id) = name.strip_prefix("gig:") {
+                        // Gig event folder → show gig workspace
+                        let store = crate::gig::GigStore::load();
+                        if let Some(gig) = store.gigs.iter().find(|g| g.id == gig_id) {
+                            if let Some(contact) = store.contact_for_gig(gig) {
+                                load_gig_into_workspace(&gig_workspace, gig, contact);
+                                right_stack.set_visible_child_name("gig");
+                            }
+                        }
+                    } else if let Some(id_str) = name.strip_prefix("pl:")
+                        .or_else(|| name.strip_prefix("pool:"))
+                    {
+                        // Set playlist or pool → show tracks
+                        if let Ok(pid) = id_str.parse::<i64>() {
+                            if let Some(lib) = library.borrow().as_ref() {
+                                *current_playlist_id2.borrow_mut() = Some(pid);
+                                if let Ok(tracks) = lib.playlist_tracks(pid) {
+                                    let n = tracks.len();
+                                    browser_populate_tracks(&track_store2, &tracks);
+                                    status_lbl2.set_text(&format!("{} tracks", n));
+                                    right_stack.set_visible_child_name("tracks");
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -1682,6 +1720,8 @@ impl BrowserView {
             let current_playlist_id2 = current_playlist_id.clone();
             let make_filter2         = make_filter.clone();
             let pl_store2            = pl_store.clone();
+            let right_stack2         = right_stack.clone();
+            let gig_list_box2        = gig_list_box.clone();
 
             pl_view.get_selection().connect_changed(move |sel| {
                 let (model, iter) = match sel.get_selected() {
@@ -1729,6 +1769,9 @@ impl BrowserView {
                         let n = tracks.len();
                         browser_populate_tracks(&track_store2, &tracks);
                         status_lbl2.set_text(&format!("{} tracks", n));
+                        // Switch back to track browser if gig workspace is open
+                        right_stack2.set_visible_child_name("tracks");
+                        gig_list_box2.unselect_all();
                     }
                 }
             });
@@ -1736,9 +1779,11 @@ impl BrowserView {
 
         // ── history tab selection ─────────────────────────────────────────────
         {
-            let library      = library.clone();
-            let track_store2 = track_store.clone();
-            let status_lbl2  = status_lbl.clone();
+            let library       = library.clone();
+            let track_store2  = track_store.clone();
+            let status_lbl2   = status_lbl.clone();
+            let right_stack2  = right_stack.clone();
+            let gig_list_box2 = gig_list_box.clone();
 
             hist_view.get_selection().connect_changed(move |sel| {
                 let (model, iter) = match sel.get_selected() {
@@ -1759,6 +1804,8 @@ impl BrowserView {
                                 let n = tracks.len();
                                 browser_populate_tracks(&track_store2, &tracks);
                                 status_lbl2.set_text(&format!("{} tracks", n));
+                                right_stack2.set_visible_child_name("tracks");
+                                gig_list_box2.unselect_all();
                             }
                         }
                     }
@@ -2132,8 +2179,9 @@ fn browser_populate_tracks(store: &gtk::ListStore, tracks: &[Track]) {
     }
 }
 
-// ── Gig Prep dialog ───────────────────────────────────────────────────────────
+// ── Gig Prep dialog (legacy — replaced by inline workspace) ──────────────────
 
+#[allow(dead_code)]
 fn show_gig_prep_dialog(
     window:  &gtk::ApplicationWindow,
     config:  &Rc<RefCell<Config>>,
@@ -2253,10 +2301,10 @@ fn show_gig_prep_dialog(
         return;
     }
 
-    let gig_type = match type_combo.get_active_id().as_deref() {
-        Some("corporate") => GigType::Corporate,
-        Some("venue")     => GigType::Venue,
-        _                 => GigType::Private,
+    let customer_type = match type_combo.get_active_id().as_deref() {
+        Some("corporate") => CustomerType::Corporate,
+        Some("venue")     => CustomerType::Venue,
+        _                 => CustomerType::Private,
     };
 
     let notes_buf  = notes_view.get_buffer().unwrap();
@@ -2266,11 +2314,12 @@ fn show_gig_prep_dialog(
         false,
     ).map(|s| s.to_string()).unwrap_or_default();
 
-    let id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string();
+    let contact = Contact {
+        id:                  uuid::Uuid::new_v4().to_string(),
+        name:                contact_entry.get_text().to_string(),
+        customer_type,
+        rekordbox_folder_id: None,
+    };
 
     let spotify_url = {
         let url = spotify_entry.get_text().to_string();
@@ -2278,18 +2327,14 @@ fn show_gig_prep_dialog(
     };
 
     let mut gig = Gig {
-        id,
-        gig_type,
+        id:                   uuid::Uuid::new_v4().to_string(),
+        contact_id:           contact.id.clone(),
         name:                 name_entry.get_text().to_string(),
-        contact:              contact_entry.get_text().to_string(),
-        date:                 date_entry.get_text().to_string(),
-        start_time:           start_entry.get_text().to_string(),
-        end_time:             end_entry.get_text().to_string(),
-        location:             location_entry.get_text().to_string(),
-        notes:                notes_text,
+        date:                 { let d = date_entry.get_text().to_string(); if d.is_empty() { None } else { Some(d) } },
         tags:                 Vec::new(),
+        notes:                notes_text,
         spotify_playlist_url: spotify_url.clone(),
-        rekordbox_playlist_id: None,
+        rekordbox_folder_id:  None,
     };
 
     // If a Spotify URL was given and the library is open, run the match flow
@@ -2323,17 +2368,22 @@ fn show_gig_prep_dialog(
                     Ok(spotify_tracks) => {
                         let all_tracks = lib.tracks().unwrap_or_default();
                         let results    = crate::matcher::match_tracks(&spotify_tracks, &all_tracks);
-                        let playlist_id = show_gig_match_results(window, &gig, &results, lib);
-                        gig.rekordbox_playlist_id = playlist_id;
+                        let folder_id = lib.find_or_create_folder(contact.customer_type.playlist_folder()).ok();
+                        gig.rekordbox_folder_id = folder_id;
+                        let _ = show_gig_match_results(window, &gig, &results, lib);
                     }
                 }
             }
         }
     }
 
-    GigStore::load().add(gig);
+    let mut store = GigStore::load();
+    store.contacts.push(contact);
+    store.gigs.push(gig);
+    store.save();
 }
 
+#[allow(dead_code)]
 fn show_gig_match_results(
     window:  &gtk::ApplicationWindow,
     gig:     &Gig,
@@ -2344,7 +2394,7 @@ fn show_gig_match_results(
     let missing: Vec<_> = results.iter().filter(|r| r.matched.is_none()).collect();
 
     let dialog = gtk::Dialog::new();
-    dialog.set_title(&format!("Gig Prep — {}", gig.playlist_name()));
+    dialog.set_title(&format!("Gig Prep — {}", gig.name));
     dialog.set_transient_for(Some(window));
     dialog.set_modal(true);
     dialog.set_default_size(660, 560);
@@ -2442,9 +2492,8 @@ fn show_gig_match_results(
     }
 
     // Create the Rekordbox playlist under the right folder
-    let folder_name = gig.gig_type.playlist_folder();
-    let playlist_id = lib.find_or_create_folder(folder_name)
-        .and_then(|folder_id| lib.create_playlist(&gig.playlist_name(), Some(folder_id)))
+    let playlist_id = lib.find_or_create_folder("PRIVATE")
+        .and_then(|folder_id| lib.create_playlist(&gig.name, Some(folder_id)))
         .and_then(|pl_id| {
             let track_ids: Vec<i64> = matched.iter()
                 .map(|r| r.matched.as_ref().unwrap().id)
@@ -2459,33 +2508,158 @@ fn show_gig_match_results(
 
 // ── Gig sidebar helpers ───────────────────────────────────────────────────────
 
-fn populate_gig_list(list_box: &gtk::ListBox, gigs: &[crate::gig::Gig]) {
-    // Remove existing rows
+/// Populate the gig sidebar from the full Rekordbox playlist tree.
+/// When the library isn't loaded yet, falls back to the flat GigStore view.
+fn populate_gig_sidebar_from_library(
+    list_box:  &gtk::ListBox,
+    store:     &crate::gig::GigStore,
+    playlists: &[crate::rekordbox::Playlist],
+) {
     for child in list_box.get_children() {
         list_box.remove(&child);
     }
-    for gig in gigs {
-        let row = make_gig_row(gig);
-        list_box.add(&row);
+
+    for contact in &store.contacts {
+        list_box.add(&make_contact_header_row(contact));
+
+        if let Some(folder_id) = contact.rekordbox_folder_id {
+            // Direct children of the contact folder in Rekordbox
+            let mut children: Vec<_> = playlists.iter()
+                .filter(|pl| pl.parent_id == Some(folder_id))
+                .collect();
+            children.sort_by_key(|pl| pl.id);
+
+            for child_pl in children {
+                if child_pl.attribute == 1 {
+                    // Gig event folder
+                    let gig = store.gigs.iter()
+                        .find(|g| g.rekordbox_folder_id == Some(child_pl.id));
+                    let gig_row = make_gig_folder_row(child_pl, gig);
+                    list_box.add(&gig_row);
+
+                    // Set playlists inside this gig folder (collapsed under it)
+                    let mut set_pls: Vec<_> = playlists.iter()
+                        .filter(|pl| pl.parent_id == Some(child_pl.id))
+                        .collect();
+                    set_pls.sort_by_key(|pl| pl.id);
+                    for set_pl in set_pls {
+                        list_box.add(&make_set_playlist_row(set_pl));
+                    }
+                } else {
+                    // Pool playlist directly under contact
+                    list_box.add(&make_pool_row(child_pl));
+                }
+            }
+        } else {
+            // No rekordbox link yet — show gigs from store as fallback
+            for gig in store.gigs_for_contact(&contact.id) {
+                list_box.add(&make_gig_row_simple(gig));
+            }
+        }
+    }
+
+    list_box.show_all();
+}
+
+/// Fallback used before library is loaded and when creating new gigs.
+fn populate_contacts_and_gigs(list_box: &gtk::ListBox, store: &crate::gig::GigStore) {
+    for child in list_box.get_children() {
+        list_box.remove(&child);
+    }
+    for contact in &store.contacts {
+        list_box.add(&make_contact_header_row(contact));
+        for gig in store.gigs_for_contact(&contact.id) {
+            list_box.add(&make_gig_row_simple(gig));
+        }
     }
     list_box.show_all();
 }
 
-fn make_gig_row(gig: &crate::gig::Gig) -> gtk::ListBoxRow {
+fn make_contact_header_row(contact: &crate::gig::Contact) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
-    row.set_widget_name(&gig.id);
-    let label_text = if gig.contact.is_empty() && gig.name.is_empty() {
-        "New Gig".to_string()
-    } else if gig.name.is_empty() {
-        gig.contact.clone()
+    row.set_widget_name(&format!("contact:{}", contact.id));
+    row.set_selectable(false);
+    let lbl = gtk::Label::new(None);
+    lbl.set_markup(&format!(
+        "<b>{}</b>  <small>{}</small>",
+        glib::markup_escape_text(&contact.name),
+        contact.customer_type.label(),
+    ));
+    lbl.set_xalign(0.0);
+    lbl.set_margin_start(6);
+    lbl.set_margin_top(6);
+    lbl.set_margin_bottom(2);
+    row.add(&lbl);
+    row
+}
+
+fn make_gig_folder_row(
+    pl:  &crate::rekordbox::Playlist,
+    gig: Option<&crate::gig::Gig>,
+) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    let widget_name = gig
+        .map(|g| format!("gig:{}", g.id))
+        .unwrap_or_else(|| format!("rb_folder:{}", pl.id));
+    row.set_widget_name(&widget_name);
+    let lbl = gtk::Label::new(Some(&pl.name));
+    lbl.set_xalign(0.0);
+    lbl.set_margin_start(18);
+    lbl.set_margin_top(4);
+    lbl.set_margin_bottom(4);
+    row.add(&lbl);
+    row
+}
+
+fn make_set_playlist_row(pl: &crate::rekordbox::Playlist) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_widget_name(&format!("pl:{}", pl.id));
+    let label_text = if pl.track_count > 0 {
+        format!("  {} ({})", pl.name, pl.track_count)
     } else {
-        format!("{} – {}", gig.contact, gig.name)
+        format!("  {}", pl.name)
     };
     let lbl = gtk::Label::new(Some(&label_text));
     lbl.set_xalign(0.0);
-    lbl.set_margin_start(8);
-    lbl.set_margin_top(4);
-    lbl.set_margin_bottom(4);
+    lbl.set_margin_start(32);
+    lbl.set_margin_top(2);
+    lbl.set_margin_bottom(2);
+    row.add(&lbl);
+    row
+}
+
+fn make_pool_row(pl: &crate::rekordbox::Playlist) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_widget_name(&format!("pool:{}", pl.id));
+    let label_text = if pl.track_count > 0 {
+        format!("{} ({})", pl.name, pl.track_count)
+    } else {
+        pl.name.clone()
+    };
+    let lbl = gtk::Label::new(Some(&label_text));
+    lbl.set_xalign(0.0);
+    lbl.set_margin_start(18);
+    lbl.set_margin_top(3);
+    lbl.set_margin_bottom(3);
+    row.add(&lbl);
+    row
+}
+
+fn make_gig_row_simple(gig: &crate::gig::Gig) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_widget_name(&format!("gig:{}", gig.id));
+    let label_text = if gig.name.is_empty() {
+        gig.date.as_deref().unwrap_or("New Gig").to_string()
+    } else if let Some(date) = &gig.date {
+        format!("{} ({})", gig.name, date)
+    } else {
+        gig.name.clone()
+    };
+    let lbl = gtk::Label::new(Some(&label_text));
+    lbl.set_xalign(0.0);
+    lbl.set_margin_start(18);
+    lbl.set_margin_top(3);
+    lbl.set_margin_bottom(3);
     row.add(&lbl);
     row
 }
@@ -2549,41 +2723,20 @@ fn build_gig_workspace() -> gtk::Box {
         e
     }}; }
 
-    let type_combo = gtk::ComboBoxText::new();
-    type_combo.set_widget_name("gig_type");
-    type_combo.append(Some("corporate"), "Corporate");
-    type_combo.append(Some("venue"),     "Venue");
-    type_combo.append(Some("private"),   "Private");
-    type_combo.set_active_id(Some("private"));
+    let contact_lbl = gtk::Label::new(None);
+    contact_lbl.set_widget_name("gig_contact_label");
+    contact_lbl.set_xalign(0.0);
+    contact_lbl.set_use_markup(true);
 
-    let contact_entry  = field_entry!("gig_contact",  "Contact person or client");
-    let name_entry     = field_entry!("gig_name",     "Event name");
-    let date_entry     = field_entry!("gig_date",     "YYYY-MM-DD");
-    let start_entry    = field_entry!("gig_start",    "HH:MM");
-    start_entry.set_hexpand(false);
-    start_entry.set_width_chars(6);
-    let end_entry      = field_entry!("gig_end",      "HH:MM");
-    end_entry.set_hexpand(false);
-    end_entry.set_width_chars(6);
-    let location_entry = field_entry!("gig_location", "Venue name or address");
+    let name_entry = field_entry!("gig_name", "Event name");
+    let date_entry = field_entry!("gig_date", "YYYY-MM-DD");
 
-    let time_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    time_box.pack_start(&start_entry,                    false, false, 0);
-    time_box.pack_start(&gtk::Label::new(Some("–")),     false, false, 0);
-    time_box.pack_start(&end_entry,                      false, false, 0);
-
-    info_grid.attach(&field_lbl!("Type"),     0, 0, 1, 1);
-    info_grid.attach(&type_combo,             1, 0, 1, 1);
-    info_grid.attach(&field_lbl!("Contact"),  0, 1, 1, 1);
-    info_grid.attach(&contact_entry,          1, 1, 1, 1);
-    info_grid.attach(&field_lbl!("Name"),     0, 2, 1, 1);
-    info_grid.attach(&name_entry,             1, 2, 1, 1);
-    info_grid.attach(&field_lbl!("Date"),     0, 3, 1, 1);
-    info_grid.attach(&date_entry,             1, 3, 1, 1);
-    info_grid.attach(&field_lbl!("Time"),     0, 4, 1, 1);
-    info_grid.attach(&time_box,               1, 4, 1, 1);
-    info_grid.attach(&field_lbl!("Location"), 0, 5, 1, 1);
-    info_grid.attach(&location_entry,         1, 5, 1, 1);
+    info_grid.attach(&field_lbl!("Contact"), 0, 0, 1, 1);
+    info_grid.attach(&contact_lbl,           1, 0, 1, 1);
+    info_grid.attach(&field_lbl!("Name"),    0, 1, 1, 1);
+    info_grid.attach(&name_entry,            1, 1, 1, 1);
+    info_grid.attach(&field_lbl!("Date"),    0, 2, 1, 1);
+    info_grid.attach(&date_entry,            1, 2, 1, 1);
     info_exp.add(&info_grid);
     content.pack_start(&info_exp, false, false, 0);
 
@@ -2691,16 +2844,31 @@ fn find_in_widget(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     None
 }
 
-fn load_gig_into_workspace(workspace: &gtk::Box, gig: &crate::gig::Gig) {
+fn load_gig_into_workspace(
+    workspace: &gtk::Box,
+    gig: &crate::gig::Gig,
+    contact: &crate::gig::Contact,
+) {
     // Update header
     if let Some(w) = workspace.get_children().into_iter().find(|c| c.get_widget_name() == "gig_header") {
         if let Ok(lbl) = w.downcast::<gtk::Label>() {
-            let title = if gig.contact.is_empty() && gig.name.is_empty() {
-                "New Gig".to_string()
+            let title = if gig.name.is_empty() {
+                contact.name.clone()
             } else {
-                gig.playlist_name()
+                format!("{} – {}", contact.name, gig.name)
             };
             lbl.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&title)));
+        }
+    }
+
+    // Contact label
+    if let Some(w) = find_widget(workspace, "gig_contact_label") {
+        if let Ok(lbl) = w.downcast::<gtk::Label>() {
+            lbl.set_markup(&format!(
+                "{}  <small>{}</small>",
+                glib::markup_escape_text(&contact.name),
+                contact.customer_type.label(),
+            ));
         }
     }
 
@@ -2712,26 +2880,15 @@ fn load_gig_into_workspace(workspace: &gtk::Box, gig: &crate::gig::Gig) {
         }
     }; }
 
-    set_entry!("gig_contact",      &gig.contact);
-    set_entry!("gig_name",         &gig.name);
-    set_entry!("gig_date",         &gig.date);
-    set_entry!("gig_start",        &gig.start_time);
-    set_entry!("gig_end",          &gig.end_time);
-    set_entry!("gig_location",     &gig.location);
-    set_entry!("gig_spotify_url",  gig.spotify_playlist_url.as_deref().unwrap_or(""));
-    set_entry!("gig_playlist_name", &gig.playlist_name());
-
-    // Type combo
-    if let Some(w) = find_widget(workspace, "gig_type") {
-        if let Ok(combo) = w.downcast::<gtk::ComboBoxText>() {
-            let id = match gig.gig_type {
-                crate::gig::GigType::Corporate => "corporate",
-                crate::gig::GigType::Venue     => "venue",
-                crate::gig::GigType::Private   => "private",
-            };
-            combo.set_active_id(Some(id));
-        }
-    }
+    set_entry!("gig_name",        &gig.name);
+    set_entry!("gig_date",        gig.date.as_deref().unwrap_or(""));
+    set_entry!("gig_spotify_url", gig.spotify_playlist_url.as_deref().unwrap_or(""));
+    set_entry!("gig_playlist_name", &format!(
+        "{}/{}/{}",
+        contact.customer_type.playlist_folder(),
+        contact.name,
+        gig.name,
+    ));
 
     // Notes
     if let Some(w) = find_widget(workspace, "gig_notes") {
@@ -2745,14 +2902,18 @@ fn load_gig_into_workspace(workspace: &gtk::Box, gig: &crate::gig::Gig) {
     // Destination label
     if let Some(w) = find_widget(workspace, "gig_dest_label") {
         if let Ok(lbl) = w.downcast::<gtk::Label>() {
-            lbl.set_text(&format!("Destination: {}/", gig.gig_type.playlist_folder()));
+            lbl.set_text(&format!(
+                "Destination: {}/{}/",
+                contact.customer_type.playlist_folder(),
+                contact.name,
+            ));
         }
     }
 
     // Match status
     if let Some(w) = find_widget(workspace, "gig_match_status") {
         if let Ok(lbl) = w.downcast::<gtk::Label>() {
-            let status = if gig.rekordbox_playlist_id.is_some() {
+            let status = if gig.rekordbox_folder_id.is_some() {
                 "Playlist created ✓".to_string()
             } else if gig.spotify_playlist_url.is_some() {
                 "Spotify URL set — click Run Match".to_string()
