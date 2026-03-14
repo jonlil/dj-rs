@@ -517,12 +517,14 @@ impl BrowserView {
         let topbar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         topbar.set_border_width(4);
         let open_btn     = gtk::Button::with_label("Open Library…");
+        let reload_btn   = gtk::Button::with_label("↺ Reload");
         let settings_btn = gtk::Button::with_label("Settings…");
         let status_lbl   = gtk::Label::new(Some("No library loaded"));
         let search_entry = gtk::Entry::new();
         search_entry.set_placeholder_text(Some("Search tracks…"));
         search_entry.set_hexpand(true);
         topbar.pack_start(&open_btn,     false, false, 0);
+        topbar.pack_start(&reload_btn,   false, false, 0);
         topbar.pack_start(&settings_btn, false, false, 0);
         topbar.pack_start(&status_lbl,   false, false, 8);
         topbar.pack_end(&search_entry,   false, false, 0);
@@ -974,6 +976,19 @@ impl BrowserView {
                 }
             })
         };
+
+        // ── reload library button ─────────────────────────────────────────────
+        {
+            let do_open = do_open_library.clone();
+            let config  = config.clone();
+
+            reload_btn.connect_clicked(move |_| {
+                let path = config.borrow().db_path.clone();
+                if let Some(path) = path {
+                    do_open(&path);
+                }
+            });
+        }
 
         // ── open library button ───────────────────────────────────────────────
         {

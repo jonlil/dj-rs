@@ -32,7 +32,7 @@ src/
 │   [Cast…] [Stop Cast] [cast status]                       │
 │   [Next: —]                              [Next →]         │
 ├─ BrowserView ─────────────────────────────────────────────┤
-│   [Open Library…] [Settings…] [N tracks]  [Search…]      │
+│   [Open Library…] [↺ Reload] [Settings…] [N tracks]  [Search…] │
 │   [BPM: min–max] [Key:▾] [Genre:▾] [Rating:▾] [Harmonic] │
 │   ┌──────────────┬──────────────────────────────────────┐ │
 │   │ ★ All Tracks │ Title Artist BPM Key Time Genre ★ Lbl│ │

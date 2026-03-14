@@ -1,5 +1,29 @@
 # Development Log
 
+## 2026-03-14 — Library tooling & reload button
+
+### Features implemented
+
+**↺ Reload Library button**
+- Added to BrowserView topbar, next to "Open Library…"
+- Re-opens the currently configured `db_path` from config, refreshing playlists, tracks, history, and filter combos in one click
+- Intended for use after external DB modifications (e.g. `create_sandbox.py`, `gig-prep`)
+
+**Library analysis & playlist structure (Python tooling)**
+- Audited library for missing/streaming tracks: streaming-only entries (`/v4/catalog/tracks/…`) removed from `djmdContent` and all dependent tables (`djmdSongPlaylist`, `djmdSongHistory`, `djmdCue`, `djmdMixerParam`)
+- Built automated playlist structure via Python (`sqlcipher3`) based on cross-gig play frequency and BPM analysis — see `dj_jonas/` for details (gitignored)
+- Backup of `dj_jonas/` DB files (excluding `music/`, `share/`, `PIONEER/`) saved as `dj_jonas_backup_YYYYMMDD.tar.gz`; root-level archives are gitignored
+
+### Bugs found and fixed
+
+| Bug | Cause | Fix |
+|---|---|---|
+| App crash (SIGABRT) on Reload click | `config.borrow()` in `if let Some(path) = config.borrow().db_path.clone()` held an immutable borrow alive across the entire `if let` block; `do_open_library` internally calls `config.borrow_mut()`, causing a double-borrow panic | Separated into two statements: `let path = config.borrow().db_path.clone();` then `if let Some(path) = path { do_open(&path); }` so the borrow is dropped before `do_open` is entered |
+
+### Lessons learned
+
+- **RefCell borrow lifetime in `if let`**: a temporary `Ref<T>` created in the scrutinee of `if let Some(x) = rc.borrow().field.clone()` lives for the entire `if let` block, not just the condition. If any code inside the block re-borrows the same `RefCell` mutably, it panics at runtime. Always assign to a `let` binding first to drop the borrow immediately.
+
 ## 2026-03-13 — Feature sprint
 
 ### Features implemented
