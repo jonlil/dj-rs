@@ -5,8 +5,11 @@ extern crate glib;
 mod config;
 mod deck;
 mod dlna;
+mod gig;
+mod matcher;
 mod rekordbox;
 mod server;
+mod spotify;
 mod views;
 
 use gtk::prelude::*;

@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub db_path: Option<String>,
     pub path_mappings: Vec<PathMapping>,
+    pub spotify_client_id: Option<String>,
+    pub spotify_access_token: Option<String>,
+    pub spotify_refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

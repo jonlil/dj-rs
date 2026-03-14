@@ -525,6 +525,42 @@ impl Library {
         )?;
         Ok(())
     }
+
+    /// Add tracks to a playlist in order.
+    pub fn add_tracks_to_playlist(&self, playlist_id: i64, track_ids: &[i64]) -> Result<()> {
+        let pl_str = playlist_id.to_string();
+        for (i, &track_id) in track_ids.iter().enumerate() {
+            let new_sp_id: i64 = self.conn.query_row(
+                "SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdSongPlaylist",
+                [], |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "INSERT INTO djmdSongPlaylist \
+                 (ID, PlaylistID, ContentID, TrackNo, rb_local_deleted, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, datetime('now'), datetime('now'))",
+                params![new_sp_id.to_string(), pl_str, track_id.to_string(), (i + 1) as i32],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Find a top-level folder by name. Returns its ID if found.
+    pub fn find_folder_by_name(&self, name: &str) -> Option<i64> {
+        self.conn.query_row(
+            "SELECT ID FROM djmdPlaylist \
+             WHERE Name = ?1 AND Attribute = 1 AND rb_local_deleted = 0",
+            params![name],
+            |row| row.get::<_, String>(0),
+        ).ok().and_then(|s| s.parse().ok())
+    }
+
+    /// Find a folder by name, creating it at root level if it doesn't exist.
+    pub fn find_or_create_folder(&self, name: &str) -> Result<i64> {
+        if let Some(id) = self.find_folder_by_name(name) {
+            return Ok(id);
+        }
+        self.create_folder(name, None)
+    }
 }
 
 impl Track {
