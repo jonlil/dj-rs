@@ -258,6 +258,38 @@ fn extract_playlist_id(input: &str) -> Result<String, String> {
     Err(format!("Could not extract playlist ID from: {input}"))
 }
 
+// ── Track image ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TrackImageResponse {
+    album: AlbumImages,
+}
+
+#[derive(Deserialize)]
+struct AlbumImages {
+    images: Vec<ImageObject>,
+}
+
+#[derive(Deserialize)]
+struct ImageObject {
+    url: String,
+}
+
+/// Returns the URL of the best-fit album art (prefers ≤300 px, falls back to largest).
+pub fn fetch_track_image_url(access_token: &str, track_id: &str) -> Option<String> {
+    let client = Client::new();
+    let resp = client
+        .get(&format!("https://api.spotify.com/v1/tracks/{track_id}"))
+        .bearer_auth(access_token)
+        .send().ok()?
+        .json::<TrackImageResponse>().ok()?;
+
+    // Spotify returns images largest-first; take the last one that is still
+    // at least 150px so it looks sharp at 80×80 (retina). Fall back to first.
+    let images = resp.album.images;
+    images.last().or_else(|| images.first()).map(|i| i.url.clone())
+}
+
 // ── Spotify Connect ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

@@ -444,8 +444,10 @@ pub(super) fn populate_match_results(
         let track_id = local.id;
 
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        row_box.set_margin_start(4);
-        row_box.set_margin_end(4);
+        row_box.set_margin_start(8);
+        row_box.set_margin_end(8);
+        row_box.set_margin_top(6);
+        row_box.set_margin_bottom(6);
 
         let label = gtk::Label::new(Some(&format!(
             "{} – {}",
@@ -536,8 +538,10 @@ pub(super) fn populate_match_results(
 
     for r in &missing {
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        row_box.set_margin_start(4);
-        row_box.set_margin_end(4);
+        row_box.set_margin_start(8);
+        row_box.set_margin_end(8);
+        row_box.set_margin_top(6);
+        row_box.set_margin_bottom(6);
 
         let label = gtk::Label::new(Some(&format!("{} – {}", r.spotify.title, r.spotify.artist)));
         label.set_xalign(0.0);

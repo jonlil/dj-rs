@@ -1,4 +1,5 @@
 use gtk::prelude::*;
+use gdk_pixbuf::prelude::*;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -57,7 +58,7 @@ pub struct PlayerView {
 }
 
 impl PlayerView {
-    pub fn new(_window: &gtk::ApplicationWindow, deck_label: &str, bridge: Arc<ServerBridge>, spotify_player: Rc<LibrespotPlayer>) -> Self {
+    pub fn new(_window: &gtk::ApplicationWindow, deck_label: &str, bridge: Arc<ServerBridge>, spotify_player: Rc<LibrespotPlayer>, config: Rc<RefCell<crate::config::Config>>) -> Self {
         let state = Rc::new(RefCell::new(DeckState::new()));
         let current_track_db_id: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
         let on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
@@ -68,16 +69,30 @@ impl PlayerView {
 
         // ── Info row: [album art] [title / BPM] [artist / Key] ──────────────
 
-        // Album art placeholder — grey square, replaced later with actual art
-        let art_placeholder = gtk::DrawingArea::new();
-        art_placeholder.set_size_request(80, 80);
-        art_placeholder.connect_draw(|w, cr| {
-            let alloc = w.get_allocation();
-            cr.set_source_rgb(0.25, 0.25, 0.25);
-            cr.rectangle(0.0, 0.0, alloc.width as f64, alloc.height as f64);
-            cr.fill();
-            gtk::Inhibit(false)
-        });
+        // Album art — shows track/album art when available, grey otherwise
+        let art_image = gtk::Image::new();
+        art_image.set_size_request(80, 80);
+
+        // Channel for background image fetches → GTK thread display
+        let (art_tx, art_rx) = glib::MainContext::channel::<Option<Vec<u8>>>(glib::PRIORITY_LOW);
+        {
+            let art_image_rx = art_image.clone();
+            art_rx.attach(None, move |bytes_opt| {
+                match bytes_opt {
+                    None => art_image_rx.clear(),
+                    Some(bytes) => {
+                        let loader = gdk_pixbuf::PixbufLoader::new();
+                        let _ = loader.write(&bytes);
+                        let _ = loader.close();
+                        if let Some(pb) = loader.get_pixbuf() {
+                            let scaled = pb.scale_simple(80, 80, gdk_pixbuf::InterpType::Bilinear);
+                            art_image_rx.set_from_pixbuf(scaled.as_ref());
+                        }
+                    }
+                }
+                glib::Continue(true)
+            });
+        }
 
         let track_label = gtk::Label::new(Some("No track loaded"));
         track_label.set_xalign(0.0);
@@ -106,8 +121,8 @@ impl PlayerView {
         meta_box.pack_start(&artist_row, false, false, 0);
 
         let info_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        info_row.pack_start(&art_placeholder, false, false, 0);
-        info_row.pack_start(&meta_box,        true,  true,  0);
+        info_row.pack_start(&art_image, false, false, 0);
+        info_row.pack_start(&meta_box,  true,  true,  0);
 
         // ── Waveform row: [waveform placeholder] [-M:SS] ─────────────────────
 
@@ -139,17 +154,20 @@ impl PlayerView {
         position_scale.set_hexpand(true);
         position_scale.set_sensitive(false);
 
-        // ── Controls: [Cue] [▶/❚❚]  +  TV toggle (right) ────────────────────
+        // ── Controls: [Cue] [▶/❚❚]  +  Convert/TV toggle (right) ───────────
 
-        let play_btn = gtk::Button::with_label("▶  Play");
-        let cue_btn  = gtk::Button::with_label("Cue");
-        let tv_btn   = gtk::ToggleButton::with_label("TV");
+        let play_btn    = gtk::Button::with_label("▶  Play");
+        let cue_btn     = gtk::Button::with_label("Cue");
+        let tv_btn      = gtk::ToggleButton::with_label("TV");
+        let convert_btn = gtk::Button::with_label("Convert to FLAC");
         tv_btn.set_sensitive(false);
+        convert_btn.set_no_show_all(true);
 
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        controls.pack_start(&cue_btn,  false, false, 0);
-        controls.pack_start(&play_btn, false, false, 0);
-        controls.pack_end  (&tv_btn,   false, false, 0);
+        controls.pack_start(&cue_btn,     false, false, 0);
+        controls.pack_start(&play_btn,    false, false, 0);
+        controls.pack_end  (&tv_btn,      false, false, 0);
+        controls.pack_end  (&convert_btn, false, false, 0);
 
         // Volume scale (hidden, used programmatically)
         let vol_adj = gtk::Adjustment::new(1.0, 0.0, 1.5, 0.01, 0.1, 0.0);
@@ -169,12 +187,20 @@ impl PlayerView {
             });
         }
 
+        // ── Error label (hidden until a load fails) ───────────────────────────
+
+        let error_label = gtk::Label::new(None::<&str>);
+        error_label.set_xalign(0.0);
+        error_label.set_line_wrap(true);
+        error_label.set_no_show_all(true);
+
         // ── Assemble ──────────────────────────────────────────────────────────
 
-        vbox.pack_start(&info_row,      false, false, 0);
-        vbox.pack_start(&wave_row,      false, false, 0);
+        vbox.pack_start(&info_row,       false, false, 0);
+        vbox.pack_start(&wave_row,       false, false, 0);
         vbox.pack_start(&position_scale, false, false, 0);
         vbox.pack_start(&controls,       false, false, 0);
+        vbox.pack_start(&error_label,    false, false, 0);
 
         frame.add(&vbox);
 
@@ -191,6 +217,9 @@ impl PlayerView {
             let current_db_id_load = current_track_db_id.clone();
             let bridge_load        = bridge.clone();
             let spotify_load       = spotify_player.clone();
+            let error_label_load   = error_label.clone();
+            let convert_btn_load   = convert_btn.clone();
+            let art_tx_load        = art_tx.clone();
             Rc::new(move |track: Track| {
                 // Stop Spotify if it was playing so the deck takes over
                 if spotify_load.is_active() {
@@ -209,35 +238,61 @@ impl PlayerView {
                     .map(|k| format!("Key: {}", k))
                     .unwrap_or_default();
                 let db_duration = track.duration_secs.map(|s| s as f64).unwrap_or(0.0);
-                if state.borrow_mut().load(path).is_ok() {
-                    // DB duration is more reliable than rodio's total_duration
-                    if db_duration > 0.0 {
-                        state.borrow_mut().duration_secs = db_duration;
+                let image_path  = track.image_path.clone();
+                let load_result = state.borrow_mut().load(path);
+                match load_result {
+                    Ok(warning) => {
+                        // DB duration is more reliable than rodio's total_duration
+                        if db_duration > 0.0 {
+                            state.borrow_mut().duration_secs = db_duration;
+                        }
+                        if track.id != 0 {
+                            *current_db_id_load.borrow_mut() = Some(track.id);
+                        }
+                        track_label.set_text(&title);
+                        artist_label.set_text(&artist);
+                        bpm_label.set_text(&bpm_str);
+                        key_label.set_text(&key_str);
+                        play_btn_load.set_label("▶  Play");
+                        position_scale.set_sensitive(true);
+                        if let Some(w) = warning {
+                            error_label_load.set_text(&w);
+                            error_label_load.show();
+                            convert_btn_load.set_label("Convert to FLAC");
+                            convert_btn_load.set_sensitive(true);
+                            convert_btn_load.show();
+                        } else {
+                            error_label_load.set_text("");
+                            error_label_load.hide();
+                            convert_btn_load.hide();
+                        };
+                        // Load album art from rekordbox image path in background
+                        let tx = art_tx_load.clone();
+                        std::thread::spawn(move || {
+                            let bytes = image_path.and_then(|p| std::fs::read(&p).ok());
+                            let _ = tx.send(bytes);
+                        });
+                        let dur = state.borrow().duration_secs;
+                        if dur > 0.0 {
+                            time_label.set_text(&format!("-{}", fmt_time(dur)));
+                        } else {
+                            time_label.set_text("-?");
+                        }
+                        bridge_load.send(WsEvent::Metadata {
+                            title,
+                            artist,
+                            duration: dur,
+                        });
+                        bridge_load.send(WsEvent::Position { pos: 0.0 });
+                        bridge_load.send(WsEvent::State { playing: false });
                     }
-                    if track.id != 0 {
-                        *current_db_id_load.borrow_mut() = Some(track.id);
+                    Err(e) => {
+                        track_label.set_text(&title);
+                        error_label_load.set_text(&format!("⚠ {e}"));
+                        error_label_load.show();
+                        convert_btn_load.hide();
+                        let _ = art_tx_load.send(None);
                     }
-                    track_label.set_text(&title);
-                    artist_label.set_text(&artist);
-                    bpm_label.set_text(&bpm_str);
-                    key_label.set_text(&key_str);
-                    play_btn_load.set_label("▶  Play");
-                    position_scale.set_sensitive(true);
-                    let dur = state.borrow().duration_secs;
-                    if dur > 0.0 {
-                        time_label.set_text(&format!("-{}", fmt_time(dur)));
-                    } else {
-                        time_label.set_text("-?");
-                    }
-                    bridge_load.send(WsEvent::Metadata {
-                        title,
-                        artist,
-                        duration: dur,
-                    });
-                    bridge_load.send(WsEvent::Position { pos: 0.0 });
-                    bridge_load.send(WsEvent::State { playing: false });
-                } else {
-                    track_label.set_text("Error loading file");
                 }
             })
         };
@@ -248,20 +303,20 @@ impl PlayerView {
             frame.drag_dest_set(gtk::DestDefaults::ALL, &dnd_targets, gdk::DragAction::COPY);
             let do_load = do_load_track.clone();
             frame.connect_drag_data_received(move |_w, _ctx, _x, _y, sel, _info, _time| {
-                let path_str = match sel.get_text() {
-                    Some(s) => s.to_string(),
-                    None    => return,
+                let path_str = match std::str::from_utf8(&sel.get_data()) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return,
                 };
-                let title = std::path::Path::new(&path_str)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
+                let title = {
+                    let p = std::path::Path::new(&path_str);
+                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown");
+                    stem.to_string()
+                };
                 do_load(Track {
                     id: 0, title, artist: None, album: None, genre: None,
                     key: None, bpm: None, duration_secs: None, rating: None,
                     play_count: None, file_path: Some(path_str), track_no: None,
-                    label: None, color_id: None,
+                    label: None, color_id: None, image_path: None,
                 });
             });
         }
@@ -327,6 +382,90 @@ impl PlayerView {
                 ));
                 bridge_cue.send(WsEvent::State    { playing: false });
                 bridge_cue.send(WsEvent::Position { pos: 0.0 });
+            });
+        }
+
+        // Convert to FLAC button
+        {
+            let state           = state.clone();
+            let current_db_id   = current_track_db_id.clone();
+            let do_load         = do_load_track.clone();
+            let error_label_c   = error_label.clone();
+            let convert_btn_c   = convert_btn.clone();
+            let config_conv     = config.clone();
+
+            convert_btn.connect_clicked(move |btn| {
+                let file_path = match state.borrow().file_path.clone() {
+                    Some(p) => p,
+                    None => return,
+                };
+                let db_id   = *current_db_id.borrow();
+                let db_path = config_conv.borrow().resolved_db_path();
+
+                btn.set_sensitive(false);
+                btn.set_label("Converting…");
+
+                let (tx, rx) = glib::MainContext::channel::<Result<std::path::PathBuf, String>>(glib::PRIORITY_DEFAULT);
+
+                std::thread::spawn(move || {
+                    let flac_path = file_path.with_extension("flac");
+                    let result = std::process::Command::new("ffmpeg")
+                        .args([
+                            "-i",  file_path.to_str().unwrap_or(""),
+                            "-c:a", "flac", "-loglevel", "error",
+                            flac_path.to_str().unwrap_or(""),
+                        ])
+                        .output();
+
+                    let outcome: Result<std::path::PathBuf, String> = match result {
+                        Ok(out) if out.status.success() => Ok(flac_path),
+                        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                        Err(e)  => Err(e.to_string()),
+                    };
+
+                    let outcome = outcome.and_then(|flac| {
+                        if let (Some(id), Some(db)) = (db_id, db_path) {
+                            crate::rekordbox::Library::open(&db)
+                                .and_then(|lib| lib.update_track_path(id, flac.to_str().unwrap_or("")))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Ok(flac)
+                    });
+
+                    let _ = tx.send(outcome);
+                });
+
+                let do_load2       = do_load.clone();
+                let error_label2   = error_label_c.clone();
+                let convert_btn2   = convert_btn_c.clone();
+
+                rx.attach(None, move |outcome| {
+                    match outcome {
+                        Ok(flac) => {
+                            do_load2(crate::rekordbox::Track {
+                                id: db_id.unwrap_or(0),
+                                title: flac.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("Unknown")
+                                    .to_string(),
+                                artist: None,
+                                album: None, genre: None, key: None,
+                                bpm: None, duration_secs: None,
+                                track_no: None, label: None, color_id: None,
+                                rating: None, play_count: None,
+                                file_path: Some(flac.to_str().unwrap_or("").to_string()),
+                                image_path: None,
+                            });
+                        }
+                        Err(e) => {
+                            error_label2.set_text(&format!("⚠ Conversion failed: {e}"));
+                            error_label2.show();
+                            convert_btn2.set_label("Convert to FLAC");
+                            convert_btn2.set_sensitive(true);
+                        }
+                    }
+                    glib::Continue(false)
+                });
             });
         }
 
@@ -416,18 +555,67 @@ impl PlayerView {
             let tv_btn_timer         = tv_btn.clone();
             let volume_scale_timer   = volume_scale.clone();
             let spotify_player_timer = spotify_player.clone();
+            let art_tx_timer         = art_tx.clone();
+            let config_timer         = config.clone();
             let mut tick: u32        = 0;
             glib::timeout_add_local(100, move || {
                 tick += 1;
 
+                // Every 5 minutes, refresh the Spotify token and reconnect librespot
+                if tick % 3000 == 0 {
+                    let refresh_token = config_timer.borrow().spotify_refresh_token.clone();
+                    if let Some(rt) = refresh_token {
+                        let config_ref    = config_timer.clone();
+                        let player_ref    = spotify_player_timer.clone();
+                        let (tx, rx) = glib::MainContext::channel::<(String, Option<String>)>(glib::PRIORITY_DEFAULT);
+                        std::thread::spawn(move || {
+                            if let Ok((new_access, new_refresh)) = crate::spotify::refresh(&rt) {
+                                let _ = tx.send((new_access, new_refresh));
+                            }
+                        });
+                        rx.attach(None, move |(new_access, new_refresh)| {
+                            {
+                                let mut cfg = config_ref.borrow_mut();
+                                cfg.spotify_access_token = Some(new_access.clone());
+                                if let Some(nr) = new_refresh {
+                                    cfg.spotify_refresh_token = Some(nr);
+                                }
+                                cfg.save();
+                            }
+                            player_ref.set_token(new_access);
+                            glib::Continue(false)
+                        });
+                    }
+                }
+
                 // If Spotify (librespot) is the active audio source, update deck display from it
                 if spotify_player_timer.is_active() {
+                    // Pause local deck if it's still playing
+                    if !state.borrow().sink.is_paused() {
+                        state.borrow_mut().pause();
+                        play_btn.set_label("▶  Play");
+                    }
                     let (title, artist, dur) = spotify_player_timer.track_info();
                     let cur_text = track_label.get_text();
                     if cur_text != title {
                         track_label.set_text(&title);
                         artist_label.set_text(&artist);
                         position_scale.set_sensitive(true);
+                        // Fetch album art for the new Spotify track
+                        let uri   = spotify_player_timer.current_uri();
+                        let token = spotify_player_timer.access_token();
+                        if let Some(token) = token {
+                            if let Some(track_id) = uri.split(':').nth(2).map(|s| s.to_string()) {
+                                let tx = art_tx_timer.clone();
+                                std::thread::spawn(move || {
+                                    let bytes = crate::spotify::fetch_track_image_url(&token, &track_id)
+                                        .and_then(|url| reqwest::blocking::get(&url).ok())
+                                        .and_then(|r| r.bytes().ok())
+                                        .map(|b| b.to_vec());
+                                    let _ = tx.send(bytes);
+                                });
+                            }
+                        }
                     }
                     // Sync play/pause button label with librespot state
                     let expected_label = if spotify_player_timer.is_paused() { "▶  Play" } else { "❚❚  Pause" };
@@ -556,12 +744,12 @@ pub struct MainView {
 }
 
 impl MainView {
-    pub fn new(window: &gtk::ApplicationWindow, bridge: Arc<ServerBridge>) -> Self {
+    pub fn new(window: &gtk::ApplicationWindow, bridge: Arc<ServerBridge>, config: Rc<RefCell<crate::config::Config>>) -> Self {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         container.set_border_width(8);
 
         let spotify_player = LibrespotPlayer::new();
-        let player = PlayerView::new(window, "Deck", bridge, spotify_player.clone());
+        let player = PlayerView::new(window, "Player", bridge, spotify_player.clone(), config);
         let queue_fn = player.queue_fn.clone();
         let current_track_db_id = player.current_track_db_id.clone();
         let on_track_end = player.on_track_end.clone();
@@ -793,6 +981,8 @@ impl BrowserView {
         ] {
             let col = gtk::TreeViewColumn::new();
             let cell = gtk::CellRendererText::new();
+            let _ = cell.set_property("xpad", &6u32);
+            let _ = cell.set_property("ypad", &4u32);
             col.pack_start(&cell, true);
             col.add_attribute(&cell, "text", idx);
             col.set_title(title);
@@ -865,7 +1055,9 @@ impl BrowserView {
                         *cur_db_id.borrow_mut() = Some(id);
                     }
                     let mapped = config.borrow().apply_mappings(&raw);
-                    sel.set_text(&mapped);
+                    // Use raw bytes to avoid GTK's text encoding mangling non-ASCII paths
+                    let atom = gdk::Atom::intern("text/plain");
+                    sel.set(&atom, 8, mapped.as_bytes());
                 }
             });
         }
@@ -921,7 +1113,7 @@ impl BrowserView {
                                 duration_secs: if dur_raw > 0 { Some(dur_raw) } else { None },
                                 rating: None, play_count: None,
                                 file_path: Some(mapped),
-                                track_no: None, label: None, color_id: None,
+                                track_no: None, label: None, color_id: None, image_path: None,
                             });
                         }
                     });
@@ -979,14 +1171,39 @@ impl BrowserView {
                         let all_tracks = lib.tracks().unwrap_or_default();
                         let results    = crate::matcher::match_tracks(&gig.cached_spotify_tracks, &all_tracks);
 
-                        if let Some(token) = config_c.borrow().spotify_access_token.clone() {
-                            preview_player_c.set_token(token);
-                        }
                         set_match_status(&gig_workspace_c, &format!(
                             "Cached: {} tracks — click Run Match to refresh",
                             gig.cached_spotify_tracks.len(),
                         ));
                         populate_match_results(&gig_workspace_c, &gig_id, &results, &window_c, &preview_player_c);
+
+                        // Refresh token in background then connect librespot
+                        let refresh_token = config_c.borrow().spotify_refresh_token.clone();
+                        let access_token  = config_c.borrow().spotify_access_token.clone();
+                        let config_ref    = config_c.clone();
+                        let player_ref    = preview_player_c.clone();
+                        let (tx, rx) = glib::MainContext::channel::<(String, Option<String>, bool)>(glib::PRIORITY_DEFAULT);
+                        std::thread::spawn(move || {
+                            if let Some(rt) = refresh_token {
+                                if let Ok((new_access, new_refresh)) = crate::spotify::refresh(&rt) {
+                                    let _ = tx.send((new_access, new_refresh, true));
+                                    return;
+                                }
+                            }
+                            if let Some(t) = access_token { let _ = tx.send((t, None, false)); }
+                        });
+                        rx.attach(None, move |(new_access, new_refresh, did_refresh)| {
+                            if did_refresh {
+                                let mut cfg = config_ref.borrow_mut();
+                                cfg.spotify_access_token = Some(new_access.clone());
+                                if let Some(nr) = new_refresh {
+                                    cfg.spotify_refresh_token = Some(nr);
+                                }
+                                cfg.save();
+                            }
+                            player_ref.set_token(new_access);
+                            glib::Continue(false)
+                        });
                     });
                 }
             }
@@ -1741,8 +1958,7 @@ impl BrowserView {
             let config  = config.clone();
 
             reload_btn.connect_clicked(move |_| {
-                let path = config.borrow().db_path.clone();
-                if let Some(path) = path {
+                if let Some(path) = config.borrow().resolved_db_path() {
                     do_open(&path);
                 }
             });
@@ -2422,7 +2638,7 @@ impl BrowserView {
         // ── auto-load saved library ───────────────────────────────────────────
         {
             let do_open    = do_open_library.clone();
-            let saved_path = config.borrow().db_path.clone();
+            let saved_path = config.borrow().resolved_db_path();
 
             if let Some(path) = saved_path {
                 glib::idle_add_local(move || {
