@@ -644,6 +644,9 @@ impl BrowserView {
         hist_expander.add(&hist_scroll);
 
         // Gigs section
+        let expanded_contacts: Rc<RefCell<std::collections::HashSet<String>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
+
         let gig_list_box = gtk::ListBox::new();
         gig_list_box.set_selection_mode(gtk::SelectionMode::Single);
         gig_list_box.set_size_request(-1, 120);
@@ -964,7 +967,8 @@ impl BrowserView {
             let key_combo2           = key_combo.clone();
             let genre_combo2         = genre_combo.clone();
             let pl_view2             = pl_view.clone();
-            let gig_list_box2        = gig_list_box.clone();
+            let gig_list_box2          = gig_list_box.clone();
+            let expanded_contacts2     = expanded_contacts.clone();
 
             Rc::new(move |path_str: &str| {
                 match Library::open(path_str) {
@@ -997,6 +1001,7 @@ impl BrowserView {
                             &gig_list_box2,
                             &crate::gig::GigStore::load(),
                             &lists,
+                            &expanded_contacts2.borrow(),
                         );
 
                         if let Ok(tracks) = lib.tracks() {
@@ -1098,14 +1103,19 @@ impl BrowserView {
         // ── gig list: populate from store ─────────────────────────────────────
         {
             let gig_list_box = gig_list_box.clone();
-            populate_contacts_and_gigs(&gig_list_box, &crate::gig::GigStore::load());
+            populate_contacts_and_gigs(
+                &gig_list_box,
+                &crate::gig::GigStore::load(),
+                &expanded_contacts.borrow(),
+            );
         }
 
         // ── new contact+gig button ────────────────────────────────────────────
         {
-            let gig_list_box  = gig_list_box.clone();
-            let right_stack   = right_stack.clone();
-            let gig_workspace = gig_workspace.clone();
+            let gig_list_box        = gig_list_box.clone();
+            let right_stack         = right_stack.clone();
+            let gig_workspace       = gig_workspace.clone();
+            let expanded_contacts2  = expanded_contacts.clone();
 
             new_gig_btn.connect_clicked(move |_| {
                 let new_id = || uuid::Uuid::new_v4().to_string();
@@ -1129,7 +1139,9 @@ impl BrowserView {
                 store.contacts.push(contact.clone());
                 store.gigs.push(gig.clone());
                 store.save();
-                populate_contacts_and_gigs(&gig_list_box, &store);
+                // Auto-expand the new contact
+                expanded_contacts2.borrow_mut().insert(contact.id.clone());
+                populate_contacts_and_gigs(&gig_list_box, &store, &expanded_contacts2.borrow());
                 // Select the new gig row
                 let row_name = format!("gig:{}", gig.id);
                 for child in gig_list_box.get_children() {
@@ -1153,11 +1165,33 @@ impl BrowserView {
             let track_store2         = track_store.clone();
             let status_lbl2          = status_lbl.clone();
             let current_playlist_id2 = current_playlist_id.clone();
+            let gig_list_box2        = gig_list_box.clone();
+            let expanded_contacts2   = expanded_contacts.clone();
 
-            gig_list_box.connect_row_selected(move |_, row| {
+            gig_list_box.connect_row_selected(move |lb, row| {
                 if let Some(row) = row {
                     let name = row.get_widget_name().to_string();
-                    if let Some(gig_id) = name.strip_prefix("gig:") {
+                    if let Some(contact_id) = name.strip_prefix("contact:") {
+                        // Toggle expand/collapse for this contact
+                        let mut expanded = expanded_contacts2.borrow_mut();
+                        if expanded.contains(contact_id) {
+                            expanded.remove(contact_id);
+                        } else {
+                            expanded.insert(contact_id.to_string());
+                        }
+                        drop(expanded);
+                        lb.unselect_all();
+                        let store = crate::gig::GigStore::load();
+                        let playlists = library.borrow().as_ref()
+                            .and_then(|lib| lib.playlists().ok())
+                            .unwrap_or_default();
+                        populate_gig_sidebar_from_library(
+                            &gig_list_box2,
+                            &store,
+                            &playlists,
+                            &expanded_contacts2.borrow(),
+                        );
+                    } else if let Some(gig_id) = name.strip_prefix("gig:") {
                         // Gig event folder → show gig workspace
                         let store = crate::gig::GigStore::load();
                         if let Some(gig) = store.gigs.iter().find(|g| g.id == gig_id) {
@@ -2509,21 +2543,26 @@ fn show_gig_match_results(
 // ── Gig sidebar helpers ───────────────────────────────────────────────────────
 
 /// Populate the gig sidebar from the full Rekordbox playlist tree.
-/// When the library isn't loaded yet, falls back to the flat GigStore view.
+/// Only expanded contacts show their gigs/pools.
 fn populate_gig_sidebar_from_library(
-    list_box:  &gtk::ListBox,
-    store:     &crate::gig::GigStore,
-    playlists: &[crate::rekordbox::Playlist],
+    list_box:          &gtk::ListBox,
+    store:             &crate::gig::GigStore,
+    playlists:         &[crate::rekordbox::Playlist],
+    expanded_contacts: &std::collections::HashSet<String>,
 ) {
     for child in list_box.get_children() {
         list_box.remove(&child);
     }
 
     for contact in &store.contacts {
-        list_box.add(&make_contact_header_row(contact));
+        let expanded = expanded_contacts.contains(&contact.id);
+        list_box.add(&make_contact_header_row(contact, expanded));
+
+        if !expanded {
+            continue;
+        }
 
         if let Some(folder_id) = contact.rekordbox_folder_id {
-            // Direct children of the contact folder in Rekordbox
             let mut children: Vec<_> = playlists.iter()
                 .filter(|pl| pl.parent_id == Some(folder_id))
                 .collect();
@@ -2531,13 +2570,10 @@ fn populate_gig_sidebar_from_library(
 
             for child_pl in children {
                 if child_pl.attribute == 1 {
-                    // Gig event folder
                     let gig = store.gigs.iter()
                         .find(|g| g.rekordbox_folder_id == Some(child_pl.id));
-                    let gig_row = make_gig_folder_row(child_pl, gig);
-                    list_box.add(&gig_row);
+                    list_box.add(&make_gig_folder_row(child_pl, gig));
 
-                    // Set playlists inside this gig folder (collapsed under it)
                     let mut set_pls: Vec<_> = playlists.iter()
                         .filter(|pl| pl.parent_id == Some(child_pl.id))
                         .collect();
@@ -2546,12 +2582,10 @@ fn populate_gig_sidebar_from_library(
                         list_box.add(&make_set_playlist_row(set_pl));
                     }
                 } else {
-                    // Pool playlist directly under contact
                     list_box.add(&make_pool_row(child_pl));
                 }
             }
         } else {
-            // No rekordbox link yet — show gigs from store as fallback
             for gig in store.gigs_for_contact(&contact.id) {
                 list_box.add(&make_gig_row_simple(gig));
             }
@@ -2562,33 +2596,41 @@ fn populate_gig_sidebar_from_library(
 }
 
 /// Fallback used before library is loaded and when creating new gigs.
-fn populate_contacts_and_gigs(list_box: &gtk::ListBox, store: &crate::gig::GigStore) {
+fn populate_contacts_and_gigs(
+    list_box:          &gtk::ListBox,
+    store:             &crate::gig::GigStore,
+    expanded_contacts: &std::collections::HashSet<String>,
+) {
     for child in list_box.get_children() {
         list_box.remove(&child);
     }
     for contact in &store.contacts {
-        list_box.add(&make_contact_header_row(contact));
-        for gig in store.gigs_for_contact(&contact.id) {
-            list_box.add(&make_gig_row_simple(gig));
+        let expanded = expanded_contacts.contains(&contact.id);
+        list_box.add(&make_contact_header_row(contact, expanded));
+        if expanded {
+            for gig in store.gigs_for_contact(&contact.id) {
+                list_box.add(&make_gig_row_simple(gig));
+            }
         }
     }
     list_box.show_all();
 }
 
-fn make_contact_header_row(contact: &crate::gig::Contact) -> gtk::ListBoxRow {
+fn make_contact_header_row(contact: &crate::gig::Contact, expanded: bool) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_widget_name(&format!("contact:{}", contact.id));
-    row.set_selectable(false);
+    let arrow = if expanded { "▼" } else { "▶" };
     let lbl = gtk::Label::new(None);
     lbl.set_markup(&format!(
-        "<b>{}</b>  <small>{}</small>",
+        "{} <b>{}</b>  <small>{}</small>",
+        arrow,
         glib::markup_escape_text(&contact.name),
         contact.customer_type.label(),
     ));
     lbl.set_xalign(0.0);
     lbl.set_margin_start(6);
-    lbl.set_margin_top(6);
-    lbl.set_margin_bottom(2);
+    lbl.set_margin_top(5);
+    lbl.set_margin_bottom(5);
     row.add(&lbl);
     row
 }
