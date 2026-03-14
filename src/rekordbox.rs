@@ -256,6 +256,37 @@ impl Library {
         Ok(())
     }
 
+    /// Recursively delete a folder or playlist and all its descendants.
+    pub fn delete_subtree(&self, root_id: i64) -> Result<()> {
+        let root_str = root_id.to_string();
+        // Collect all descendant IDs using a recursive CTE
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "WITH RECURSIVE tree(id) AS ( \
+                   SELECT ID FROM djmdPlaylist WHERE ID = ?1 \
+                   UNION ALL \
+                   SELECT p.ID FROM djmdPlaylist p JOIN tree t ON p.ParentID = CAST(t.id AS TEXT) \
+                 ) SELECT id FROM tree",
+            )?;
+            let rows: Vec<rusqlite::Result<i64>> = stmt
+                .query_map(params![root_str], |row| row.get::<_, i64>(0))?
+                .collect();
+            rows.into_iter().filter_map(|r| r.ok()).collect()
+        };
+        for id in ids {
+            let id_str = id.to_string();
+            self.conn.execute(
+                "DELETE FROM djmdSongPlaylist WHERE PlaylistID = ?1",
+                params![id_str],
+            )?;
+            self.conn.execute(
+                "DELETE FROM djmdPlaylist WHERE ID = ?1",
+                params![id_str],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn create_playlist(&self, name: &str, parent_id: Option<i64>) -> Result<i64> {
         self.create_playlist_entry(name, 0, parent_id)
     }

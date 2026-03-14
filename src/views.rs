@@ -868,6 +868,7 @@ impl BrowserView {
             let right_stack_c   = right_stack.clone();
             let gig_workspace_c = gig_workspace.clone();
             let contact_view_c  = contact_view.clone();
+            let library_c       = library.clone();
             back_btn.downcast::<gtk::Button>().unwrap()
                 .connect_clicked(move |_| {
                     // The workspace widget name is "gig_workspace:{gig_id}" when a gig is loaded
@@ -878,7 +879,10 @@ impl BrowserView {
                             let contact_id = gig.contact_id.clone();
                             if let Some(contact) = store.contacts.iter().find(|c| c.id == contact_id) {
                                 let gigs = store.gigs_for_contact(&contact_id);
-                                load_contact_into_view(&contact_view_c, contact, &gigs);
+                                let playlists = library_c.borrow().as_ref()
+                                    .and_then(|lib| lib.playlists().ok())
+                                    .unwrap_or_default();
+                                load_contact_into_view(&contact_view_c, contact, &gigs, &playlists);
                                 right_stack_c.set_visible_child_name("contact");
                                 return;
                             }
@@ -940,6 +944,17 @@ impl BrowserView {
                         }
                     }
                     store.save();
+                    // Flash "Saved" indicator
+                    if let Some(w) = find_widget(&contact_view2, "contact_saved_lbl") {
+                        if let Ok(lbl) = w.downcast::<gtk::Label>() {
+                            lbl.set_text("✓ Saved");
+                            let lbl_c = lbl.clone();
+                            glib::timeout_add_local(2000, move || {
+                                lbl_c.set_text("");
+                                glib::Continue(false)
+                            });
+                        }
+                    }
                 }
             });
 
@@ -1009,6 +1024,17 @@ impl BrowserView {
                         }
                     }
                     store.save();
+                    // Flash "Saved" indicator
+                    if let Some(w) = find_widget(&gig_workspace2, "gig_saved_lbl") {
+                        if let Ok(lbl) = w.downcast::<gtk::Label>() {
+                            lbl.set_text("✓ Saved");
+                            let lbl_c = lbl.clone();
+                            glib::timeout_add_local(2000, move || {
+                                lbl_c.set_text("");
+                                glib::Continue(false)
+                            });
+                        }
+                    }
                 }
             });
 
@@ -1057,12 +1083,39 @@ impl BrowserView {
                                 return;
                             }
                         };
-                        let token = config2.borrow().spotify_access_token.clone();
-                        let token = match token {
-                            Some(t) => t,
-                            None => {
-                                set_match_status(&gig_workspace2, "Spotify not connected — connect via Settings…");
-                                return;
+                        // Refresh token if available before making the API call
+                        let token = {
+                            let refresh_token = config2.borrow().spotify_refresh_token.clone();
+                            if let Some(rt) = refresh_token {
+                                match crate::spotify::refresh(&rt) {
+                                    Ok((new_access, new_refresh)) => {
+                                        let mut cfg = config2.borrow_mut();
+                                        cfg.spotify_access_token  = Some(new_access.clone());
+                                        if let Some(nr) = new_refresh {
+                                            cfg.spotify_refresh_token = Some(nr);
+                                        }
+                                        cfg.save();
+                                        new_access
+                                    }
+                                    Err(_) => {
+                                        // Fall back to stored token
+                                        match config2.borrow().spotify_access_token.clone() {
+                                            Some(t) => t,
+                                            None => {
+                                                set_match_status(&gig_workspace2, "Spotify not connected — connect via Settings…");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                match config2.borrow().spotify_access_token.clone() {
+                                    Some(t) => t,
+                                    None => {
+                                        set_match_status(&gig_workspace2, "Spotify not connected — connect via Settings…");
+                                        return;
+                                    }
+                                }
                             }
                         };
                         let lib_opt = library2.borrow();
@@ -1219,6 +1272,90 @@ impl BrowserView {
                             load_gig_into_workspace(&gig_workspace2, &gig, contact);
                             right_stack2.set_visible_child_name("gig");
                         }
+                    });
+            }
+        }
+
+        // ── contact view: delete contact button ──────────────────────────────
+        {
+            let contact_view2      = contact_view.clone();
+            let right_stack2       = right_stack.clone();
+            let gig_list_box2      = gig_list_box.clone();
+            let expanded_contacts2 = expanded_contacts.clone();
+            let library2           = library.clone();
+            let window2            = window.clone();
+
+            if let Some(w) = find_widget(&contact_view, "contact_delete_btn") {
+                w.downcast::<gtk::Button>().unwrap()
+                    .connect_clicked(move |_| {
+                        let view_name  = contact_view2.get_widget_name().to_string();
+                        let contact_id = match view_name.strip_prefix("contact_view:") {
+                            Some(id) if !id.is_empty() => id.to_string(),
+                            _ => return,
+                        };
+                        let store = crate::gig::GigStore::load();
+                        let contact = match store.contacts.iter().find(|c| c.id == contact_id) {
+                            Some(c) => c.clone(),
+                            None    => return,
+                        };
+                        let gigs = store.gigs_for_contact(&contact_id);
+
+                        // Check whether there's anything to warn about
+                        let playlists = library2.borrow().as_ref()
+                            .and_then(|lib| lib.playlists().ok())
+                            .unwrap_or_default();
+                        let has_rb_children = contact.rekordbox_folder_id.map_or(false, |cid| {
+                            playlists.iter().any(|pl| pl.parent_id == Some(cid))
+                        });
+                        let needs_confirm = !gigs.is_empty() || has_rb_children;
+
+                        if needs_confirm {
+                            let mut msg = format!(
+                                "Delete contact \"{}\"?\n\nThis will also remove:",
+                                contact.name,
+                            );
+                            if !gigs.is_empty() {
+                                msg.push_str(&format!("\n• {} gig(s) from the app", gigs.len()));
+                            }
+                            if has_rb_children {
+                                msg.push_str("\n• The contact folder and all its playlists from Rekordbox");
+                            }
+                            msg.push_str("\n\nThis cannot be undone.");
+
+                            let dialog = gtk::MessageDialog::new(
+                                Some(&window2),
+                                gtk::DialogFlags::MODAL,
+                                gtk::MessageType::Warning,
+                                gtk::ButtonsType::None,
+                                &msg,
+                            );
+                            dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+                            dialog.add_button("Delete", gtk::ResponseType::Accept);
+                            let response = dialog.run();
+                            dialog.close();
+                            if response != gtk::ResponseType::Accept {
+                                return;
+                            }
+                        }
+
+                        // Delete from Rekordbox
+                        if let Some(folder_id) = contact.rekordbox_folder_id {
+                            if let Some(lib) = library2.borrow().as_ref() {
+                                let _ = lib.delete_subtree(folder_id);
+                            }
+                        }
+
+                        // Delete from gigs.json
+                        let mut store = crate::gig::GigStore::load();
+                        store.gigs.retain(|g| g.contact_id != contact_id);
+                        store.contacts.retain(|c| c.id != contact_id);
+                        store.save();
+
+                        // Refresh sidebar
+                        expanded_contacts2.borrow_mut().remove(&contact_id);
+                        populate_contacts_and_gigs(&gig_list_box2, &store, &expanded_contacts2.borrow());
+
+                        right_stack2.set_visible_child_name("tracks");
                     });
             }
         }
@@ -1502,45 +1639,28 @@ impl BrowserView {
             );
         }
 
-        // ── new contact+gig button ────────────────────────────────────────────
+        // ── new contact button ────────────────────────────────────────────────
         {
-            let gig_list_box        = gig_list_box.clone();
-            let right_stack         = right_stack.clone();
-            let gig_workspace       = gig_workspace.clone();
-            let expanded_contacts2  = expanded_contacts.clone();
+            let gig_list_box       = gig_list_box.clone();
+            let right_stack        = right_stack.clone();
+            let contact_view2      = contact_view.clone();
+            let expanded_contacts2 = expanded_contacts.clone();
 
             new_gig_btn.connect_clicked(move |_| {
-                let new_id = || uuid::Uuid::new_v4().to_string();
                 let contact = crate::gig::Contact {
-                    id:                  new_id(),
-                    name:                "New Contact".to_string(),
+                    id:                  uuid::Uuid::new_v4().to_string(),
+                    name:                String::new(),
                     customer_type:       crate::gig::CustomerType::Private,
                     notes:               String::new(),
                     rekordbox_folder_id: None,
                 };
-                let gig = crate::gig::Gig {
-                    id:                   new_id(),
-                    contact_id:           contact.id.clone(),
-                    name:                 String::new(),
-                    date:                 None,
-                    start_time:           None,
-                    end_time:             None,
-                    location:             None,
-                    tags:                 Vec::new(),
-                    notes:                String::new(),
-                    spotify_playlist_url: None,
-                    accepted_track_ids:   Vec::new(),
-                    rekordbox_folder_id:  None,
-                };
                 let mut store = crate::gig::GigStore::load();
                 store.contacts.push(contact.clone());
-                store.gigs.push(gig.clone());
                 store.save();
-                // Auto-expand the new contact
-                expanded_contacts2.borrow_mut().insert(contact.id.clone());
+                // Show the contact row in the sidebar (collapsed)
                 populate_contacts_and_gigs(&gig_list_box, &store, &expanded_contacts2.borrow());
-                // Select the new gig row
-                let row_name = format!("gig:{}", gig.id);
+                // Select the contact row so the user can see it
+                let row_name = format!("contact:{}", contact.id);
                 for child in gig_list_box.get_children() {
                     if let Ok(row) = child.downcast::<gtk::ListBoxRow>() {
                         if row.get_widget_name() == row_name {
@@ -1549,8 +1669,9 @@ impl BrowserView {
                         }
                     }
                 }
-                load_gig_into_workspace(&gig_workspace, &gig, &contact);
-                right_stack.set_visible_child_name("gig");
+                // Open the contact view so the user fills in the details
+                load_contact_into_view(&contact_view2, &contact, &[], &[]);
+                right_stack.set_visible_child_name("contact");
             });
         }
 
@@ -1592,7 +1713,7 @@ impl BrowserView {
                         // Open contact view
                         if let Some(contact) = store.contacts.iter().find(|c| c.id == contact_id) {
                             let gigs = store.gigs_for_contact(contact_id);
-                            load_contact_into_view(&contact_view2, contact, &gigs);
+                            load_contact_into_view(&contact_view2, contact, &gigs, &playlists);
                             right_stack.set_visible_child_name("contact");
                         }
                     } else if let Some(gig_id) = name.strip_prefix("gig:") {
@@ -3139,8 +3260,13 @@ fn build_gig_workspace() -> gtk::Box {
     header.set_use_markup(true);
     header.set_hexpand(true);
 
-    header_bar.pack_start(&back_btn, false, false, 0);
-    header_bar.pack_start(&header,   true,  true,  4);
+    let saved_lbl = gtk::Label::new(None);
+    saved_lbl.set_widget_name("gig_saved_lbl");
+    saved_lbl.set_margin_end(6);
+
+    header_bar.pack_start(&back_btn,  false, false, 0);
+    header_bar.pack_start(&header,    true,  true,  4);
+    header_bar.pack_end  (&saved_lbl, false, false, 0);
 
     outer.pack_start(&header_bar, false, false, 0);
     outer.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 0);
@@ -3216,14 +3342,15 @@ fn build_gig_workspace() -> gtk::Box {
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
         vbox.set_border_width(12);
 
-        let spotify_lbl = gtk::Label::new(Some("Spotify playlist URL"));
+        let spotify_lbl = gtk::Label::new(Some("Spotify reference playlist (paste URL, then go to Match tab)"));
         spotify_lbl.set_xalign(0.0);
+        spotify_lbl.set_use_markup(true);
         let spotify_entry = gtk::Entry::new();
         spotify_entry.set_widget_name("gig_spotify_url");
         spotify_entry.set_placeholder_text(Some("https://open.spotify.com/playlist/…"));
         spotify_entry.set_hexpand(true);
 
-        let notes_lbl = gtk::Label::new(Some("Notes / vibe / music preferences"));
+        let notes_lbl = gtk::Label::new(Some("Vibe / music preferences / client notes"));
         notes_lbl.set_xalign(0.0);
         let notes_view = gtk::TextView::new();
         notes_view.set_widget_name("gig_notes");
@@ -3632,9 +3759,19 @@ fn build_contact_view() -> gtk::Box {
     add_gig_btn.set_widget_name("contact_add_gig_btn");
     add_gig_btn.set_relief(gtk::ReliefStyle::None);
 
+    let delete_btn = gtk::Button::with_label("Delete");
+    delete_btn.set_widget_name("contact_delete_btn");
+    delete_btn.set_relief(gtk::ReliefStyle::None);
+
+    let saved_lbl = gtk::Label::new(None);
+    saved_lbl.set_widget_name("contact_saved_lbl");
+    saved_lbl.set_margin_end(4);
+
     header_bar.pack_start(&back_btn,    false, false, 0);
     header_bar.pack_start(&header,      true,  true,  4);
     header_bar.pack_end  (&add_gig_btn, false, false, 0);
+    header_bar.pack_end  (&delete_btn,  false, false, 0);
+    header_bar.pack_end  (&saved_lbl,   false, false, 0);
 
     outer.pack_start(&header_bar, false, false, 0);
     outer.pack_start(&gtk::Separator::new(gtk::Orientation::Horizontal), false, false, 0);
@@ -3710,9 +3847,10 @@ fn build_contact_view() -> gtk::Box {
 }
 
 fn load_contact_into_view(
-    view:    &gtk::Box,
-    contact: &crate::gig::Contact,
-    gigs:    &[&crate::gig::Gig],
+    view:      &gtk::Box,
+    contact:   &crate::gig::Contact,
+    gigs:      &[&crate::gig::Gig],
+    playlists: &[crate::rekordbox::Playlist],
 ) {
     // Header
     if let Some(w) = find_widget(view, "contact_header") {
@@ -3753,11 +3891,20 @@ fn load_contact_into_view(
         }
     }
 
-    // Populate gig list
+    // Build a set of pool playlist IDs (attribute=0, direct child of contact folder)
+    let pool_ids: std::collections::HashSet<i64> = {
+        let contact_folder_id = contact.rekordbox_folder_id;
+        playlists.iter()
+            .filter(|pl| pl.attribute == 0 && contact_folder_id.map_or(false, |cid| pl.parent_id == Some(cid)))
+            .map(|pl| pl.id)
+            .collect()
+    };
+
+    // Populate gig list (exclude pool playlists)
     if let Some(w) = find_widget(view, "contact_gig_list") {
         if let Ok(lb) = w.downcast::<gtk::ListBox>() {
             for child in lb.get_children() { lb.remove(&child); }
-            for gig in gigs {
+            for gig in gigs.iter().filter(|g| g.rekordbox_folder_id.map_or(true, |rid| !pool_ids.contains(&rid))) {
                 let row = gtk::ListBoxRow::new();
                 row.set_widget_name(&format!("gig:{}", gig.id));
                 let label_text = if gig.name.is_empty() {
