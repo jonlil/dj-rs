@@ -1,4 +1,5 @@
 use gtk::prelude::*;
+use indexmap::IndexMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -570,7 +571,7 @@ impl BrowserView {
 
         // ── stores ───────────────────────────────────────────────────────────
         let str_t = String::static_type();
-        let pl_store = gtk::ListStore::new(&[str_t, str_t, str_t, str_t]);
+        let pl_store = gtk::TreeStore::new(&[str_t, str_t, str_t, str_t]);
         // 13 columns: title, artist, bpm, key, duration, file_path, genre, rating, label, color_id, track_id, bpm_raw, duration_raw
         let track_store = gtk::ListStore::new(&[
             str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t, str_t,
@@ -600,8 +601,40 @@ impl BrowserView {
             gtk::NONE_ADJUSTMENT,
         );
         pl_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        pl_scroll.set_min_content_width(220);
         pl_scroll.add(&pl_view);
+
+        // ── history panel ─────────────────────────────────────────────────────
+        let hist_store = gtk::ListStore::new(&[str_t, str_t, str_t, str_t]);
+        let hist_view  = gtk::TreeView::new();
+        hist_view.set_model(Some(&hist_store));
+        hist_view.set_headers_visible(false);
+        hist_view.set_enable_search(false);
+
+        for &(title, idx, expand) in &[
+            ("Session", P_NAME as i32,  true),
+            ("#",       P_COUNT as i32, false),
+        ] {
+            let col  = gtk::TreeViewColumn::new();
+            let cell = gtk::CellRendererText::new();
+            col.pack_start(&cell, true);
+            col.add_attribute(&cell, "text", idx);
+            col.set_title(title);
+            col.set_expand(expand);
+            hist_view.append_column(&col);
+        }
+
+        let hist_scroll = gtk::ScrolledWindow::new(
+            gtk::NONE_ADJUSTMENT,
+            gtk::NONE_ADJUSTMENT,
+        );
+        hist_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        hist_scroll.add(&hist_view);
+
+        // ── sidebar notebook ──────────────────────────────────────────────────
+        let sidebar_notebook = gtk::Notebook::new();
+        sidebar_notebook.set_size_request(220, -1);
+        sidebar_notebook.append_page(&pl_scroll,   Some(&gtk::Label::new(Some("Playlists"))));
+        sidebar_notebook.append_page(&hist_scroll, Some(&gtk::Label::new(Some("History"))));
 
         // ── track panel ──────────────────────────────────────────────────────
         let track_view = gtk::TreeView::new();
@@ -763,9 +796,9 @@ impl BrowserView {
 
         // ── layout ───────────────────────────────────────────────────────────
         let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-        paned.pack1(&pl_scroll, false, false);
+        paned.pack1(&sidebar_notebook, false, false);
         paned.pack2(&track_panel, true, true);
-        paned.set_position(220);
+        paned.set_position(240);
 
         container.pack_start(&topbar,     false, false, 0);
         container.pack_start(&filter_bar, false, false, 0);
@@ -863,6 +896,7 @@ impl BrowserView {
         let do_open_library = {
             let library              = library.clone();
             let pl_store2            = pl_store.clone();
+            let hist_store2          = hist_store.clone();
             let track_store2         = track_store.clone();
             let status_lbl2          = status_lbl.clone();
             let config2              = config.clone();
@@ -870,6 +904,7 @@ impl BrowserView {
             let on_track_end2        = on_track_end.clone();
             let key_combo2           = key_combo.clone();
             let genre_combo2         = genre_combo.clone();
+            let pl_view2             = pl_view.clone();
 
             Rc::new(move |path_str: &str| {
                 match Library::open(path_str) {
@@ -893,10 +928,11 @@ impl BrowserView {
                             genre_combo2.set_active(Some(0));
                         }
 
-                        // Populate playlists (including history)
-                        let lists = lib.playlists().unwrap_or_default();
+                        let lists    = lib.playlists().unwrap_or_default();
                         let sessions = lib.history_sessions().unwrap_or_default();
-                        browser_populate_playlists(&pl_store2, &lists, &sessions);
+                        browser_populate_playlists(&pl_store2, &lists);
+                        browser_populate_history(&hist_store2, &sessions);
+                        pl_view2.collapse_all();
 
                         if let Ok(tracks) = lib.tracks() {
                             browser_populate_tracks(&track_store2, &tracks);
@@ -1041,10 +1077,12 @@ impl BrowserView {
 
         // ── playlist right-click context menu ────────────────────────────────
         {
-            let library  = library.clone();
-            let pl_store2 = pl_store.clone();
-            let pl_view2 = pl_view.clone();
-            let window   = window.clone();
+            let library    = library.clone();
+            let pl_store2  = pl_store.clone();
+            let hist_store2 = hist_store.clone();
+            let pl_view_rc = pl_view.clone();
+            let pl_view2   = pl_view.clone();
+            let window     = window.clone();
 
             pl_view.connect_button_press_event(move |view, event| {
                 if event.get_button() != 3 {
@@ -1090,9 +1128,11 @@ impl BrowserView {
                 // ── New Playlist ──
                 let new_item = gtk::MenuItem::with_label("New Playlist…");
                 {
-                    let library  = library.clone();
-                    let pl_store3 = pl_store2.clone();
-                    let window   = window.clone();
+                    let library     = library.clone();
+                    let pl_store3   = pl_store2.clone();
+                    let hist_store3 = hist_store2.clone();
+                    let pl_view3    = pl_view_rc.clone();
+                    let window      = window.clone();
                     new_item.connect_activate(move |_| {
                         let dialog = gtk::Dialog::new();
                         dialog.set_title("New Playlist");
@@ -1126,7 +1166,9 @@ impl BrowserView {
                                 let lib_ref = lib.as_ref().unwrap();
                                 let lists = lib_ref.playlists().unwrap_or_default();
                                 let sessions = lib_ref.history_sessions().unwrap_or_default();
-                                browser_populate_playlists(&pl_store3, &lists, &sessions);
+                                browser_populate_playlists(&pl_store3, &lists);
+                                browser_populate_history(&hist_store3, &sessions);
+                                pl_view3.collapse_all();
                             }
                             Err(e) => {
                                 let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
@@ -1142,9 +1184,11 @@ impl BrowserView {
                 // ── New Folder ──
                 let new_folder_item = gtk::MenuItem::with_label("New Folder…");
                 {
-                    let library  = library.clone();
-                    let pl_store3 = pl_store2.clone();
-                    let window   = window.clone();
+                    let library     = library.clone();
+                    let pl_store3   = pl_store2.clone();
+                    let hist_store3 = hist_store2.clone();
+                    let pl_view3    = pl_view_rc.clone();
+                    let window      = window.clone();
                     new_folder_item.connect_activate(move |_| {
                         let dialog = gtk::Dialog::new();
                         dialog.set_title("New Folder");
@@ -1178,7 +1222,9 @@ impl BrowserView {
                                 let lib_ref = lib.as_ref().unwrap();
                                 let lists = lib_ref.playlists().unwrap_or_default();
                                 let sessions = lib_ref.history_sessions().unwrap_or_default();
-                                browser_populate_playlists(&pl_store3, &lists, &sessions);
+                                browser_populate_playlists(&pl_store3, &lists);
+                                browser_populate_history(&hist_store3, &sessions);
+                                pl_view3.collapse_all();
                             }
                             Err(e) => {
                                 let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
@@ -1196,9 +1242,11 @@ impl BrowserView {
                     if let Some(folder_id) = clicked_id {
                         let new_in_folder_item = gtk::MenuItem::with_label("New Playlist in Folder…");
                         {
-                            let library  = library.clone();
-                            let pl_store3 = pl_store2.clone();
-                            let window   = window.clone();
+                            let library     = library.clone();
+                            let pl_store3   = pl_store2.clone();
+                            let hist_store3 = hist_store2.clone();
+                            let pl_view3    = pl_view_rc.clone();
+                            let window      = window.clone();
                             new_in_folder_item.connect_activate(move |_| {
                                 let dialog = gtk::Dialog::new();
                                 dialog.set_title("New Playlist in Folder");
@@ -1233,7 +1281,9 @@ impl BrowserView {
                                         let lib_ref = lib.as_ref().unwrap();
                                         let lists = lib_ref.playlists().unwrap_or_default();
                                         let sessions = lib_ref.history_sessions().unwrap_or_default();
-                                        browser_populate_playlists(&pl_store3, &lists, &sessions);
+                                        browser_populate_playlists(&pl_store3, &lists);
+                                        browser_populate_history(&hist_store3, &sessions);
+                                        pl_view3.collapse_all();
                                     }
                                     Err(e) => {
                                         let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
@@ -1261,9 +1311,11 @@ impl BrowserView {
 
                     let del_item = gtk::MenuItem::with_label("Delete Playlist");
                     {
-                        let library  = library.clone();
-                        let pl_store3 = pl_store2.clone();
-                        let window   = window.clone();
+                        let library     = library.clone();
+                        let pl_store3   = pl_store2.clone();
+                        let hist_store3 = hist_store2.clone();
+                        let pl_view3    = pl_view_rc.clone();
+                        let window      = window.clone();
                         del_item.connect_activate(move |_| {
                             let confirm = gtk::MessageDialog::new(
                                 Some(&window),
@@ -1284,7 +1336,9 @@ impl BrowserView {
                                     let lib_ref = lib.as_ref().unwrap();
                                     let lists = lib_ref.playlists().unwrap_or_default();
                                     let sessions = lib_ref.history_sessions().unwrap_or_default();
-                                    browser_populate_playlists(&pl_store3, &lists, &sessions);
+                                    browser_populate_playlists(&pl_store3, &lists);
+                                    browser_populate_history(&hist_store3, &sessions);
+                                    pl_view3.collapse_all();
                                 }
                                 Err(e) => {
                                     let d = gtk::MessageDialog::new(Some(&window), gtk::DialogFlags::MODAL,
@@ -1339,9 +1393,11 @@ impl BrowserView {
             });
 
             {
-                let library  = library.clone();
-                let pl_store2 = pl_store.clone();
-                let pl_view2 = pl_view.clone();
+                let library     = library.clone();
+                let pl_store2   = pl_store.clone();
+                let hist_store2 = hist_store.clone();
+                let pl_view2    = pl_view.clone();
+                let pl_view_rc2 = pl_view.clone();
 
                 pl_view.connect_drag_data_received(move |_view, ctx, x, y, sel, _info, time| {
                     let src_id_str = match sel.get_text() {
@@ -1411,7 +1467,9 @@ impl BrowserView {
                                 let lib_ref = lib.as_ref().unwrap();
                                 let lists = lib_ref.playlists().unwrap_or_default();
                                 let sessions = lib_ref.history_sessions().unwrap_or_default();
-                                browser_populate_playlists(&pl_store2, &lists, &sessions);
+                                browser_populate_playlists(&pl_store2, &lists);
+                                browser_populate_history(&hist_store2, &sessions);
+                                pl_view_rc2.collapse_all();
                                 ctx.drag_finish(true, false, time);
                             }
                             Err(_) => { ctx.drag_finish(false, false, time); }
@@ -1460,7 +1518,9 @@ impl BrowserView {
                                 let lib_ref = lib.as_ref().unwrap();
                                 let lists = lib_ref.playlists().unwrap_or_default();
                                 let sessions = lib_ref.history_sessions().unwrap_or_default();
-                                browser_populate_playlists(&pl_store2, &lists, &sessions);
+                                browser_populate_playlists(&pl_store2, &lists);
+                                browser_populate_history(&hist_store2, &sessions);
+                                pl_view_rc2.collapse_all();
                                 ctx.drag_finish(true, false, time);
                             }
                             Err(_) => { ctx.drag_finish(false, false, time); }
@@ -1538,6 +1598,38 @@ impl BrowserView {
                         let n = tracks.len();
                         browser_populate_tracks(&track_store2, &tracks);
                         status_lbl2.set_text(&format!("{} tracks", n));
+                    }
+                }
+            });
+        }
+
+        // ── history tab selection ─────────────────────────────────────────────
+        {
+            let library      = library.clone();
+            let track_store2 = track_store.clone();
+            let status_lbl2  = status_lbl.clone();
+
+            hist_view.get_selection().connect_changed(move |sel| {
+                let (model, iter) = match sel.get_selected() {
+                    Some(pair) => pair,
+                    None       => return,
+                };
+                let id: String = model
+                    .get_value(&iter, P_ID as i32)
+                    .get::<String>()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+
+                if let Some(hid_str) = id.strip_prefix("h:") {
+                    if let Ok(hid) = hid_str.parse::<i64>() {
+                        if let Some(lib) = library.borrow().as_ref() {
+                            if let Ok(tracks) = lib.history_tracks(hid) {
+                                let n = tracks.len();
+                                browser_populate_tracks(&track_store2, &tracks);
+                                status_lbl2.set_text(&format!("{} tracks", n));
+                            }
+                        }
                     }
                 }
             });
@@ -1745,78 +1837,63 @@ fn show_settings_dialog(window: &gtk::ApplicationWindow, config: &Rc<RefCell<Con
     }
 }
 
-fn browser_populate_playlists(
-    store: &gtk::ListStore,
-    playlists: &[Playlist],
-    sessions: &[HistorySession],
-) {
+fn browser_populate_playlists(store: &gtk::TreeStore, playlists: &[Playlist]) {
     store.clear();
     store.insert_with_values(
-        None,
+        None, None,
         &[P_NAME, P_COUNT, P_ID, P_ATTR],
         &[&"★ All Tracks", &"", &"all", &"0"],
     );
 
-    // Build parent → children map (sorted by Seq via the DB ordering)
-    let mut children: std::collections::HashMap<Option<i64>, Vec<&Playlist>> =
-        std::collections::HashMap::new();
+    // IndexMap preserves insertion order, which matches the DB's ORDER BY Seq
+    let mut children: IndexMap<Option<i64>, Vec<&Playlist>> = IndexMap::new();
     for pl in playlists {
         children.entry(pl.parent_id).or_default().push(pl);
     }
 
-    // Recursive tree walk: insert folder then its children
     fn insert_node(
-        store: &gtk::ListStore,
-        children: &std::collections::HashMap<Option<i64>, Vec<&Playlist>>,
+        store: &gtk::TreeStore,
+        children: &IndexMap<Option<i64>, Vec<&Playlist>>,
         parent_id: Option<i64>,
-        depth: usize,
+        parent_iter: Option<&gtk::TreeIter>,
     ) {
-        let indent = "  ".repeat(depth);
         if let Some(nodes) = children.get(&parent_id) {
             for pl in nodes {
                 let name = if pl.attribute == 1 {
-                    format!("{}▸ {}", indent, pl.name)
+                    format!("▸ {}", pl.name)
                 } else {
-                    format!("{}{}", indent, pl.name)
+                    pl.name.clone()
                 };
                 let count = if pl.attribute == 1 {
                     String::new()
                 } else {
                     pl.track_count.to_string()
                 };
-                let id   = pl.id.to_string();
-                let attr = pl.attribute.to_string();
-                store.insert_with_values(
-                    None,
+                let iter = store.insert_with_values(
+                    parent_iter, None,
                     &[P_NAME, P_COUNT, P_ID, P_ATTR],
-                    &[&name.as_str(), &count.as_str(), &id.as_str(), &attr.as_str()],
+                    &[&name.as_str(), &count.as_str(), &pl.id.to_string().as_str(), &pl.attribute.to_string().as_str()],
                 );
-                // Recurse into folder children
                 if pl.attribute == 1 {
-                    insert_node(store, children, Some(pl.id), depth + 1);
+                    insert_node(store, children, Some(pl.id), Some(&iter));
                 }
             }
         }
     }
 
-    insert_node(store, &children, None, 0);
+    insert_node(store, &children, None, None);
+}
 
-    if !sessions.is_empty() {
+fn browser_populate_history(store: &gtk::ListStore, sessions: &[HistorySession]) {
+    store.clear();
+    for s in sessions {
+        let id  = format!("h:{}", s.id);
+        let cnt = s.track_count.to_string();
         store.insert_with_values(
             None,
             &[P_NAME, P_COUNT, P_ID, P_ATTR],
-            &[&"— History —", &"", &"history_header", &"h"],
+            &[&s.name.as_str(), &cnt.as_str(), &id.as_str(), &"h"],
         );
-        for s in sessions {
-            let id   = format!("h:{}", s.id);
-            let name = format!("  {}", s.name);
-            let cnt  = s.track_count.to_string();
-            store.insert_with_values(
-                None,
-                &[P_NAME, P_COUNT, P_ID, P_ATTR],
-                &[&name.as_str(), &cnt.as_str(), &id.as_str(), &"h"],
-            );
-        }
     }
 }
 
