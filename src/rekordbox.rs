@@ -561,6 +561,21 @@ impl Library {
         }
         self.create_folder(name, None)
     }
+
+    /// Find a folder with `name` whose parent is `parent_id`, creating it if absent.
+    pub fn find_or_create_subfolder(&self, name: &str, parent_id: i64) -> Result<i64> {
+        let parent_str = parent_id.to_string();
+        let existing: Option<i64> = self.conn.query_row(
+            "SELECT ID FROM djmdPlaylist \
+             WHERE Name = ?1 AND Attribute = 1 AND ParentID = ?2 AND rb_local_deleted = 0",
+            params![name, parent_str],
+            |row| row.get::<_, String>(0),
+        ).ok().and_then(|s| s.parse().ok());
+        match existing {
+            Some(id) => Ok(id),
+            None     => self.create_folder(name, Some(parent_id)),
+        }
+    }
 }
 
 impl Track {
