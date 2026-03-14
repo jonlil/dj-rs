@@ -1,5 +1,5 @@
 use gtk::prelude::*;
-use rodio::{OutputStream, Sink, buffer::SamplesBuffer};
+use rodio::{OutputStream, OutputStreamHandle, Sink, buffer::SamplesBuffer};
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
@@ -27,6 +27,7 @@ impl LibrespotSink for GlibSink {
     }
 }
 
+
 // ── Player commands ───────────────────────────────────────────────────────────
 
 enum PlayerCmd {
@@ -41,7 +42,12 @@ enum PlayerCmd {
 
 pub struct LibrespotPlayer {
     cmd_tx:              tokio::sync::mpsc::UnboundedSender<PlayerCmd>,
-    playback:            Rc<RefCell<Option<(OutputStream, Sink)>>>,
+    /// Persistent audio stream — kept alive so the device stays open.
+    _stream:             Rc<RefCell<Option<OutputStream>>>,
+    /// Handle used to create new sinks (cloneable, outlives individual sinks).
+    handle:              Rc<RefCell<Option<OutputStreamHandle>>>,
+    /// Current rodio sink — replaced on each play/seek to flush the buffer.
+    sink:                Rc<RefCell<Option<Sink>>>,
     active_btn:          Rc<RefCell<Option<gtk::Button>>>,
     /// True when a track is loaded (may be paused or playing).
     loaded:              Rc<Cell<bool>>,
@@ -55,6 +61,7 @@ pub struct LibrespotPlayer {
     track_title:         Rc<RefCell<String>>,
     track_artist:        Rc<RefCell<String>>,
     current_uri:         Rc<RefCell<String>>,
+    access_token:        Rc<RefCell<Option<String>>>,
     /// Incremented on every seek/play so stale buffered packets are discarded.
     generation:          Arc<AtomicU64>,
 }
@@ -63,42 +70,58 @@ impl LibrespotPlayer {
     pub fn new() -> Rc<Self> {
         let (audio_tx, audio_rx) = glib::MainContext::channel::<(u64, Vec<f32>)>(glib::PRIORITY_DEFAULT);
         let (cmd_tx, cmd_rx)     = tokio::sync::mpsc::unbounded_channel::<PlayerCmd>();
-        let playback             = Rc::new(RefCell::new(None::<(OutputStream, Sink)>));
-        let active_btn           = Rc::new(RefCell::new(None::<gtk::Button>));
-        let loaded               = Rc::new(Cell::new(false));
-        let paused               = Rc::new(Cell::new(false));
-        let play_started_at      = Rc::new(RefCell::new(None::<Instant>));
-        let seek_offset_secs     = Rc::new(Cell::new(0.0f64));
-        let track_duration_secs  = Rc::new(Cell::new(0.0f64));
-        let track_title          = Rc::new(RefCell::new(String::new()));
-        let track_artist         = Rc::new(RefCell::new(String::new()));
-        let current_uri          = Rc::new(RefCell::new(String::new()));
-        let generation           = Arc::new(AtomicU64::new(0));
+
+        // Open audio device eagerly and filter out webcams
+        let (stream_opt, handle_opt, sink_opt) = match crate::deck::open_audio_stream() {
+            Ok((stream, handle)) => {
+                let sink = Sink::try_new(&handle).ok().map(|s| { s.play(); s });
+                (Some(stream), Some(handle), sink)
+            }
+            Err(_) => (None, None, None),
+        };
+
+        let _stream          = Rc::new(RefCell::new(stream_opt));
+        let handle           = Rc::new(RefCell::new(handle_opt));
+        let sink             = Rc::new(RefCell::new(sink_opt));
+        let active_btn       = Rc::new(RefCell::new(None::<gtk::Button>));
+        let loaded           = Rc::new(Cell::new(false));
+        let paused           = Rc::new(Cell::new(false));
+        let play_started_at  = Rc::new(RefCell::new(None::<Instant>));
+        let seek_offset_secs = Rc::new(Cell::new(0.0f64));
+        let track_duration_secs = Rc::new(Cell::new(0.0f64));
+        let track_title      = Rc::new(RefCell::new(String::new()));
+        let track_artist     = Rc::new(RefCell::new(String::new()));
+        let current_uri      = Rc::new(RefCell::new(String::new()));
+        let access_token     = Rc::new(RefCell::new(None::<String>));
+        let generation       = Arc::new(AtomicU64::new(0));
 
         let player = Rc::new(Self {
-            cmd_tx, playback, active_btn, loaded, paused,
+            cmd_tx, _stream, handle, sink, active_btn, loaded, paused,
             play_started_at, seek_offset_secs,
             track_duration_secs, track_title, track_artist, current_uri,
-            generation,
+            access_token, generation,
         });
 
-        // GTK main thread: receive decoded f32 samples and append to rodio Sink
-        let playback_c   = player.playback.clone();
+        // GTK main thread: receive decoded f32 samples and append to the sink
+        let sink_c       = player.sink.clone();
+        let handle_c     = player.handle.clone();
         let loaded_c     = player.loaded.clone();
         let paused_c     = player.paused.clone();
         let generation_c = player.generation.clone();
         audio_rx.attach(None, move |(gen, samples)| {
-            // Discard packets that belong to a previous seek or play
+            // Discard packets from a previous seek/play or while paused
             if !loaded_c.get() || paused_c.get() || gen != generation_c.load(Ordering::Relaxed) {
                 return glib::Continue(true);
             }
-            let mut pb = playback_c.borrow_mut();
-            if let Some((_, sink)) = pb.as_ref() {
-                sink.append(SamplesBuffer::new(2, 44100, samples));
-            } else if let Ok((stream, handle)) = OutputStream::try_default() {
-                if let Ok(sink) = Sink::try_new(&handle) {
-                    sink.append(SamplesBuffer::new(2, 44100, samples));
-                    *pb = Some((stream, sink));
+            let mut sk = sink_c.borrow_mut();
+            if let Some(ref s) = *sk {
+                s.append(SamplesBuffer::new(2, 44100, samples));
+            } else if let Some(ref h) = *handle_c.borrow() {
+                // Sink was dropped (e.g. after stop); recreate it
+                if let Ok(new_sink) = Sink::try_new(h) {
+                    new_sink.play();
+                    new_sink.append(SamplesBuffer::new(2, 44100, samples));
+                    *sk = Some(new_sink);
                 }
             }
             glib::Continue(true)
@@ -114,17 +137,33 @@ impl LibrespotPlayer {
         player
     }
 
+    /// Replace the current sink with a fresh one to flush buffered audio.
+    fn reset_sink(&self) {
+        // Stop and drop the old sink first so buffered audio is discarded immediately
+        if let Some(old) = self.sink.borrow_mut().take() {
+            old.stop();
+        }
+        if let Some(ref h) = *self.handle.borrow() {
+            let new_sink = Sink::try_new(h).ok().map(|s| { s.play(); s });
+            *self.sink.borrow_mut() = new_sink;
+        }
+    }
+
     /// Update the Spotify access token; creates a new librespot session asynchronously.
     pub fn set_token(&self, token: String) {
+        *self.access_token.borrow_mut() = Some(token.clone());
         let _ = self.cmd_tx.send(PlayerCmd::Connect(token));
     }
+
+    pub fn access_token(&self) -> Option<String> { self.access_token.borrow().clone() }
+    pub fn current_uri(&self) -> String { self.current_uri.borrow().clone() }
 
     /// Fully stop playback and reset all state.
     pub fn stop(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.loaded.set(false);
         self.paused.set(false);
-        *self.playback.borrow_mut() = None;
+        self.reset_sink();
         *self.play_started_at.borrow_mut() = None;
         self.seek_offset_secs.set(0.0);
         if let Some(btn) = self.active_btn.borrow_mut().take() {
@@ -138,7 +177,7 @@ impl LibrespotPlayer {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.loaded.set(false);
         self.paused.set(false);
-        *self.playback.borrow_mut() = None;
+        self.reset_sink();
         if let Some(old) = self.active_btn.borrow_mut().take() {
             old.set_label("▶");
         }
@@ -163,7 +202,7 @@ impl LibrespotPlayer {
         }
         *self.play_started_at.borrow_mut() = None;
         self.paused.set(true);
-        *self.playback.borrow_mut() = None;
+        self.reset_sink();
         let _ = self.cmd_tx.send(PlayerCmd::Stop);
     }
 
@@ -183,14 +222,11 @@ impl LibrespotPlayer {
         let pos = pos_secs.max(0.0);
         self.seek_offset_secs.set(pos);
         if self.paused.get() {
-            // Stay paused; position will be used on next resume
             return;
         }
-        // Bump generation so in-flight packets from the old position are discarded
         self.generation.fetch_add(1, Ordering::Relaxed);
-        *self.playback.borrow_mut() = None;
+        self.reset_sink();
         *self.play_started_at.borrow_mut() = Some(Instant::now());
-        // Re-load at the new position (more reliable than p.seek() for large jumps)
         let uri    = self.current_uri.borrow().clone();
         let pos_ms = (pos * 1000.0) as u32;
         let _ = self.cmd_tx.send(PlayerCmd::PlayAt(uri, pos_ms));
