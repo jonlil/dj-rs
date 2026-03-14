@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>dj-rs</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    background: #121212;
+    color: #fff;
+    font-family: Arial, sans-serif;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+    position: relative;
+}
+
+/* ── Scanning overlay ──────────────────────────────────────────── */
+#scanning {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #121212;
+    z-index: 10;
+    gap: 40px;
+}
+#scanning.hidden { display: none; }
+
+#scan-logo {
+    font-size: 96px;
+    font-weight: bold;
+    color: #1DB954;
+    letter-spacing: -4px;
+}
+#scan-msg {
+    font-size: 36px;
+    color: #b3b3b3;
+}
+#scan-detail {
+    font-size: 24px;
+    color: #535353;
+}
+
+.spinner {
+    width: 64px;
+    height: 64px;
+    border: 6px solid #333;
+    border-top-color: #1DB954;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Top bar ───────────────────────────────────────────────────── */
+#top-bar {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 60px;
+    background: linear-gradient(to bottom, #000, transparent);
+}
+#logo {
+    font-size: 48px;
+    font-weight: bold;
+    color: #1DB954;
+    letter-spacing: -2px;
+}
+#conn-status {
+    font-size: 28px;
+    color: #535353;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+#conn-dot {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #535353;
+}
+#conn-status.connected #conn-dot { background: #1DB954; }
+#conn-status.connected #conn-label { color: #1DB954; }
+#conn-status.disconnected #conn-dot { background: #e22134; }
+
+/* ── Main ──────────────────────────────────────────────────────── */
+#main {
+    position: absolute;
+    top: 80px; bottom: 180px;
+    left: 0; right: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 80px;
+}
+
+#cover-art {
+    width: 480px;
+    height: 480px;
+    background: #282828;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+#cover-art svg { opacity: 0.3; }
+
+#track-info {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    max-width: 800px;
+}
+#track-title {
+    font-size: 56px;
+    font-weight: bold;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+#track-artist {
+    font-size: 40px;
+    color: #b3b3b3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ── Bottom bar ────────────────────────────────────────────────── */
+#bottom-bar {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 180px;
+    padding: 0 80px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 24px;
+    background: linear-gradient(to top, #000, transparent);
+}
+
+#seek-row {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+}
+.time-label {
+    font-size: 28px;
+    color: #b3b3b3;
+    min-width: 80px;
+    text-align: center;
+}
+#seek-track {
+    flex: 1;
+    height: 8px;
+    background: #535353;
+    border-radius: 4px;
+    position: relative;
+    cursor: pointer;
+}
+#seek-progress {
+    height: 100%;
+    background: #1DB954;
+    border-radius: 4px;
+    width: 0%;
+    transition: width 0.5s linear;
+}
+#seek-thumb {
+    position: absolute;
+    top: 50%;
+    left: 0%;
+    transform: translate(-50%, -50%);
+    width: 24px;
+    height: 24px;
+    background: #fff;
+    border-radius: 50%;
+    transition: left 0.5s linear;
+}
+
+#play-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 40px;
+}
+#play-icon {
+    width: 60px;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+}
+</style>
+</head>
+<body>
+
+<!-- Scanning overlay -->
+<div id="scanning">
+    <div id="scan-logo">dj-rs</div>
+    <div class="spinner"></div>
+    <div id="scan-msg">Scanning for dj-rs on local network…</div>
+    <div id="scan-detail">checking 192.168.x.1–254 on port 7879</div>
+</div>
+
+<!-- Top bar -->
+<div id="top-bar">
+    <span id="logo">dj-rs</span>
+    <div id="conn-status">
+        <div id="conn-dot"></div>
+        <span id="conn-label">Disconnected</span>
+        <span id="conn-host" style="font-size:22px;color:#535353"></span>
+    </div>
+</div>
+
+<!-- Main -->
+<div id="main">
+    <div id="cover-art">
+        <svg width="120" height="120" viewBox="0 0 24 24" fill="white">
+            <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3z"/>
+        </svg>
+    </div>
+    <div id="track-info">
+        <div id="track-title">No track loaded</div>
+        <div id="track-artist">—</div>
+    </div>
+</div>
+
+<!-- Bottom bar -->
+<div id="bottom-bar">
+    <div id="seek-row">
+        <span class="time-label" id="time-current">00:00</span>
+        <div id="seek-track">
+            <div id="seek-progress"></div>
+            <div id="seek-thumb"></div>
+        </div>
+        <span class="time-label" id="time-total">00:00</span>
+    </div>
+    <div id="play-row">
+        <div id="play-icon">
+            <svg id="icon-play" width="60" height="60" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5,3 19,12 5,21"/>
+            </svg>
+            <svg id="icon-pause" width="60" height="60" viewBox="0 0 24 24" fill="currentColor" style="display:none">
+                <rect x="6" y="4" width="4" height="16"/>
+                <rect x="14" y="4" width="4" height="16"/>
+            </svg>
+        </div>
+    </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+var state = {
+    position: 0,
+    duration: 0,
+    playing: false,
+    ws: null,
+    ticker: null,
+    desktopBase: null
+};
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function fmt(secs) {
+    var s = Math.floor(secs);
+    var m = Math.floor(s / 60);
+    s = s % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function updateSeek() {
+    var pct = state.duration > 0 ? (state.position / state.duration * 100) : 0;
+    document.getElementById('seek-progress').style.width = pct + '%';
+    document.getElementById('seek-thumb').style.left = pct + '%';
+    document.getElementById('time-current').textContent = fmt(state.position);
+    document.getElementById('time-total').textContent = fmt(state.duration);
+}
+
+function setPlaying(playing) {
+    state.playing = playing;
+    document.getElementById('icon-play').style.display  = playing ? 'none'  : 'block';
+    document.getElementById('icon-pause').style.display = playing ? 'block' : 'none';
+    if (playing) {
+        if (state.ticker) clearInterval(state.ticker);
+        state.ticker = setInterval(function() {
+            if (!state.playing) { clearInterval(state.ticker); return; }
+            if (state.duration > 0 && state.position < state.duration) {
+                state.position += 1;
+                updateSeek();
+            }
+        }, 1000);
+    } else {
+        if (state.ticker) clearInterval(state.ticker);
+    }
+}
+
+function setConnected(host) {
+    document.getElementById('scanning').classList.add('hidden');
+    var cs = document.getElementById('conn-status');
+    cs.className = 'connected';
+    document.getElementById('conn-label').textContent = 'Connected';
+    document.getElementById('conn-host').textContent = host;
+}
+
+function setDisconnected() {
+    document.getElementById('conn-status').className = 'disconnected';
+    document.getElementById('conn-label').textContent = 'Disconnected';
+    document.getElementById('conn-host').textContent = '';
+}
+
+// ── Seek bar click ────────────────────────────────────────────────────────────
+document.getElementById('seek-track').addEventListener('click', function(e) {
+    var rect = this.getBoundingClientRect();
+    var frac = (e.clientX - rect.left) / rect.width;
+    var pos = Math.max(0, Math.min(state.duration, frac * state.duration));
+    state.position = pos;
+    updateSeek();
+    if (state.ws && state.ws.readyState === 1) {
+        state.ws.send(JSON.stringify({ type: 'seek', pos: pos }));
+    }
+});
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+function connectWs(base) {
+    var url = base.replace('http://', 'ws://') + '/ws';
+    var ws = new WebSocket(url);
+    state.ws = ws;
+
+    ws.onopen = function() { setConnected(base); };
+
+    ws.onmessage = function(e) {
+        try {
+            var msg = JSON.parse(e.data);
+            if (msg.type === 'metadata') {
+                document.getElementById('track-title').textContent = msg.title || 'Unknown';
+                document.getElementById('track-artist').textContent = msg.artist || '—';
+                state.duration = msg.duration || 0;
+                state.position = 0;
+                updateSeek();
+            } else if (msg.type === 'position') {
+                state.position = msg.pos;
+                updateSeek();
+            } else if (msg.type === 'state') {
+                setPlaying(msg.playing);
+            }
+        } catch(err) {}
+    };
+
+    ws.onclose = function() {
+        setDisconnected();
+        setPlaying(false);
+        // Retry after 3s
+        setTimeout(function() { connectWs(base); }, 3000);
+    };
+}
+
+// ── Discovery: subnet scan via XHR ───────────────────────────────────────────
+function getLocalIp(cb) {
+    try {
+        var pc = new RTCPeerConnection({ iceServers: [] });
+        pc.createDataChannel('');
+        pc.createOffer().then(function(o) { pc.setLocalDescription(o); });
+        pc.onicecandidate = function(e) {
+            if (!e || !e.candidate) return;
+            var m = e.candidate.candidate.match(/([0-9]{1,3}(\.[0-9]{1,3}){3})/);
+            if (m && !m[1].startsWith('0.') && !m[1].startsWith('169.')) {
+                pc.close();
+                cb(m[1]);
+            }
+        };
+        setTimeout(function() { cb(null); }, 3000);
+    } catch(err) { cb(null); }
+}
+
+function scanSubnet(localIp, done) {
+    var parts = localIp.split('.');
+    var subnet = parts[0] + '.' + parts[1] + '.' + parts[2] + '.';
+    var found = false;
+    var pending = 254;
+
+    document.getElementById('scan-detail').textContent =
+        'scanning ' + subnet + '1–254 on port 7879…';
+
+    for (var i = 1; i <= 254; i++) {
+        (function(ip) {
+            var xhr = new XMLHttpRequest();
+            xhr.timeout = 800;
+            xhr.open('GET', 'http://' + ip + ':7879/ping', true);
+            xhr.onreadystatechange = function() {
+                if (found) return;
+                if (xhr.readyState === 4) {
+                    if (xhr.status === 200 && xhr.responseText.indexOf('dj-rs') !== -1) {
+                        found = true;
+                        done('http://' + ip + ':7879');
+                    } else {
+                        pending--;
+                        if (pending === 0 && !found) done(null);
+                    }
+                }
+            };
+            xhr.ontimeout = xhr.onerror = function() {
+                if (found) return;
+                pending--;
+                if (pending === 0 && !found) done(null);
+            };
+            xhr.send();
+        })(subnet + i);
+    }
+}
+
+function discover() {
+    getLocalIp(function(ip) {
+        if (!ip) {
+            document.getElementById('scan-msg').textContent = 'Could not detect local IP';
+            return;
+        }
+        scanSubnet(ip, function(base) {
+            if (!base) {
+                document.getElementById('scan-msg').textContent = 'dj-rs not found — retrying…';
+                setTimeout(discover, 5000);
+                return;
+            }
+            state.desktopBase = base;
+            connectWs(base);
+        });
+    });
+}
+
+discover();
+</script>
+</body>
+</html>

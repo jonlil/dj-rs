@@ -17,3 +17,20 @@ create_sandbox.py
 
 # Logs
 *.log
+
+# Tizen app build output and signed packages
+tizen-app/dist/
+tizen-app/*.wgt
+tizen-app/target/
+
+# dj_jonas library export (large audio files + personal DB)
+dj_jonas/
+
+# Tizen signing certificates (stored in ~/tizen-studio-data, never in repo)
+*.p12
+*.pem
+*.cer
+profiles.xml
+
+# Tizen local env (cert password, not for version control)
+tizen-app/.env.tizen
