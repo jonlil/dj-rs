@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::io::Cursor;
 use rodio::{Decoder, Sink, Source, OutputStream, OutputStreamHandle};
+use rodio::source::Zero;
 use cpal::traits::{DeviceTrait, HostTrait};
 
 /// Open an audio output stream on the default device, skipping devices that
@@ -71,6 +72,7 @@ pub struct DeckState {
     pub stream: OutputStream,
     pub stream_handle: OutputStreamHandle,
     pub sink: Sink,
+    _keepalive: Sink,
     pub file_path: Option<PathBuf>,
     pub duration_secs: f64,
     pub play_started_at: Option<Instant>,
@@ -84,10 +86,16 @@ impl DeckState {
         let sink = Sink::try_new(&stream_handle)
             .expect("Failed to create audio sink");
         sink.pause();
+        // Keep a silent source playing at all times so PipeWire never suspends
+        // the audio device — prevents the resume-glitch on first play.
+        let keepalive = Sink::try_new(&stream_handle)
+            .expect("Failed to create keepalive sink");
+        keepalive.append(Zero::<f32>::new(2, 48000));
         DeckState {
             stream,
             stream_handle,
             sink,
+            _keepalive: keepalive,
             file_path: None,
             duration_secs: 0.0,
             play_started_at: None,
@@ -105,13 +113,18 @@ impl DeckState {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        // Fresh sink — drop the old one so there's no async-stop race with append
-        let new_sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
-        new_sink.append(decoder);
-        new_sink.pause();
-        // Snap to true position 0 in case the decoder pre-buffered any frames
-        let _ = new_sink.try_seek(Duration::from_secs_f64(0.0));
-        self.sink = new_sink;
+        // If playing, fade out briefly before swapping so there's no hard cut
+        let vol = self.sink.volume();
+        if !self.sink.is_paused() {
+            for i in (0..=4).rev() {
+                self.sink.set_volume(vol * i as f32 / 4.0);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        // clear() blocks until the audio thread has processed the clear — no race with append
+        self.sink.clear();
+        self.sink.set_volume(vol);
+        self.sink.append(decoder);
 
         self.file_path = Some(path);
         self.accumulated_secs = 0.0;
@@ -137,40 +150,32 @@ impl DeckState {
     pub fn stop(&mut self) {
         self.accumulated_secs = 0.0;
         self.play_started_at = None;
+        self.sink.clear();
         if let Some(path) = self.file_path.clone() {
             if let Ok((cursor, _)) = read_file(&path) {
                 if let Ok(decoder) = make_decoder(cursor) {
-                    if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
-                        new_sink.append(decoder);
-                        new_sink.pause();
-                        let _ = new_sink.try_seek(Duration::from_secs_f64(0.0));
-                        self.sink = new_sink;
-                        return;
-                    }
+                    self.sink.append(decoder);
                 }
             }
         }
-        self.sink.stop();
+        self.sink.pause();
     }
 
     /// Seek to `pos` seconds, preserving play/pause state.
     pub fn seek_to(&mut self, pos: f64) -> Result<(), String> {
         let was_playing = self.play_started_at.is_some();
-        let path = self.file_path.clone().ok_or("No track loaded")?;
-
-        let (cursor, _) = read_file(&path)?;
-        let decoder = make_decoder(cursor).map_err(|e| e.to_string())?;
-
-        let new_sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
-        new_sink.append(decoder);
-        // Seek within the freshly-appended decoder (no async-stop race)
-        let _ = new_sink.try_seek(Duration::from_secs_f64(pos));
-        if was_playing {
-            new_sink.play();
-        } else {
-            new_sink.pause();
+        if self.sink.try_seek(Duration::from_secs_f64(pos)).is_err() {
+            // Sink was empty (track ended) — reload and seek
+            let path = self.file_path.clone().ok_or("No track loaded")?;
+            let (cursor, _) = read_file(&path)?;
+            let decoder = make_decoder(cursor).map_err(|e| e.to_string())?;
+            self.sink.clear();
+            self.sink.append(decoder);
+            let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
         }
-        self.sink = new_sink;
+        if was_playing {
+            self.sink.play();
+        }
         self.accumulated_secs = pos;
         self.play_started_at = if was_playing { Some(Instant::now()) } else { None };
         Ok(())
