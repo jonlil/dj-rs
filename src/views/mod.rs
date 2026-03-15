@@ -427,6 +427,8 @@ impl PlayerView {
                     };
 
                     let outcome = outcome.and_then(|flac| {
+                        // Migrate ISRC, AcoustID, MusicBrainz tags from source to FLAC
+                        let _ = crate::tags::migrate_tags(&file_path, &flac);
                         if let (Some(id), Some(db)) = (db_id, db_path) {
                             crate::rekordbox::Library::open(&db)
                                 .and_then(|lib| lib.update_track_path(id, flac.to_str().unwrap_or("")))

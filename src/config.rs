@@ -9,6 +9,7 @@ pub struct Config {
     pub spotify_client_id: Option<String>,
     pub spotify_access_token: Option<String>,
     pub spotify_refresh_token: Option<String>,
+    pub acoustid_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

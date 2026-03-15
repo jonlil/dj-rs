@@ -35,6 +35,7 @@ strsim = "0.11"
 librespot-core = { git = "https://github.com/librespot-org/librespot", branch = "dev", default-features = false, features = ["native-tls"] }
 librespot-playback = { git = "https://github.com/librespot-org/librespot", branch = "dev", default-features = false, features = ["native-tls"] }
 uuid = { version = "1", features = ["v4"] }
+lofty = "0.22"
 
 [dependencies.gtk]
 version = "0.9.0"

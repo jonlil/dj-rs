@@ -10,6 +10,7 @@ mod rekordbox;
 mod server;
 mod librespot_player;
 mod spotify;
+mod tags;
 mod views;
 
 use gtk::prelude::*;
