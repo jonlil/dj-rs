@@ -95,7 +95,7 @@ impl DeckState {
         }
     }
 
-/// Returns `Ok(Some(warning))` on success with a format warning, `Ok(None)` on clean success.
+    /// Returns `Ok(Some(warning))` on success with a format warning, `Ok(None)` on clean success.
     pub fn load(&mut self, path: PathBuf) -> Result<Option<String>, String> {
         let (cursor, warning) = read_file(&path)?;
         let decoder = make_decoder(cursor)
@@ -105,9 +105,13 @@ impl DeckState {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        // Stop clears the queue and pauses — reuse the same sink to avoid device transitions
-        self.sink.stop();
-        self.sink.append(decoder);
+        // Fresh sink — drop the old one so there's no async-stop race with append
+        let new_sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
+        new_sink.append(decoder);
+        new_sink.pause();
+        // Snap to true position 0 in case the decoder pre-buffered any frames
+        let _ = new_sink.try_seek(Duration::from_secs_f64(0.0));
+        self.sink = new_sink;
 
         self.file_path = Some(path);
         self.accumulated_secs = 0.0;
@@ -133,26 +137,42 @@ impl DeckState {
     pub fn stop(&mut self) {
         self.accumulated_secs = 0.0;
         self.play_started_at = None;
-        self.sink.stop();
-        // Reload the file so the track can be played again from the start
         if let Some(path) = self.file_path.clone() {
             if let Ok((cursor, _)) = read_file(&path) {
                 if let Ok(decoder) = make_decoder(cursor) {
-                    self.sink.append(decoder);
+                    if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
+                        new_sink.append(decoder);
+                        new_sink.pause();
+                        let _ = new_sink.try_seek(Duration::from_secs_f64(0.0));
+                        self.sink = new_sink;
+                        return;
+                    }
                 }
             }
         }
+        self.sink.stop();
     }
 
-/// Seek to `pos` seconds, preserving play/pause state.
+    /// Seek to `pos` seconds, preserving play/pause state.
     pub fn seek_to(&mut self, pos: f64) -> Result<(), String> {
         let was_playing = self.play_started_at.is_some();
+        let path = self.file_path.clone().ok_or("No track loaded")?;
 
-        let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
+        let (cursor, _) = read_file(&path)?;
+        let decoder = make_decoder(cursor).map_err(|e| e.to_string())?;
 
+        let new_sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
+        new_sink.append(decoder);
+        // Seek within the freshly-appended decoder (no async-stop race)
+        let _ = new_sink.try_seek(Duration::from_secs_f64(pos));
+        if was_playing {
+            new_sink.play();
+        } else {
+            new_sink.pause();
+        }
+        self.sink = new_sink;
         self.accumulated_secs = pos;
         self.play_started_at = if was_playing { Some(Instant::now()) } else { None };
-
         Ok(())
     }
 

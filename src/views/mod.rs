@@ -154,6 +154,9 @@ impl PlayerView {
         position_scale.set_hexpand(true);
         position_scale.set_sensitive(false);
 
+        // True while the user is holding the mouse button down on the slider
+        let seeking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
         // ── Controls: [Cue] [▶/❚❚]  +  Convert/TV toggle (right) ───────────
 
         let play_btn    = gtk::Button::with_label("▶  Play");
@@ -493,7 +496,14 @@ impl PlayerView {
             });
         }
 
-        // Seek slider — user-initiated scrub
+        // Seek slider — seek only on mouse release (not during drag)
+        {
+            let seeking_press = seeking.clone();
+            position_scale.connect_button_press_event(move |_, _| {
+                seeking_press.set(true);
+                gtk::Inhibit(false)
+            });
+        }
         {
             let state                = state.clone();
             let time_label           = time_label.clone();
@@ -501,15 +511,17 @@ impl PlayerView {
             let tv_output_sk         = tv_output.clone();
             let current_db_sk        = current_track_db_id.clone();
             let spotify_player_seek  = spotify_player.clone();
-            let time_label_seek      = time_label.clone();
-            position_scale.connect_change_value(move |_scale, _scroll, value| {
+            let seeking_release      = seeking.clone();
+            position_scale.connect_button_release_event(move |scale, _| {
+                seeking_release.set(false);
+                let value = scale.get_value();
                 if spotify_player_seek.is_active() {
                     let dur = spotify_player_seek.track_info().2;
-                    if dur <= 0.0 { return gtk::Inhibit(false); }
-                    let pos = (value * dur).clamp(0.0, dur);
-                    spotify_player_seek.seek(pos);
-                    let remaining = (dur - pos).max(0.0);
-                    time_label_seek.set_text(&format!("-{}", fmt_time(remaining)));
+                    if dur > 0.0 {
+                        let pos = (value * dur).clamp(0.0, dur);
+                        spotify_player_seek.seek(pos);
+                        time_label.set_text(&format!("-{}", fmt_time((dur - pos).max(0.0))));
+                    }
                     return gtk::Inhibit(false);
                 }
                 let dur = state.borrow().duration_secs;
@@ -523,6 +535,26 @@ impl PlayerView {
                     if let Some(id) = *current_db_sk.borrow() {
                         bridge_seek.send(WsEvent::Stream { id, seek: pos });
                     }
+                }
+                gtk::Inhibit(false)
+            });
+        }
+        // During drag: update time label display only, no seek
+        {
+            let state_drag      = state.clone();
+            let time_label_drag = time_label.clone();
+            let spotify_drag    = spotify_player.clone();
+            let seeking_drag    = seeking.clone();
+            position_scale.connect_change_value(move |_scale, _scroll, value| {
+                if !seeking_drag.get() { return gtk::Inhibit(false); }
+                let dur = if spotify_drag.is_active() {
+                    spotify_drag.track_info().2
+                } else {
+                    state_drag.borrow().duration_secs
+                };
+                if dur > 0.0 {
+                    let pos = (value * dur).clamp(0.0, dur);
+                    time_label_drag.set_text(&format!("-{}", fmt_time((dur - pos).max(0.0))));
                 }
                 gtk::Inhibit(false)
             });
@@ -557,6 +589,7 @@ impl PlayerView {
             let spotify_player_timer = spotify_player.clone();
             let art_tx_timer         = art_tx.clone();
             let config_timer         = config.clone();
+            let seeking_timer        = seeking.clone();
             let mut tick: u32        = 0;
             glib::timeout_add_local(100, move || {
                 tick += 1;
@@ -703,7 +736,7 @@ impl PlayerView {
                     return glib::Continue(true);
                 }
 
-                if is_started {
+                if is_started && !seeking_timer.get() {
                     let (pos, dur) = {
                         let st = state.borrow();
                         (st.current_position_secs(), st.duration_secs)
