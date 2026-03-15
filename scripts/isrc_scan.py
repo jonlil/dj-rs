@@ -70,7 +70,7 @@ DB_PATH   = Path.home() / ".local/share/dj-rs/master.db"
 DB_KEY    = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
 PATH_FROM = "/home/jonas/Projects/jonlil/dj-rs/dj_jonas/music"
 PATH_TO   = str(Path.home() / "Music")
-LIMIT     = 1000
+LIMIT     = 10000
 MB_DELAY  = 1.1  # MusicBrainz rate limit: 1 req/sec
 
 
@@ -82,7 +82,11 @@ def load_config():
         return {}
 
 CONFIG       = load_config()
-ACOUSTID_KEY = os.environ.get("ACOUSTID_KEY") or CONFIG.get("acoustid_api_key", "")
+ACOUSTID_KEY = os.environ.get("ACOUSTID_KEY") or CONFIG.get("acoustid_api_key") or ""
+
+if not ACOUSTID_KEY:
+    print("ERROR: acoustid_api_key not set in ~/.config/dj-rs/config.json and ACOUSTID_KEY env var is empty.")
+    sys.exit(1)
 
 
 def _normalize(s):
@@ -274,28 +278,34 @@ def fingerprint(path):
         return None, None
 
 
+def _acoustid_post(params):
+    import urllib.error
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request("https://api.acoustid.org/v2/lookup", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        raise Exception(f"HTTP {e.code}: {body}") from None
+
+
 def acoustid_lookup_by_id(acoustid_id):
     """Look up recordings linked to a known AcoustID without re-fingerprinting."""
-    data = urllib.parse.urlencode({
+    return _acoustid_post({
         "client": ACOUSTID_KEY,
         "trackid": acoustid_id,
         "meta": "recordings isrcs",
-    }).encode()
-    req = urllib.request.Request("https://api.acoustid.org/v2/lookup", data=data)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
+    })
 
 
 def acoustid_lookup(duration, fp):
-    data = urllib.parse.urlencode({
+    return _acoustid_post({
         "client": ACOUSTID_KEY,
         "duration": duration,
         "fingerprint": fp,
         "meta": "recordings isrcs",
-    }).encode()
-    req = urllib.request.Request("https://api.acoustid.org/v2/lookup", data=data)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.load(r)
+    })
 
 
 def mb_lookup(mbid):
