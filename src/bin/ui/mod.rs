@@ -25,7 +25,7 @@ pub enum Message {
     TrackClicked(i64),
     // Contacts / Gigs
     ContactToggled(String),
-    GigSelected(String, Option<i64>),
+    GigFolderToggled(i64, Option<String>), // (folder_id, gig_id)
     // Player transport
     CuePressed,
     PlayPressed,
@@ -199,17 +199,16 @@ impl App {
                 Task::none()
             }
 
-            Message::GigSelected(_gig_id, playlist_id) => {
-                if let Some(folder_id) = playlist_id {
-                    self.browser.selection = Selection::Playlist(folder_id);
-                    let db_path = self.db_path.clone();
-                    Task::perform(
-                        async move { load_tracks(db_path, Selection::Playlist(folder_id)).await },
-                        Message::TracksLoaded,
-                    )
-                } else {
-                    Task::none()
+            Message::GigFolderToggled(folder_id, _gig_id) => {
+                if folder_id == 0 {
+                    return Task::none();
                 }
+                if self.browser.expanded_gig_folders.contains(&folder_id) {
+                    self.browser.expanded_gig_folders.remove(&folder_id);
+                } else {
+                    self.browser.expanded_gig_folders.insert(folder_id);
+                }
+                Task::none()
             }
 
             Message::CuePressed => {
