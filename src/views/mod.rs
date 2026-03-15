@@ -1,5 +1,6 @@
 use gtk::prelude::*;
 use gdk_pixbuf::prelude::*;
+use cairo;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -64,6 +65,82 @@ const HOT_CUE_COLORS: [(f64, f64, f64); 8] = [
 
 fn hot_cue_color(slot: usize) -> (f64, f64, f64) {
     HOT_CUE_COLORS[slot.saturating_sub(1).min(7)]
+}
+
+/// Pre-render the overview waveform to an off-screen surface.
+/// Uses color data (PWV7) when available, falls back to greyscale (PWAV).
+/// Returns None only on surface creation failure.
+fn render_overview_surface(
+    color:    &Option<Vec<u8>>,
+    overview: &Option<Vec<u8>>,
+    width:    i32,
+    height:   i32,
+) -> Option<cairo::ImageSurface> {
+    let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, width, height).ok()?;
+    let cr = cairo::Context::new(&surface);
+    let w = width  as f64;
+    let h = height as f64;
+    let half_h = h / 2.0;
+
+    cr.set_source_rgb(0.08, 0.08, 0.08);
+    cr.rectangle(0.0, 0.0, w, h);
+    cr.fill();
+
+    if let Some(ref data) = color {
+        let n = data.len() / 3;
+        if n > 0 {
+            let col_w = (w / n as f64).max(1.0);
+            for i in 0..n {
+                let x   = i as f64 / n as f64 * w;
+                let b0  = data[i * 3];
+                let b1  = data[i * 3 + 1];
+                let b2  = data[i * 3 + 2];
+                let bass = (b0 & 0x1F) as f64 / 31.0;
+                let mid  = (b1 & 0x1F) as f64 / 31.0;
+                let high = (b2 & 0x1F) as f64 / 31.0;
+                let bw = (b0 >> 5) as f64 / 7.0;
+                let mw = (b1 >> 5) as f64 / 7.0;
+                let hw = (b2 >> 5) as f64 / 7.0;
+
+                let h_bass = bass * half_h;
+                cr.set_source_rgb(1.0, 0.55 + bw * 0.45, bw * 0.5);
+                cr.rectangle(x, half_h - h_bass, col_w, h_bass * 2.0);
+                cr.fill();
+
+                let h_mid = mid * half_h * 0.80;
+                cr.set_source_rgb(mw * 0.5, 0.85 + mw * 0.15, mw * 0.3);
+                cr.rectangle(x, half_h - h_mid, col_w, h_mid * 2.0);
+                cr.fill();
+
+                let h_high = high * half_h * 0.60;
+                cr.set_source_rgb(0.35 + hw * 0.65, 0.65 + hw * 0.35, 1.0);
+                cr.rectangle(x, half_h - h_high, col_w, h_high * 2.0);
+                cr.fill();
+            }
+        }
+    } else if let Some(ref data) = overview {
+        let n = data.len() as f64;
+        if n > 0.0 {
+            let col_w = (w / n).max(1.0);
+            for (i, &byte) in data.iter().enumerate() {
+                let x     = i as f64 / n * w;
+                let bh    = (byte & 0x1F) as f64 / 31.0 * half_h;
+                let white = ((byte >> 5) & 0x07) as f64 / 7.0;
+                let v     = 0.35 + white * 0.45;
+                cr.set_source_rgb(v, v, v);
+                cr.rectangle(x, half_h - bh, col_w, bh * 2.0);
+                cr.fill();
+            }
+        }
+    } else {
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.6);
+        cr.set_line_width(1.0);
+        cr.move_to(0.0, half_h);
+        cr.line_to(w, half_h);
+        cr.stroke();
+    }
+
+    Some(surface)
 }
 
 /// Format loop length as a human-readable label given a length in seconds and BPM.
@@ -162,6 +239,9 @@ impl PlayerView {
         let seeking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // TV output active state
         let tv_output: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        // Pre-rendered overview waveform surface (width, height, surface); None = needs re-render
+        let overview_wf_surface: Rc<RefCell<Option<(i32, i32, cairo::ImageSurface)>>> =
+            Rc::new(RefCell::new(None));
         // Pending debounced TV Stream event for overview seek (cancelled on new click)
         let pending_tv_stream: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         // Last loaded track metadata for re-sending when TV output is toggled on or a new client connects
@@ -219,53 +299,49 @@ impl PlayerView {
                 let pos_secs = pos_cell.get();
 
                 // Draw waveform columns (PWV7 format: 3 bytes/col, bass/mid/high)
+                // Iterate over visible waveform columns only — much faster than per-pixel loop.
                 if let Some(ref data) = *color_wave.borrow() {
                     let n_cols = data.len() / 3;
                     let dur = dur_cell.get();
                     if n_cols > 0 && dur > 0.0 {
                         let samples_per_sec = n_cols as f64 / dur;
                         let half_h = height / 2.0;
-                        for px in 0..(width as i32) {
-                            let t = pos_secs + (px as f64 - ph_x) / px_per_s;
-                            if t < 0.0 || t > dur { continue; }
-                            let sample_idx = (t * samples_per_sec) as usize;
-                            if sample_idx >= n_cols { continue; }
-                            let b0 = data[sample_idx * 3];
-                            let b1 = data[sample_idx * 3 + 1];
-                            let b2 = data[sample_idx * 3 + 2];
-                            let bass  = (b0 & 0x1F) as f64 / 31.0;
-                            let mid   = (b1 & 0x1F) as f64 / 31.0;
-                            let high  = (b2 & 0x1F) as f64 / 31.0;
-                            let bw    = (b0 >> 5) as f64 / 7.0;
-                            let mw    = (b1 >> 5) as f64 / 7.0;
-                            let hw    = (b2 >> 5) as f64 / 7.0;
+                        let col_px_w = (px_per_s / samples_per_sec).max(1.0);
 
-                            // Bass: warm amber → white
+                        let t_start = pos_secs - PLAYHEAD_FRAC * ZOOM_WINDOW;
+                        let t_end   = pos_secs + (1.0 - PLAYHEAD_FRAC) * ZOOM_WINDOW;
+                        let col_start = ((t_start * samples_per_sec).floor() as i64).max(0) as usize;
+                        let col_end   = (((t_end * samples_per_sec).ceil() as usize) + 1).min(n_cols);
+
+                        for col in col_start..col_end {
+                            let t = col as f64 / samples_per_sec;
+                            let x = ph_x + (t - pos_secs) * px_per_s;
+                            if x + col_px_w < 0.0 || x > width { continue; }
+
+                            let idx = col * 3;
+                            let b0 = data[idx];
+                            let b1 = data[idx + 1];
+                            let b2 = data[idx + 2];
+                            let bass = (b0 & 0x1F) as f64 / 31.0;
+                            let mid  = (b1 & 0x1F) as f64 / 31.0;
+                            let high = (b2 & 0x1F) as f64 / 31.0;
+                            let bw = (b0 >> 5) as f64 / 7.0;
+                            let mw = (b1 >> 5) as f64 / 7.0;
+                            let hw = (b2 >> 5) as f64 / 7.0;
+
                             let h_bass = bass * half_h;
-                            cr.set_source_rgb(
-                                1.0,
-                                0.55 + bw * 0.45,
-                                bw * 0.5,
-                            );
-                            cr.rectangle(px as f64, half_h - h_bass, 1.0, h_bass * 2.0);
+                            cr.set_source_rgb(1.0, 0.55 + bw * 0.45, bw * 0.5);
+                            cr.rectangle(x, half_h - h_bass, col_px_w, h_bass * 2.0);
                             cr.fill();
-                            // Mid: lime green → white, 80% of bass height
+
                             let h_mid = mid * half_h * 0.80;
-                            cr.set_source_rgb(
-                                mw * 0.5,
-                                0.85 + mw * 0.15,
-                                mw * 0.3,
-                            );
-                            cr.rectangle(px as f64, half_h - h_mid, 1.0, h_mid * 2.0);
+                            cr.set_source_rgb(mw * 0.5, 0.85 + mw * 0.15, mw * 0.3);
+                            cr.rectangle(x, half_h - h_mid, col_px_w, h_mid * 2.0);
                             cr.fill();
-                            // High: steel blue → white, 60% of bass height
+
                             let h_high = high * half_h * 0.60;
-                            cr.set_source_rgb(
-                                0.35 + hw * 0.65,
-                                0.65 + hw * 0.35,
-                                1.0,
-                            );
-                            cr.rectangle(px as f64, half_h - h_high, 1.0, h_high * 2.0);
+                            cr.set_source_rgb(0.35 + hw * 0.65, 0.65 + hw * 0.35, 1.0);
+                            cr.rectangle(x, half_h - h_high, col_px_w, h_high * 2.0);
                             cr.fill();
                         }
                     }
@@ -316,6 +392,14 @@ impl PlayerView {
                 cr.move_to(ph_x, 0.0);
                 cr.line_to(ph_x, height);
                 cr.stroke();
+
+                // Red downward triangle at top of playhead
+                cr.set_source_rgb(0.9, 0.15, 0.15);
+                cr.move_to(ph_x - 7.0, 0.0);
+                cr.line_to(ph_x + 7.0, 0.0);
+                cr.line_to(ph_x,       12.0);
+                cr.close_path();
+                cr.fill();
 
                 gtk::Inhibit(false)
             });
@@ -397,62 +481,51 @@ impl PlayerView {
         );
 
         {
-            let pos_cell  = waveform_pos_secs.clone();
-            let dur_cell  = waveform_dur.clone();
-            let cues_cell = waveform_cues.clone();
-            let ov_wave   = overview_waveform.clone();
+            let pos_cell      = waveform_pos_secs.clone();
+            let dur_cell      = waveform_dur.clone();
+            let cues_cell     = waveform_cues.clone();
+            let color_wave_ov = color_waveform.clone();
+            let ov_wave       = overview_waveform.clone();
             let state_ov_draw = state.clone();
+            let ov_surface    = overview_wf_surface.clone();
             overview_area.connect_draw(move |w, cr| {
                 let alloc  = w.get_allocation();
                 let width  = alloc.width  as f64;
                 let height = alloc.height as f64;
                 let half_h = height / 2.0;
-                // Use state duration as fallback so marker shows even before first timer tick
                 let dur    = dur_cell.get().max(state_ov_draw.borrow().duration_secs);
                 let pos    = pos_cell.get();
 
-                // Background
-                cr.set_source_rgb(0.08, 0.08, 0.08);
-                cr.rectangle(0.0, 0.0, width, height);
-                cr.fill();
-
-                // Waveform bars or fallback line
-                if let Some(ref data) = *ov_wave.borrow() {
-                    let n = data.len() as f64;
-                    if n > 0.0 {
-                        let col_w = (width / n).max(1.0);
-                        for (i, &byte) in data.iter().enumerate() {
-                            let x     = i as f64 / n * width;
-                            let h     = (byte & 0x1F) as f64 / 31.0 * half_h;
-                            let white = ((byte >> 5) & 0x07) as f64 / 7.0;
-                            let v     = 0.35 + white * 0.45;
-                            cr.set_source_rgb(v, v, v);
-                            cr.rectangle(x, half_h - h, col_w, h * 2.0);
-                            cr.fill();
-                        }
-                    }
-                } else {
-                    // No waveform data — visible placeholder line
-                    cr.set_source_rgba(0.5, 0.5, 0.5, 0.6);
-                    cr.set_line_width(1.0);
-                    cr.move_to(0.0, half_h);
-                    cr.line_to(width, half_h);
-                    cr.stroke();
+                // Ensure the pre-rendered surface matches current widget dimensions
+                let needs_render = {
+                    let s = ov_surface.borrow();
+                    s.as_ref().map_or(true, |(sw, sh, _)| *sw != alloc.width || *sh != alloc.height)
+                };
+                if needs_render {
+                    let new_surf = render_overview_surface(
+                        &color_wave_ov.borrow(),
+                        &ov_wave.borrow(),
+                        alloc.width, alloc.height,
+                    );
+                    *ov_surface.borrow_mut() = new_surf.map(|s| (alloc.width, alloc.height, s));
                 }
 
-                // Played portion overlay (darker tint left of playhead)
+                // Blit the pre-rendered waveform surface
+                {
+                    let s = ov_surface.borrow();
+                    if let Some((_, _, ref surf)) = *s {
+                        cr.set_source_surface(surf, 0.0, 0.0);
+                        cr.paint();
+                    }
+                }
+
                 if dur > 0.0 {
                     let ph_x = (pos / dur * width).clamp(0.0, width);
+
+                    // Played portion overlay (darker tint left of playhead)
                     cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
                     cr.rectangle(0.0, 0.0, ph_x, height);
                     cr.fill();
-
-                    // Position marker — white vertical line
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
-                    cr.set_line_width(2.0);
-                    cr.move_to(ph_x, 0.0);
-                    cr.line_to(ph_x, height);
-                    cr.stroke();
 
                     // Cue ticks
                     for (in_secs, _, slot) in cues_cell.borrow().iter() {
@@ -462,6 +535,21 @@ impl PlayerView {
                         cr.rectangle(x - 1.0, 0.0, 2.0, height);
                         cr.fill();
                     }
+
+                    // Playhead: white vertical line
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(2.0);
+                    cr.move_to(ph_x, 0.0);
+                    cr.line_to(ph_x, height);
+                    cr.stroke();
+
+                    // Red downward triangle at top of playhead
+                    cr.set_source_rgb(0.9, 0.15, 0.15);
+                    cr.move_to(ph_x - 5.0, 0.0);
+                    cr.line_to(ph_x + 5.0, 0.0);
+                    cr.line_to(ph_x,       8.0);
+                    cr.close_path();
+                    cr.fill();
                 }
 
                 gtk::Inhibit(false)
@@ -670,6 +758,7 @@ impl PlayerView {
             let config_load         = config.clone();
             let last_metadata_load  = last_metadata.clone();
             let tv_output_load      = tv_output.clone();
+            let ov_surface_load     = overview_wf_surface.clone();
             Rc::new(move |track: Track| {
                 // Stop Spotify if it was playing so the deck takes over
                 if spotify_load.is_active() {
@@ -754,6 +843,7 @@ impl PlayerView {
                         waveform_dur_load.set(dur);
                         *color_waveform_load.borrow_mut() = None;
                         *overview_wf_load.borrow_mut()    = None;
+                        *ov_surface_load.borrow_mut()     = None; // invalidate pre-rendered surface
                         {
                             let cfg = config_load.borrow();
                             if let Some(db_path) = cfg.resolved_db_path() {
@@ -772,6 +862,7 @@ impl PlayerView {
                                             if let Ok((color, overview)) = lib.load_waveform(resolved_id, &base) {
                                                 *color_waveform_load.borrow_mut() = color;
                                                 *overview_wf_load.borrow_mut()    = overview;
+                                                *ov_surface_load.borrow_mut()     = None; // force re-render with new data
                                             }
                                         }
                                     }
@@ -1377,6 +1468,26 @@ impl PlayerView {
                     }
                 }
 
+                glib::Continue(true)
+            });
+        }
+
+        // Fast 60fps timer — updates zoomed waveform position and queues a redraw.
+        // Separate from the 100ms timer so the waveform scrolls smoothly during playback.
+        {
+            let state_fast    = state.clone();
+            let seeking_fast  = seeking.clone();
+            let pos_cell_fast = waveform_pos_secs.clone();
+            let zoomed_fast   = zoomed_area.clone();
+            glib::timeout_add_local(16, move || {
+                let is_playing = state_fast.borrow().play_started_at.is_some();
+                let is_seeking = seeking_fast.get();
+                if is_playing || is_seeking {
+                    if is_playing && !is_seeking {
+                        pos_cell_fast.set(state_fast.borrow().current_position_secs());
+                    }
+                    zoomed_fast.queue_draw();
+                }
                 glib::Continue(true)
             });
         }
