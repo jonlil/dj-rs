@@ -72,15 +72,6 @@ pub fn default_db_path() -> PathBuf {
     path
 }
 
-/// Default location for the music library on Linux: `~/Music`
-pub fn default_music_dir() -> PathBuf {
-    dirs::audio_dir().unwrap_or_else(|| {
-        let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
-        path.push("Music");
-        path
-    })
-}
-
 fn config_path() -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
     path.push("dj-rs");

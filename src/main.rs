@@ -4,7 +4,6 @@ extern crate glib;
 
 mod config;
 mod deck;
-mod dlna;
 mod gig;
 mod matcher;
 mod rekordbox;
@@ -14,7 +13,6 @@ mod spotify;
 mod views;
 
 use gtk::prelude::*;
-use gdk::prelude::*;
 use gio::prelude::*;
 
 use glib::clone;

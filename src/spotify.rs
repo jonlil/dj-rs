@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -290,71 +290,3 @@ pub fn fetch_track_image_url(access_token: &str, track_id: &str) -> Option<Strin
     images.last().or_else(|| images.first()).map(|i| i.url.clone())
 }
 
-// ── Spotify Connect ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SpotifyDevice {
-    pub id:        Option<String>,
-    pub name:      String,
-    pub is_active: bool,
-}
-
-#[derive(Deserialize)]
-struct DevicesResponse {
-    devices: Vec<SpotifyDevice>,
-}
-
-/// Returns all available Spotify Connect devices.
-pub fn get_devices(access_token: &str) -> Result<Vec<SpotifyDevice>, String> {
-    let client = Client::new();
-    let resp = client
-        .get("https://api.spotify.com/v1/me/player/devices")
-        .bearer_auth(access_token)
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        return Err(format!("Spotify API error {status}: {body}"));
-    }
-    let r: DevicesResponse = resp.json().map_err(|e| e.to_string())?;
-    Ok(r.devices)
-}
-
-/// Tells the given Spotify Connect device to play a track URI.
-pub fn start_track_playback(access_token: &str, device_id: &str, track_uri: &str) -> Result<(), String> {
-    let client = Client::new();
-    let body = serde_json::json!({ "uris": [track_uri] });
-    let resp = client
-        .put(format!("https://api.spotify.com/v1/me/player/play?device_id={device_id}"))
-        .bearer_auth(access_token)
-        .json(&body)
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    if !resp.status().is_success() && resp.status().as_u16() != 204 {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        return Err(format!("Spotify API error {status}: {body}"));
-    }
-    Ok(())
-}
-
-/// Pauses playback on the given device.
-pub fn pause_playback(access_token: &str, device_id: &str) -> Result<(), String> {
-    let client = Client::new();
-    let resp = client
-        .put(format!("https://api.spotify.com/v1/me/player/pause?device_id={device_id}"))
-        .bearer_auth(access_token)
-        .header("Content-Length", "0")
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    if !resp.status().is_success() && resp.status().as_u16() != 204 {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        return Err(format!("Spotify API error {status}: {body}"));
-    }
-    Ok(())
-}

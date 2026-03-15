@@ -19,7 +19,7 @@ mod dialogs;
 use utils::fmt_time;
 use browser::{browser_populate_playlists, browser_populate_history, browser_populate_tracks};
 use gig_sidebar::{populate_gig_sidebar_from_library, populate_contacts_and_gigs};
-use gig_workspace::{build_gig_workspace, load_gig_into_workspace, set_match_status, populate_match_results, populate_buy_list};
+use gig_workspace::{build_gig_workspace, load_gig_into_workspace, set_match_status, populate_match_results};
 use crate::librespot_player::LibrespotPlayer;
 use contact_view::{build_contact_view, load_contact_into_view};
 use dialogs::show_settings_dialog;

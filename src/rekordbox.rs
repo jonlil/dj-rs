@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags, Result, params};
+use rusqlite::{Connection, Result, params};
 
 const DB_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 
@@ -43,22 +43,6 @@ pub struct Playlist {
     pub track_count: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct CuePoint {
-    pub content_id: i64,
-    pub in_msec: i32,
-    /// 0 = memory cue, 1 = loop, 3 = hot cue
-    pub kind: i32,
-    pub color: Option<i32>,
-    pub comment: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MyTag {
-    pub id: i64,
-    pub name: String,
-    pub seq: i32,
-}
 
 #[derive(Debug, Clone)]
 pub struct HistorySession {
@@ -204,29 +188,6 @@ impl Library {
         let tracks = stmt.query_map(params![id_str], map_track_row)?
             .collect::<Result<Vec<_>>>()?;
         Ok(tracks)
-    }
-
-    pub fn cues_for_track(&self, content_id: i64) -> Result<Vec<CuePoint>> {
-        let id_str = content_id.to_string();
-        let mut stmt = self.conn.prepare(
-            "SELECT ContentID, InMsec, Kind, Color, Comment
-             FROM djmdCue
-             WHERE ContentID = ?1
-             ORDER BY InMsec",
-        )?;
-
-        let cues = stmt.query_map(params![id_str], |row| {
-            Ok(CuePoint {
-                content_id: parse_id(row.get(0)?),
-                in_msec:    row.get(1)?,
-                kind:       row.get(2)?,
-                color:      row.get(3)?,
-                comment:    row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-
-        Ok(cues)
     }
 
     pub fn move_playlist(&self, id: i64, new_parent_id: Option<i64>) -> Result<()> {
@@ -477,21 +438,6 @@ impl Library {
         Ok(genres)
     }
 
-    pub fn my_tags(&self) -> Result<Vec<MyTag>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT ID, Name, Seq FROM djmdMyTag WHERE rb_local_deleted = 0 ORDER BY Seq",
-        )?;
-        let tags = stmt.query_map([], |row| {
-            Ok(MyTag {
-                id:   parse_id(row.get(0)?),
-                name: row.get(1)?,
-                seq:  row.get(2)?,
-            })
-        })?
-        .collect::<Result<Vec<_>>>()?;
-        Ok(tags)
-    }
-
     pub fn song_my_tags(&self, content_id: i64) -> Result<Vec<String>> {
         let id_str = content_id.to_string();
         let mut stmt = self.conn.prepare(
@@ -626,44 +572,3 @@ impl Track {
     }
 }
 
-// ─── Camelot wheel ────────────────────────────────────────────────────────────
-
-static CAMELOT_WHEEL: &[(&str, &[&str])] = &[
-    ("Am",      &["Am", "Em", "Dm", "C"]),
-    ("Em",      &["Em", "Bm", "Am", "G"]),
-    ("Bm",      &["Bm", "F#m", "Em", "D"]),
-    ("F#m",     &["F#m", "C#m", "Bm", "A"]),
-    ("C#m",     &["C#m", "G#m", "F#m", "E"]),
-    ("Dbm",     &["C#m", "G#m", "F#m", "E"]),
-    ("G#m",     &["G#m", "D#m", "C#m", "B"]),
-    ("Abm",     &["G#m", "D#m", "C#m", "B"]),
-    ("D#m",     &["D#m", "Bbm", "G#m", "F#"]),
-    ("Ebm",     &["D#m", "Bbm", "G#m", "F#"]),
-    ("Bbm",     &["Bbm", "Fm", "D#m", "Db"]),
-    ("Fm",      &["Fm", "Cm", "Bbm", "Ab"]),
-    ("Cm",      &["Cm", "Gm", "Fm", "Eb"]),
-    ("Gm",      &["Gm", "Dm", "Cm", "Bb"]),
-    ("Dm",      &["Dm", "Am", "Gm", "F"]),
-    ("C",       &["C", "G", "Am", "F"]),
-    ("G",       &["G", "D", "Em", "C"]),
-    ("D",       &["D", "A", "Bm", "G"]),
-    ("A",       &["A", "E", "F#m", "D"]),
-    ("E",       &["E", "B", "C#m", "A"]),
-    ("B",       &["B", "F#", "G#m", "E"]),
-    ("F#",      &["F#", "Db", "D#m", "B"]),
-    ("Gb",      &["F#", "Db", "D#m", "B"]),
-    ("Db",      &["Db", "Ab", "Bbm", "F#"]),
-    ("Ab",      &["Ab", "Eb", "Fm", "Db"]),
-    ("Eb",      &["Eb", "Bb", "Cm", "Ab"]),
-    ("Bb",      &["Bb", "F", "Gm", "Eb"]),
-    ("F",       &["F", "C", "Dm", "Bb"]),
-];
-
-pub fn compatible_camelot_keys(key_name: &str) -> Vec<&'static str> {
-    for (key, compatible) in CAMELOT_WHEEL {
-        if *key == key_name {
-            return compatible.to_vec();
-        }
-    }
-    vec![]
-}

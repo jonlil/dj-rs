@@ -135,30 +135,6 @@ impl GigStore {
         }
     }
 
-    pub fn add_contact(&mut self, contact: Contact) {
-        self.contacts.push(contact);
-        self.save();
-    }
-
-    pub fn add_gig(&mut self, gig: Gig) {
-        self.gigs.push(gig);
-        self.save();
-    }
-
-    pub fn update_contact(&mut self, contact: Contact) {
-        if let Some(existing) = self.contacts.iter_mut().find(|c| c.id == contact.id) {
-            *existing = contact;
-            self.save();
-        }
-    }
-
-    pub fn update_gig(&mut self, gig: Gig) {
-        if let Some(existing) = self.gigs.iter_mut().find(|g| g.id == gig.id) {
-            *existing = gig;
-            self.save();
-        }
-    }
-
     pub fn gigs_for_contact<'a>(&'a self, contact_id: &str) -> Vec<&'a Gig> {
         self.gigs.iter().filter(|g| g.contact_id == contact_id).collect()
     }
