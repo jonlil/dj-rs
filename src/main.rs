@@ -2,11 +2,12 @@ extern crate gtk;
 extern crate gio;
 extern crate glib;
 
-mod config;
+// config and rekordbox live in lib.rs — re-export so `crate::` paths still work
+pub use dj_rs::config;
+pub use dj_rs::rekordbox;
 mod deck;
 mod gig;
 mod matcher;
-mod rekordbox;
 mod server;
 mod librespot_player;
 mod spotify;

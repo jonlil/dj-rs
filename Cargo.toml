@@ -37,6 +37,7 @@ librespot-core = { git = "https://github.com/librespot-org/librespot", branch = 
 librespot-playback = { git = "https://github.com/librespot-org/librespot", branch = "dev", default-features = false, features = ["native-tls"] }
 uuid = { version = "1", features = ["v4"] }
 lofty = "0.22"
+iced = { version = "0.14", features = ["canvas", "tokio"] }
 
 [dependencies.gtk]
 version = "0.9.0"
