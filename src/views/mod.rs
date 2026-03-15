@@ -639,60 +639,92 @@ impl PlayerView {
         position_scale.set_hexpand(true);
         position_scale.set_sensitive(false);
 
-        // ── Transport row: [Q▾] | [▶ Play] ──────────────────────────────────
-        let quantize_combo = gtk::ComboBoxText::new();
-        for q in &["Q: Off", "Q: 1/4", "Q: 1/2", "Q: 1 beat", "Q: 1/2 bar", "Q: 1 bar"] {
-            quantize_combo.append_text(q);
+        // ── Round transport buttons (CSS) ─────────────────────────────────────
+        let transport_css = gtk::CssProvider::new();
+        let _ = transport_css.load_from_data(
+            b"button.transport-btn { border-radius: 22px; min-width: 52px; min-height: 44px; padding: 0; font-size: 16px; font-weight: bold; }"
+        );
+
+        let play_btn = gtk::Button::with_label("▶");
+        {
+            let ctx = play_btn.get_style_context();
+            ctx.add_class("transport-btn");
+            gtk::StyleContext::add_provider(&ctx, &transport_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
-        quantize_combo.set_active(Some(0));
 
-        let play_btn = gtk::Button::with_label("▶  Play");
-
-        let sep1 = gtk::Separator::new(gtk::Orientation::Vertical);
-
-        let transport_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        transport_row.pack_start(&quantize_combo, false, false, 0);
-        transport_row.pack_start(&sep1,           false, false, 4);
-        transport_row.pack_start(&play_btn,       false, false, 0);
-
-        // ── Cue & Loop row ────────────────────────────────────────────────────
         let cue_btn = gtk::Button::with_label("CUE");
+        {
+            let ctx = cue_btn.get_style_context();
+            ctx.add_class("transport-btn");
+            gtk::StyleContext::add_provider(&ctx, &transport_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
 
-        // Hot cue buttons 1–8 (small squares)
-        let hot_cue_btns: Vec<gtk::Button> = (1..=8)
-            .map(|i| {
-                let btn = gtk::Button::with_label(&format!("{}", i));
-                btn.set_size_request(28, 24);
+        // ── Output toggle buttons ─────────────────────────────────────────────
+        let tv_btn    = gtk::ToggleButton::with_label("TV");
+        tv_btn.set_sensitive(false);
+        let local_btn = gtk::ToggleButton::with_label("● Loc");
+        local_btn.set_active(true);
+
+        let out_label = gtk::Label::new(Some("Out"));
+        let out_row   = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        out_row.pack_start(&local_btn, false, false, 0);
+        out_row.pack_start(&tv_btn,    false, false, 0);
+
+        // ── Left column: [CUE] [▶] Out [● Loc][TV] ───────────────────────────
+        let left_col = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        left_col.set_size_request(90, -1);
+        left_col.pack_start(&cue_btn,   false, false, 0);
+        left_col.pack_start(&play_btn,  false, false, 0);
+        left_col.pack_start(&out_label, false, false, 2);
+        left_col.pack_start(&out_row,   false, false, 0);
+
+        // ── Hot cue buttons A–H (single row) ─────────────────────────────────
+        let hot_cue_btns: Vec<gtk::Button> = ["A","B","C","D","E","F","G","H"].iter()
+            .map(|lbl| {
+                let btn = gtk::Button::with_label(lbl);
+                btn.set_size_request(32, 28);
                 btn
             })
             .collect();
-
-        let sep2 = gtk::Separator::new(gtk::Orientation::Vertical);
 
         let hot_cue_grid = gtk::Grid::new();
         hot_cue_grid.set_row_spacing(2);
         hot_cue_grid.set_column_spacing(2);
         for (i, btn) in hot_cue_btns.iter().enumerate() {
             btn.set_sensitive(false);
-            hot_cue_grid.attach(btn, (i % 4) as i32, (i / 4) as i32, 1, 1);
+            hot_cue_grid.attach(btn, i as i32, 0, 1, 1);
         }
 
         let cue_loop_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        cue_loop_row.pack_start(&cue_btn,      false, false, 0);
-        cue_loop_row.pack_start(&sep2,         false, false, 4);
         cue_loop_row.pack_start(&hot_cue_grid, false, false, 0);
 
-        // ── Sink row: Output: [● Local] [Samsung TV] ─────────────────────────
-        let tv_btn = gtk::ToggleButton::with_label("Samsung TV");
-        tv_btn.set_sensitive(false);
-        let output_label = gtk::Label::new(Some("Output:"));
-        let local_btn    = gtk::ToggleButton::with_label("● Local");
-        local_btn.set_active(true);
+        // ── Cue list panel (right side, 8 clickable rows) ────────────────────
+        let cue_slot_labels = ["A","B","C","D","E","F","G","H"];
+        let mut cue_list_time_labels: Vec<gtk::Label> = Vec::new();
+        let mut cue_list_btns: Vec<gtk::Button> = Vec::new();
+        let cue_list_box = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        cue_list_box.set_size_request(130, -1);
 
-        let sink_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        sink_row.pack_start(&output_label, false, false, 0);
-        sink_row.pack_start(&local_btn,    false, false, 0);
-        sink_row.pack_start(&tv_btn,       false, false, 0);
+        for i in 0..8usize {
+            let (r, g, b) = hot_cue_color(i + 1);
+            let hex = format!("#{:02x}{:02x}{:02x}",
+                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+            let letter_lbl = gtk::Label::new(None);
+            letter_lbl.set_markup(&format!("<span color=\"{hex}\" weight=\"bold\">{}</span>", cue_slot_labels[i]));
+            let time_lbl = gtk::Label::new(Some("  ──"));
+            time_lbl.set_xalign(0.0);
+            cue_list_time_labels.push(time_lbl.clone());
+
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            row_box.pack_start(&letter_lbl, false, false, 2);
+            row_box.pack_start(&time_lbl,   true,  false, 0);
+
+            let row_btn = gtk::Button::new();
+            row_btn.add(&row_box);
+            row_btn.set_sensitive(false);
+            cue_list_btns.push(row_btn.clone());
+            cue_list_box.pack_start(&row_btn, false, false, 0);
+        }
 
         // ── Convert + error labels (hidden normally) ──────────────────────────
         let convert_btn = gtk::Button::with_label("Convert to FLAC");
@@ -719,14 +751,20 @@ impl PlayerView {
 
 
         // ── Assemble ──────────────────────────────────────────────────────────
-        vbox.pack_start(&info_row,      false, true,  0);
-        vbox.pack_start(&zoomed_area,   false, true,  0);
-        vbox.pack_start(&overview_area, false, true,  0);
-        vbox.pack_start(&transport_row, false, false, 0);
-        vbox.pack_start(&cue_loop_row,   false, false, 0);
-        vbox.pack_start(&sink_row,       false, false, 0);
-        vbox.pack_start(&convert_btn,    false, false, 0);
-        vbox.pack_start(&error_label,    false, false, 0);
+        let center_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        center_col.pack_start(&zoomed_area,   true, true, 0);
+        center_col.pack_start(&overview_area, false, true, 0);
+
+        let main_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        main_hbox.pack_start(&left_col,      false, false, 4);
+        main_hbox.pack_start(&center_col,    true,  true,  0);
+        main_hbox.pack_start(&cue_list_box,  false, false, 4);
+
+        vbox.pack_start(&info_row,     false, true,  0);
+        vbox.pack_start(&main_hbox,    true,  true,  4);
+        vbox.pack_start(&cue_loop_row, false, false, 0);
+        vbox.pack_start(&convert_btn,  false, false, 0);
+        vbox.pack_start(&error_label,  false, false, 0);
 
         frame.add(&vbox);
 
@@ -753,12 +791,14 @@ impl PlayerView {
             let color_waveform_load = color_waveform.clone();
             let overview_wf_load    = overview_waveform.clone();
             let waveform_dur_load   = waveform_dur.clone();
-            let hot_cue_btns_load   = hot_cue_btns.clone();
-            let cue_loop_row_load   = cue_loop_row.clone();
-            let config_load         = config.clone();
-            let last_metadata_load  = last_metadata.clone();
-            let tv_output_load      = tv_output.clone();
-            let ov_surface_load     = overview_wf_surface.clone();
+            let hot_cue_btns_load       = hot_cue_btns.clone();
+            let cue_loop_row_load       = cue_loop_row.clone();
+            let cue_list_btns_load      = cue_list_btns.clone();
+            let cue_list_time_lbl_load  = cue_list_time_labels.clone();
+            let config_load             = config.clone();
+            let last_metadata_load      = last_metadata.clone();
+            let tv_output_load          = tv_output.clone();
+            let ov_surface_load         = overview_wf_surface.clone();
             Rc::new(move |track: Track| {
                 // Stop Spotify if it was playing so the deck takes over
                 if spotify_load.is_active() {
@@ -791,7 +831,7 @@ impl PlayerView {
                         bpm_label.set_text(&bpm_str);
                         key_label.set_text(&key_str);
                         source_badge.set_text("♦ LIBRARY");
-                        play_btn_load.set_label("▶  Play");
+                        play_btn_load.set_label("▶");
                         position_scale.set_sensitive(true);
                         cue_loop_row_load.set_sensitive(true);
 
@@ -799,11 +839,13 @@ impl PlayerView {
                         {
                             let mut cues = waveform_cues_load.borrow_mut();
                             cues.clear();
-                            // Reset all hot cue buttons to inactive
+                            // Reset all hot cue buttons and cue list to inactive
                             for btn in &hot_cue_btns_load {
                                 btn.set_sensitive(false);
-                                let lbl = btn.get_label().map(|s| s.to_string()).unwrap_or_default();
-                                btn.set_label(&lbl);
+                            }
+                            for (btn, lbl) in cue_list_btns_load.iter().zip(cue_list_time_lbl_load.iter()) {
+                                btn.set_sensitive(false);
+                                lbl.set_text("  ──");
                             }
                             if track_id != 0 {
                                 if let Some(db_path) = config_load.borrow().resolved_db_path() {
@@ -831,6 +873,11 @@ impl PlayerView {
                                                         &btn.get_style_context(), &css,
                                                         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
                                                     );
+                                                    // Update cue list panel
+                                                    let list_btn = &cue_list_btns_load[slot - 1];
+                                                    let list_lbl = &cue_list_time_lbl_load[slot - 1];
+                                                    list_btn.set_sensitive(true);
+                                                    list_lbl.set_text(&format!("  {}", fmt_time(cp.in_secs)));
                                                 }
                                             }
                                         }
@@ -952,22 +999,22 @@ impl PlayerView {
                 if spotify_play.is_active() {
                     if spotify_play.is_paused() {
                         spotify_play.resume();
-                        play_btn_ref.set_label("❚❚  Pause");
+                        play_btn_ref.set_label("❚❚");
                     } else {
                         spotify_play.pause();
-                        play_btn_ref.set_label("▶  Play");
+                        play_btn_ref.set_label("▶");
                     }
                     return;
                 }
                 let is_playing = state.borrow().play_started_at.is_some();
                 if is_playing {
                     state.borrow_mut().pause();
-                    play_btn_ref.set_label("▶  Play");
+                    play_btn_ref.set_label("▶");
                     bridge_play.send(WsEvent::State { playing: false });
                 } else {
                     state.borrow_mut().play();
                     if state.borrow().play_started_at.is_some() {
-                        play_btn_ref.set_label("❚❚  Pause");
+                        play_btn_ref.set_label("❚❚");
                         if *tv_output_play.borrow() {
                             // Keep local audio muted; tell TV to stream
                             state.borrow().sink.set_volume(0.0);
@@ -996,7 +1043,7 @@ impl PlayerView {
                 if was_playing {
                     state.borrow_mut().pause();
                 }
-                play_btn.set_label("▶  Play");
+                play_btn.set_label("▶");
                 let dur = state.borrow().duration_secs;
                 let frac = if dur > 0.0 { (cue_pos / dur).min(1.0) } else { 0.0 };
                 position_scale.set_value(frac);
@@ -1006,13 +1053,29 @@ impl PlayerView {
             });
         }
 
-        // Hot cue buttons H1–H8: jump to stored position
+        // Hot cue buttons A–H: jump to stored position
         for (i, btn) in hot_cue_btns.iter().enumerate() {
-            let slot         = i + 1;
-            let state        = state.clone();
+            let slot             = i + 1;
+            let state            = state.clone();
             let waveform_cues_hc = waveform_cues.clone();
             btn.connect_clicked(move |_| {
                 let pos_opt = waveform_cues_hc.borrow()
+                    .iter()
+                    .find(|(_, _, s)| *s == slot)
+                    .map(|(p, _, _)| *p);
+                if let Some(pos) = pos_opt {
+                    let _ = state.borrow_mut().seek_to(pos);
+                }
+            });
+        }
+
+        // Cue list panel: click row to jump to cue
+        for (i, btn) in cue_list_btns.iter().enumerate() {
+            let slot             = i + 1;
+            let state            = state.clone();
+            let waveform_cues_cl = waveform_cues.clone();
+            btn.connect_clicked(move |_| {
+                let pos_opt = waveform_cues_cl.borrow()
                     .iter()
                     .find(|(_, _, s)| *s == slot)
                     .map(|(p, _, _)| *p);

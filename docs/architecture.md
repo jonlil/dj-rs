@@ -1,8 +1,8 @@
 # dj-rs Architecture
 
 A GTK3 desktop DJ library application written in Rust. Reads a Rekordbox 6
-encrypted SQLite database, plays audio locally, and can cast to DLNA renderers
-(Samsung TVs, etc.).
+encrypted SQLite database, plays audio locally, and can stream to a Samsung TV
+via WebSocket.
 
 ---
 
@@ -10,12 +10,25 @@ encrypted SQLite database, plays audio locally, and can cast to DLNA renderers
 
 ```
 src/
-  main.rs       — GTK Application + Widgets root, wires views together
-  views.rs      — All GTK UI (PlayerView, MainView, BrowserView)
-  rekordbox.rs  — Rekordbox DB access (SQLCipher via rusqlite)
-  deck.rs       — Local audio playback (rodio + cpal)
-  dlna.rs       — DLNA casting, SSDP discovery, HTTP server, MPEG-TS transcoding
-  config.rs     — JSON config (~/.config/dj-rs/config.json): db_path + path mappings
+  main.rs               — GTK Application + Widgets root, wires views together
+  config.rs             — JSON config (~/.config/dj-rs/config.json): db_path, path mappings
+  deck.rs               — DeckState: rodio Sink + play/pause/seek/loop
+  rekordbox.rs          — Rekordbox DB access (SQLCipher via rusqlite) + ANLZ binary parser
+  gig.rs                — Gig, Contact, GigStore (gigs.json persistence)
+  spotify.rs            — PKCE OAuth, fetch_playlist, Spotify Web API
+  librespot_player.rs   — Full Spotify playback via librespot → rodio
+  matcher.rs            — Jaro-Winkler fuzzy match: Spotify tracks ↔ library
+  server.rs             — axum HTTP/WS server (port 7879), TV stream via ffmpeg
+  dlna.rs               — DLNA renderer discovery
+  tags.rs               — lofty tag read/write (ISRC, MusicBrainz, AcoustID)
+  views/
+    mod.rs              — PlayerView + MainView (all GTK wiring)
+    browser.rs          — Library/playlist browser tree + track list
+    gig_workspace.rs    — Gig editor (5-tab Notebook)
+    gig_sidebar.rs      — Contacts/Gigs sidebar tree
+    contact_view.rs     — Contact detail + pool playlists
+    dialogs.rs          — Settings dialog, new-gig dialog
+    utils.rs            — find_widget helper
 ```
 
 ---
@@ -23,27 +36,25 @@ src/
 ## UI layout
 
 ```
-┌─ MenuBar (File → Quit) ───────────────────────────────────┐
-├─ MainView ────────────────────────────────────────────────┤
-│   PlayerView (Deck)                                        │
-│   [Track info] [position slider] [time]                   │
-│   [Load] [Play/Pause] [Stop]                              │
-│   [Vol slider]  [Output device combo]                     │
-│   [Cast…] [Stop Cast] [cast status]                       │
-│   [Next: —]                              [Next →]         │
-├─ BrowserView ─────────────────────────────────────────────┤
-│   [Open Library…] [↺ Reload] [Settings…] [N tracks]  [Search…] │
-│   [BPM: min–max] [Key:▾] [Genre:▾] [Rating:▾] [Harmonic] │
-│   ┌──────────────┬──────────────────────────────────────┐ │
-│   │ ★ All Tracks │ Title Artist BPM Key Time Genre ★ Lbl│ │
-│   │ ▸ Folder     │ …                                    │ │
-│   │   Playlist   │                                      │ │
-│   │ — History —  │                                      │ │
-│   │   Session 1  │                                      │ │
-│   └──────────────┴──────────────────────────────────────┘ │
-│   Tags: —                                                 │
-│   Set rating: ★ ★★ ★★★ ★★★★ ★★★★★  ✕                    │
-└───────────────────────────────────────────────────────────┘
+┌─ MenuBar (File → Quit, etc.) ─────────────────────────────────────┐
+├─ MainView (HPaned) ───────────────────────────────────────────────┤
+│  ┌─ Left sidebar ──────────┐  ┌─ Right pane ────────────────────┐ │
+│  │ GigSidebar              │  │ PlayerView (Deck)               │ │
+│  │ Contacts / Gigs tree    │  │  [art | info row]               │ │
+│  │                         │  │  [left_col | waveforms | cues]  │ │
+│  │ (click gig → workspace) │  │  [A][B][C][D][E][F][G][H]      │ │
+│  │                         │  ├─ BrowserView ──────────────────┤ │
+│  │                         │  │ [Open Library] [Reload] [Settings] │
+│  │                         │  │ [BPM:] [Key:] [Genre:] [Rating:] [Harmonic] │
+│  │                         │  │ ┌──────────────┬──────────────┐ │ │
+│  │                         │  │ │ All Tracks   │ track list   │ │ │
+│  │                         │  │ │ ▸ Folder     │              │ │ │
+│  │                         │  │ │   Playlist   │              │ │ │
+│  │                         │  │ │ — History —  │              │ │ │
+│  │                         │  │ └──────────────┴──────────────┘ │ │
+│  │                         │  │ Tags: —   ★ rating row          │ │
+│  └─────────────────────────┘  └────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -51,26 +62,28 @@ src/
 ## State and data flow
 
 ### PlayerView shared state
-`PlayerView` holds `Rc<RefCell<DeckState>>`. Several `Rc`-cloned handles are
-shared with callbacks:
 
-| Field | Type | Purpose |
+`PlayerView` holds `Rc<RefCell<DeckState>>`. Key Rc handles shared across callbacks:
+
+| Handle | Type | Purpose |
 |---|---|---|
 | `state` | `Rc<RefCell<DeckState>>` | audio sink + position tracking |
-| `queue_fn` | `Rc<dyn Fn(PathBuf)>` | called by BrowserView to queue next track |
 | `current_track_db_id` | `Rc<RefCell<Option<i64>>>` | DB id of currently loaded track |
-| `on_track_end` | `Rc<RefCell<Option<Rc<dyn Fn(i64)>>>>` | fired when track ends naturally |
+| `waveform_cues` | `Rc<RefCell<Vec<(f64, Option<f64>, usize)>>>` | hot cue data (in_secs, out_secs, slot 1–8) |
+| `tv_output` | `Rc<RefCell<bool>>` | whether TV output is the active sink |
+| `last_metadata` | `Rc<RefCell<Option<(String, String, f64)>>>` | track info for re-sending on TV connect |
+| `pending_tv_stream` | `Rc<RefCell<Option<glib::SourceId>>>` | debounce handle for overview seek WsEvent |
+| `overview_wf_surface` | `Rc<RefCell<Option<(i32, i32, cairo::ImageSurface)>>>` | pre-rendered overview surface cache |
 
 `MainView` exposes `queue_fn`, `current_track_db_id`, and `on_track_end` so
-`main.rs` can pass them to `BrowserView::new`.
+`main.rs` can wire them to `BrowserView`.
 
 `BrowserView` sets `on_track_end` to call `lib.increment_play_count(id)` once
 the library is open.
 
-### 100ms glib timer (inside PlayerView)
-- Updates position slider + time label while playing
-- When `is_started && sink.empty()`: track ended → fires `on_track_end`, then
-  auto-advances to queued track if one is set
+### Timer loops (inside PlayerView)
+- **100ms**: position updates, Spotify token refresh, TV client detection, track-end auto-advance
+- **16ms**: zoomed waveform redraws at 60fps (only runs when playing or seeking)
 
 ---
 
@@ -91,74 +104,51 @@ PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
 
 1. **All ID columns are `VARCHAR(255)` storing decimal integers as text.**
    `rusqlite`'s `row.get::<_, i64>()` returns `InvalidColumnType` on a text
-   cell. Always read as `String` and `parse()`. This applies to every `*ID`
-   column including `ColorID`, `LabelID`, etc.
+   cell. Always read as `String` and `parse()`.
 
-2. **`c.Comment` does not exist** in this version of the rekordbox schema
-   (despite being documented). Querying it causes an `OperationalError` that
-   silently fails the whole `tracks()` call (wrapped in `if let Ok`), resulting
-   in an empty track list with the count still showing from the status label.
+2. **`c.Comment` does not exist** in this version of the rekordbox schema.
+   Querying it causes a silent `OperationalError` and an empty track list.
 
-3. **`ParentID = "root"`** is used as sentinel for top-level playlist nodes
-   (not NULL, not 0).
+3. **`ParentID = "root"`** is the sentinel for top-level playlist nodes (not NULL, not 0).
 
-4. **`BPM` is stored ×100**: 128.00 BPM → stored as `12800`. Display with
-   `bpm as f32 / 100.0`.
+4. **`BPM` is stored ×100**: 128.00 BPM → stored as `12800`.
 
-5. **`djmdPlaylist.Attribute`**: `0` = regular playlist, `1` = folder,
-   `2` = smart playlist.
+5. **`djmdPlaylist.Attribute`**: `0` = regular playlist, `1` = folder, `2` = smart playlist.
 
 6. **`djmdColor`** has 8 rows (0–8). ColorID `"0"` = no colour.
 
 ---
 
-## DLNA casting to Samsung TV
+## TV streaming (WebSocket)
 
-See [`dlna-samsung-casting.md`](dlna-samsung-casting.md) for full details.
+See [`tizen-app.md`](tizen-app.md) for the Tizen app side.
 
-**Short version**: Samsung Q-series TVs ignore audio-only DLNA content
-(AVTransport stays `TRANSITIONING` forever). The fix is to wrap audio in an
-MPEG-TS container with a dummy black video track via ffmpeg, served as
-`video/mpeg` with profile `MPEG_TS_SD_EU_ISO`. The TV's video decoder then
-works correctly.
+- axum server on port 7879
+- TV connects via WebSocket `/ws` → receives `WsEvent` JSON
+- Audio served at `/stream/{id}?seek={s}` → ffmpeg transcodes to AAC 256k ADTS and pipes it
+- `WsEvent::Stream { id, seek }` → TV fetches the stream URL
+- `WsEvent::Position`, `State`, `Metadata` keep the TV UI in sync
+- TV can send `{ "type": "seek", "pos": N }` → stored in `seek_slot`, picked up by 100ms timer
 
 ---
 
 ## Path mappings
 
-Rekordbox stores paths as recorded on macOS (e.g. `/Volumes/muzika/...`). On
-Linux the drive may be mounted at `/run/media/jonas/muzika`. The Settings
-dialog lets the user add prefix-rewrite rules saved in `config.json`.
+Rekordbox stores paths as recorded on macOS. On Linux the drive may be at a different
+mount point. The Settings dialog lets the user add prefix-rewrite rules saved in `config.json`.
+`apply_mappings(path)` rewrites for playback; `reverse_mappings(path)` rewrites back for DB lookups.
 
 ---
 
 ## Column sorting
 
-`ListStore` implements `TreeSortable` natively in GTK3. Calling
-`col.set_sort_column_id(n)` on each `TreeViewColumn` makes column headers
-clickable for sort. **Do not wrap in `TreeModelSort`** — in gtk-rs 0.9 the
-sort proxy silently disconnects from the view, producing an empty track list.
+`ListStore` sorts natively via `col.set_sort_column_id(n)`. Do not wrap in `TreeModelSort`
+— in gtk-rs 0.9 the sort proxy silently disconnects from the view, producing an empty track list.
 
 ---
 
 ## Playlist sidebar
 
-The playlist panel uses a `gtk::TreeStore` (not `ListStore`) so folders can be
-expanded and collapsed natively. Folders start collapsed via `pl_view.collapse_all()`
-after each populate.
-
-`browser_populate_playlists` builds the tree using an `IndexMap<Option<i64>,
-Vec<&Playlist>>` keyed by `parent_id`. `IndexMap` is required — a plain
-`HashMap` loses the `ORDER BY Seq` ordering from the DB query.
-
-History sessions live in a separate **History** tab (`gtk::Notebook`). They are
-populated by `browser_populate_history` into their own `ListStore` / `TreeView`.
-
----
-
-## Known issues / TODO
-
-- Cue point display in player (data is read via `cues_for_track()`, not shown)
-- Smart playlists (`Attribute = 2`) not evaluated — shown as regular playlists
-- Drag track from browser into a playlist not yet implemented
-- History sessions are in their own sidebar tab; selecting a session loads its tracks
+Uses `gtk::TreeStore` (not `ListStore`) for native folder expand/collapse.
+`IndexMap` is required for children lists — a plain `HashMap` loses the `ORDER BY Seq` ordering.
+History sessions live in a separate **History** tab (`gtk::Notebook`).

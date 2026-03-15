@@ -57,11 +57,18 @@ Frame("Player")
       meta_box (VBox)
         title_row         track_label | source_badge | bpm_label
         artist_row        artist_label | key_label | time_label
-    zoomed_area           DrawingArea 120px tall, hexpand — CDJ zoomed waveform
-    overview_area         DrawingArea  32px tall, hexpand — full-track overview
-    transport_row         [Q: Off ▾] | [▶ Play / ❚❚ Pause]
-    cue_loop_row          [CUE] | [1][2][3][4] / [5][6][7][8]  (hot cue grid)
-    sink_row              Output: [● Local] [Samsung TV]
+    main_hbox (HBox)
+      left_col (VBox, 90px)
+        cue_btn           round (border-radius 22px), label "CUE"
+        play_btn          round, label "▶" / "❚❚"
+        out_label         "Out"
+        out_row (HBox)    [● Loc] [TV]  — mutually exclusive toggles
+      center_col (VBox, hexpand)
+        zoomed_area       DrawingArea 120px tall — CDJ zoomed waveform
+        overview_area     DrawingArea  32px tall — full-track overview + seek
+      cue_list_box (VBox, 130px)
+        8 × row_btn       colored letter (A–H) + timestamp; click to seek
+    cue_loop_row          [A][B][C][D][E][F][G][H]  hot cue trigger buttons
     convert_btn           hidden; shown only for M4A/AAC tracks
     error_label           hidden; shown on load errors
 ```
@@ -83,10 +90,9 @@ Frame("Player")
 ### Zoomed waveform (zoomed_area)
 - **Height**: 120px, `hexpand = true`
 - **Window**: 6 seconds total visible (`ZOOM_WINDOW = 6.0`)
-- **Playhead**: 25% from left edge (`PLAYHEAD_FRAC = 0.25`) — white vertical line
+- **Playhead**: 25% from left edge (`PLAYHEAD_FRAC = 0.25`) — white vertical line + red downward triangle
 - **Data source**: `color_waveform` — PWV7 bytes from ANLZ `.2EX` file
-- **Rendering**: per-pixel, maps `t = pos + (px - ph_x) / px_per_s` to sample index.
-  Each column draws 3 overlapping rectangles (bottom→top: bass, mid, high):
+- **Rendering**: column iteration (not per-pixel). Each column draws 3 overlapping rectangles (bottom→top: bass, mid, high):
   - Bass: warm amber → white (`upper 3 bits` = whiteness 0–7)
   - Mid: lime green → white, 80% of bass height
   - High: steel blue → white, 60% of bass height
@@ -99,22 +105,32 @@ Frame("Player")
 
 ### Overview waveform (overview_area)
 - **Height**: 32px, `hexpand = true`
-- **Data source**: `overview_waveform` — PWAV bytes from ANLZ `.DAT` file
-- **Rendering**: monochrome bars, `v = 0.35 + whiteness * 0.45`; played portion has darker overlay left of playhead; white vertical position marker; colored cue ticks
-- **Fallback**: grey center line (0.5 alpha) when no waveform data
+- **Data source**: `overview_waveform` — PWAV bytes from ANLZ `.DAT` file (PWV7 color used for pre-rendered surface)
+- **Rendering**: pre-rendered to a `cairo::ImageSurface` once per track load (3-band color, same palette as zoomed). Blit the surface each frame, then overlay: darker region left of playhead, white position marker + red triangle, colored cue ticks
+- **Fallback**: grey center line (0.5 alpha) when no waveform data; position marker always drawn
 - **Interaction**:
-  - `button_press` → set `seeking=true`, `seek_to(frac * dur)`, update `pos_cell`
-  - `motion_notify` (BUTTON1_MASK) → `seek_to(frac * dur)`, update `pos_cell`
-  - `button_release` → clear `seeking`
+  - `button_press` → set `seeking=true`, visual update only
+  - `motion_notify` (BUTTON1_MASK) → visual update only
+  - `button_release` → `seek_to(frac * dur)`, debounced `WsEvent::Stream` (300ms, cancellable via `glib::source_remove`)
   - Note: `seek_to()` handles its own play-state restoration internally; do NOT pause before calling it
 
-### Timer (100ms glib timeout)
+### Timers
+**100ms timer** (main):
 ```
 tick % 3000 → refresh Spotify token
-Spotify active? → update title/art/pos labels, early return (no waveform update for Spotify)
+Spotify active? → update title/art/pos labels, early return
+detect new TV client (prev_client_count) → push full Metadata+Position+State to TV
+tv_live changed → update tv_btn sensitivity; if TV dropped while active → fall back to local
 is_started && sink_empty → track ended: fire on_track_end, auto-advance queue
-is_started && !seeking → update position_scale, time_label, waveform_pos_t/dur_t, queue_draw both areas
+is_started && !seeking → update position_scale, time_label, waveform_pos, queue_draw both areas
+tv_connected → broadcast WsEvent::Position every tick
 ```
+
+**16ms timer** (fast, zoomed waveform only):
+```
+is_playing || is_seeking → update pos_cell, queue_draw zoomed_area
+```
+Dedicated 60fps timer ensures smooth zoomed waveform scrolling independent of the 100ms main tick.
 
 ### do_load_track closure
 Called on drag-and-drop (id=0) and queue auto-advance. For tracks from the browser, `track.id` is the Rekordbox DB id.
@@ -124,15 +140,18 @@ Key steps:
 2. `state.load(path)` → rodio decoder, sets `duration_secs`
 3. If `db_duration > 0` from Rekordbox, override `duration_secs`
 4. Set `current_db_id` if `track_id != 0`
-5. Load cues from `lib.load_cues(track_id)` → populate `waveform_cues` + color hot-cue buttons
-6. Load waveform: resolve `track_id` (or look up by path for D&D), call `lib.load_waveform(id, &anlz_base)`
-7. `queue_draw` both waveform areas
+5. Load cues from `lib.load_cues(track_id)` → populate `waveform_cues` + color hot-cue buttons + update cue list panel timestamps
+6. Load waveform: resolve `track_id` (or look up by path for D&D), call `lib.load_waveform(id, &anlz_base)`; invalidates `overview_wf_surface` cache
+7. Store `last_metadata` for re-sending to newly connected TV clients
+8. If TV output active, keep local sink muted (volume = 0.0)
+9. `queue_draw` both waveform areas
 
 ### Hot cues
 - Slots 1–8, stored as `(in_secs, Option<out_secs>, slot)` in `waveform_cues`
 - `kind == 0` in `djmdCue` = memory cue (used as CUE button position)
-- `kind 1–8` = hot cues; button colored via inline GTK CSS
+- `kind 1–8` = hot cues; trigger buttons labeled A–H, colored via inline GTK CSS
 - Loop region: cue has `out_secs = Some(t)` → tinted rectangle in zoomed view
+- **Cue list panel** (right side): 8 clickable rows showing colored letter + timestamp; enabled only for slots that have a cue loaded; click seeks to that position
 
 ### Source badge
 - `"♦ LIBRARY"` — local Rekordbox track
@@ -275,8 +294,3 @@ If `track_id == 0` (drag-and-drop), `lib.track_id_by_path(path)` looks up by `Fo
 
 ---
 
-## Future work (saved from conversations)
-
-- **Waveform compute on add**: when adding tracks to the library, compute waveform data in Rekordbox format (FFT per frame, bass/mid/high bands) and write back to ANLZ files. This avoids needing rekordbox to analyze tracks before waveforms appear.
-- **Zoomed waveform zoom control**: currently fixed at 6s window; add pinch/scroll to zoom in/out.
-- **Set cue points from zoomed view**: long-press or right-click to set a hot cue at the current zoomed position.

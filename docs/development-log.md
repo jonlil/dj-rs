@@ -1,5 +1,41 @@
 # Development Log
 
+## 2026-03-15 — CDJ waveform rendering + PlayerView redesign
+
+### Features implemented
+
+**CDJ-style waveform rendering**
+- Zoomed waveform rewritten from per-pixel iteration to column iteration (~50 cairo calls vs ~1800), eliminating lag
+- 3-band color palette matching Rekordbox CDJ style: bass (amber), mid (lime), high (steel blue); whiteness blends toward white
+- Red downward triangle at playhead top (zoomed + overview)
+- Overview waveform pre-rendered to `cairo::ImageSurface` once per track load; subsequent frames blit the surface and overlay marker/cues
+- Dedicated 16ms (60fps) glib timer for zoomed waveform — smooth scrolling independent of the 100ms main timer
+
+**Samsung TV output improvements**
+- Overview seek sends `WsEvent::Stream` to TV on release (was missing — overview clicks only moved the local deck, not the TV stream)
+- 300ms debounce on overview seek: rapid clicks cancel and restart the timer rather than firing multiple stream events
+- `● Loc` / `TV` buttons are now mutually exclusive with an `output_switching` guard preventing recursive toggle
+- Full state (Metadata + Position + State + Stream if playing) pushed to TV when the TV toggle is activated or a new client connects
+- `prev_client_count` tracking detects new TV connections in the 100ms timer to re-send state automatically
+- Position broadcasts gated behind `tv_connected()` so events are not wasted when no TV is present
+
+**PlayerView layout redesign**
+- Removed `quantize_combo` (Q: Off/1/2 beat controls) entirely
+- New 3-column layout: left column (CUE + Play + output toggles) | center (waveforms) | right (cue list panel)
+- CUE and Play/Pause buttons styled as round buttons (`border-radius: 22px`)
+- Play button labels shortened to `▶` / `❚❚`
+- Output toggles (`● Loc` / `TV`) moved into the left column beside the waveforms
+- New cue list panel (right, 130px): 8 clickable rows with colored letter (A–H) + timestamp; clicking seeks to that cue
+- Hot cue trigger buttons relabeled A–H (was 1–8), arranged in a single row below the waveform area
+
+### Bugs fixed
+
+| Bug | Cause | Fix |
+|---|---|---|
+| Overview seek did not move TV playback | `WsEvent::Stream` never sent on overview seek | Added debounced Stream send on `button_release` |
+| Rapid overview clicks stopped TV playback | Multiple Stream events caused TV to repeatedly reconnect to ffmpeg | 300ms debounce with `glib::source_remove` cancellation |
+| Position marker missing with no waveform data | Marker was drawn inside `if let Some(data) = overview_waveform` | Moved marker draw outside the data block, reads `state.duration_secs` as fallback |
+
 ## 2026-03-14 — Library tooling & reload button
 
 ### Features implemented
