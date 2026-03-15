@@ -160,6 +160,16 @@ impl PlayerView {
         let waveform_dur: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         // seeking flag: true while scrubbing, prevents timer from fighting drag
         let seeking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // TV output active state
+        let tv_output: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        // Pending debounced TV Stream event for overview seek (cancelled on new click)
+        let pending_tv_stream: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        // Last loaded track metadata for re-sending when TV output is toggled on or a new client connects
+        let last_metadata: Rc<RefCell<Option<(String, String, f64)>>> = Rc::new(RefCell::new(None));
+        // Prevents recursive toggling between local/TV output buttons
+        let output_switching: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Tracks WS client count to detect new TV connections
+        let prev_client_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
         // (in_secs, out_secs, hot_cue_slot 1-8)
         let waveform_cues: Rc<RefCell<Vec<(f64, Option<f64>, usize)>>> = Rc::new(RefCell::new(Vec::new()));
         // color waveform: 3 bytes/col (bass, mid, high), lower 5 bits=height, upper 3=whiteness
@@ -181,7 +191,7 @@ impl PlayerView {
         const PLAYHEAD_FRAC: f64 = 0.25; // playhead x = width * 0.25
 
         let zoomed_area = gtk::DrawingArea::new();
-        zoomed_area.set_size_request(WAVEFORM_MIN_WIDTH, 80);
+        zoomed_area.set_size_request(WAVEFORM_MIN_WIDTH, 120);
         zoomed_area.set_hexpand(true);
         zoomed_area.add_events(
             gdk::EventMask::BUTTON_PRESS_MASK
@@ -208,7 +218,7 @@ impl PlayerView {
 
                 let pos_secs = pos_cell.get();
 
-                // Draw waveform columns
+                // Draw waveform columns (PWV7 format: 3 bytes/col, bass/mid/high)
                 if let Some(ref data) = *color_wave.borrow() {
                     let n_cols = data.len() / 3;
                     let dur = dur_cell.get();
@@ -220,26 +230,41 @@ impl PlayerView {
                             if t < 0.0 || t > dur { continue; }
                             let sample_idx = (t * samples_per_sec) as usize;
                             if sample_idx >= n_cols { continue; }
-                            let bass  = (data[sample_idx * 3]     & 0x1F) as f64 / 31.0;
-                            let mid   = (data[sample_idx * 3 + 1] & 0x1F) as f64 / 31.0;
-                            let high  = (data[sample_idx * 3 + 2] & 0x1F) as f64 / 31.0;
-                            let bw    = (data[sample_idx * 3]     >> 5)   as f64 / 7.0;
-                            let mw    = (data[sample_idx * 3 + 1] >> 5)   as f64 / 7.0;
-                            let hw    = (data[sample_idx * 3 + 2] >> 5)   as f64 / 7.0;
+                            let b0 = data[sample_idx * 3];
+                            let b1 = data[sample_idx * 3 + 1];
+                            let b2 = data[sample_idx * 3 + 2];
+                            let bass  = (b0 & 0x1F) as f64 / 31.0;
+                            let mid   = (b1 & 0x1F) as f64 / 31.0;
+                            let high  = (b2 & 0x1F) as f64 / 31.0;
+                            let bw    = (b0 >> 5) as f64 / 7.0;
+                            let mw    = (b1 >> 5) as f64 / 7.0;
+                            let hw    = (b2 >> 5) as f64 / 7.0;
 
-                            // Bass: orange-red, blended toward white by whiteness
+                            // Bass: warm amber → white
                             let h_bass = bass * half_h;
-                            cr.set_source_rgb(0.9 + bw * 0.1, 0.4 + bw * 0.6, bw * 0.4);
+                            cr.set_source_rgb(
+                                1.0,
+                                0.55 + bw * 0.45,
+                                bw * 0.5,
+                            );
                             cr.rectangle(px as f64, half_h - h_bass, 1.0, h_bass * 2.0);
                             cr.fill();
-                            // Mid: green, on top
-                            let h_mid = mid * half_h * 0.75;
-                            cr.set_source_rgb(mw * 0.4, 0.7 + mw * 0.3, mw * 0.4);
+                            // Mid: lime green → white, 80% of bass height
+                            let h_mid = mid * half_h * 0.80;
+                            cr.set_source_rgb(
+                                mw * 0.5,
+                                0.85 + mw * 0.15,
+                                mw * 0.3,
+                            );
                             cr.rectangle(px as f64, half_h - h_mid, 1.0, h_mid * 2.0);
                             cr.fill();
-                            // High: blue-white, on top
-                            let h_high = high * half_h * 0.5;
-                            cr.set_source_rgb(hw * 0.6 + 0.4, hw * 0.6 + 0.4, 1.0);
+                            // High: steel blue → white, 60% of bass height
+                            let h_high = high * half_h * 0.60;
+                            cr.set_source_rgb(
+                                0.35 + hw * 0.65,
+                                0.65 + hw * 0.35,
+                                1.0,
+                            );
                             cr.rectangle(px as f64, half_h - h_high, 1.0, h_high * 2.0);
                             cr.fill();
                         }
@@ -376,12 +401,14 @@ impl PlayerView {
             let dur_cell  = waveform_dur.clone();
             let cues_cell = waveform_cues.clone();
             let ov_wave   = overview_waveform.clone();
+            let state_ov_draw = state.clone();
             overview_area.connect_draw(move |w, cr| {
                 let alloc  = w.get_allocation();
                 let width  = alloc.width  as f64;
                 let height = alloc.height as f64;
                 let half_h = height / 2.0;
-                let dur    = dur_cell.get();
+                // Use state duration as fallback so marker shows even before first timer tick
+                let dur    = dur_cell.get().max(state_ov_draw.borrow().duration_secs);
                 let pos    = pos_cell.get();
 
                 // Background
@@ -442,32 +469,73 @@ impl PlayerView {
         }
 
         // Overview click/drag → seek
+        // Visual position updates immediately on press/drag; the actual audio seek
+        // and TV stream restart happen only on release to avoid hammering ffmpeg.
+        // TV Stream events are debounced: a pending one is cancelled if a new press arrives.
         {
-            let state_ov    = state.clone();
-            let pos_cell_ov = waveform_pos_secs.clone();
-            let dur_cell_ov = waveform_dur.clone();
+            let pos_cell_ov      = waveform_pos_secs.clone();
+            let dur_cell_ov      = waveform_dur.clone();
+            let seeking_ov       = seeking.clone();
+            let state_ov         = state.clone();
+            let pending_ov_press = pending_tv_stream.clone();
             overview_area.connect_button_press_event(move |w, ev| {
                 let dur = dur_cell_ov.get().max(state_ov.borrow().duration_secs);
                 if dur <= 0.0 { return gtk::Inhibit(false); }
+                // Cancel any pending debounced Stream event from the previous click
+                if let Some(id) = pending_ov_press.borrow_mut().take() {
+                    glib::source_remove(id);
+                }
                 let frac = (ev.get_position().0 / w.get_allocation().width as f64).clamp(0.0, 1.0);
-                let new_pos = frac * dur;
-                let _ = state_ov.borrow_mut().seek_to(new_pos);
-                pos_cell_ov.set(new_pos);
+                seeking_ov.set(true);
+                pos_cell_ov.set(frac * dur);
                 gtk::Inhibit(false)
             });
         }
         {
-            let state_ov    = state.clone();
-            let pos_cell_ov = waveform_pos_secs.clone();
-            let dur_cell_ov = waveform_dur.clone();
+            let pos_cell_ov  = waveform_pos_secs.clone();
+            let dur_cell_ov  = waveform_dur.clone();
+            let state_ov     = state.clone();
             overview_area.connect_motion_notify_event(move |w, ev| {
                 if ev.get_state().contains(gdk::ModifierType::BUTTON1_MASK) {
                     let dur = dur_cell_ov.get().max(state_ov.borrow().duration_secs);
                     if dur <= 0.0 { return gtk::Inhibit(false); }
                     let frac = (ev.get_position().0 / w.get_allocation().width as f64).clamp(0.0, 1.0);
-                    let new_pos = frac * dur;
-                    let _ = state_ov.borrow_mut().seek_to(new_pos);
-                    pos_cell_ov.set(new_pos);
+                    pos_cell_ov.set(frac * dur);
+                }
+                gtk::Inhibit(false)
+            });
+        }
+        {
+            let state_ov         = state.clone();
+            let pos_cell_ov      = waveform_pos_secs.clone();
+            let dur_cell_ov      = waveform_dur.clone();
+            let seeking_ov_rel   = seeking.clone();
+            let bridge_ov        = bridge.clone();
+            let tv_output_ov     = tv_output.clone();
+            let track_id_ov      = current_track_db_id.clone();
+            let pending_ov_rel   = pending_tv_stream.clone();
+            overview_area.connect_button_release_event(move |_, _| {
+                seeking_ov_rel.set(false);
+                let dur = dur_cell_ov.get().max(state_ov.borrow().duration_secs);
+                if dur <= 0.0 { return gtk::Inhibit(false); }
+                let new_pos = pos_cell_ov.get();
+                let _ = state_ov.borrow_mut().seek_to(new_pos);
+                bridge_ov.send(WsEvent::Position { pos: new_pos });
+                if *tv_output_ov.borrow() {
+                    if let Some(id) = *track_id_ov.borrow() {
+                        // Debounce: cancel previous pending Stream, schedule a new one
+                        if let Some(old) = pending_ov_rel.borrow_mut().take() {
+                            glib::source_remove(old);
+                        }
+                        let bridge_d  = bridge_ov.clone();
+                        let pending_d = pending_ov_rel.clone();
+                        let sid = glib::timeout_add_local(300, move || {
+                            *pending_d.borrow_mut() = None;
+                            bridge_d.send(WsEvent::Stream { id, seek: new_pos });
+                            glib::Continue(false)
+                        });
+                        *pending_ov_rel.borrow_mut() = Some(sid);
+                    }
                 }
                 gtk::Inhibit(false)
             });
@@ -532,7 +600,6 @@ impl PlayerView {
         let output_label = gtk::Label::new(Some("Output:"));
         let local_btn    = gtk::ToggleButton::with_label("● Local");
         local_btn.set_active(true);
-        local_btn.set_sensitive(false);  // always active for now
 
         let sink_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         sink_row.pack_start(&output_label, false, false, 0);
@@ -551,9 +618,6 @@ impl PlayerView {
         // ── Volume (hidden, used programmatically) ────────────────────────────
         let vol_adj = gtk::Adjustment::new(1.0, 0.0, 1.5, 0.01, 0.1, 0.0);
         let volume_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&vol_adj));
-
-        // TV output active state
-        let tv_output: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
         {
             let state = state.clone();
@@ -604,6 +668,8 @@ impl PlayerView {
             let hot_cue_btns_load   = hot_cue_btns.clone();
             let cue_loop_row_load   = cue_loop_row.clone();
             let config_load         = config.clone();
+            let last_metadata_load  = last_metadata.clone();
+            let tv_output_load      = tv_output.clone();
             Rc::new(move |track: Track| {
                 // Stop Spotify if it was playing so the deck takes over
                 if spotify_load.is_active() {
@@ -737,6 +803,11 @@ impl PlayerView {
                             time_label.set_text(&format!("-{}", fmt_time(dur)));
                         } else {
                             time_label.set_text("-?");
+                        }
+                        *last_metadata_load.borrow_mut() = Some((title.clone(), artist.clone(), dur));
+                        // If TV output is active, keep local sink muted (load() preserves volume)
+                        if *tv_output_load.borrow() {
+                            state.borrow().sink.set_volume(0.0);
                         }
                         bridge_load.send(WsEvent::Metadata { title, artist, duration: dur });
                         bridge_load.send(WsEvent::Position { pos: 0.0 });
@@ -946,26 +1017,71 @@ impl PlayerView {
             });
         }
 
-        // TV output toggle: mute local sink and stream to TV when active
+        // Output selection: Local and Samsung TV are mutually exclusive.
+        // output_switching prevents recursive toggling when one button activates/deactivates the other.
         {
             let state               = state.clone();
             let tv_output_btn       = tv_output.clone();
             let bridge_tv           = bridge.clone();
             let current_track_db_tv = current_track_db_id.clone();
             let volume_scale_tv     = volume_scale.clone();
+            let local_btn_tv        = local_btn.clone();
+            let switching_tv        = output_switching.clone();
+            let last_meta_tv        = last_metadata.clone();
             tv_btn.connect_toggled(move |btn| {
+                if switching_tv.get() { return; }
                 let active = btn.get_active();
                 *tv_output_btn.borrow_mut() = active;
                 if active {
+                    // Switched to TV output
+                    switching_tv.set(true);
+                    local_btn_tv.set_active(false);
+                    switching_tv.set(false);
                     state.borrow().sink.set_volume(0.0);
-                    if state.borrow().play_started_at.is_some() {
-                        let pos = state.borrow().current_position_secs();
+                    // Push current track state so the TV knows what's loaded
+                    if let Some((ref title, ref artist, duration)) = *last_meta_tv.borrow() {
+                        bridge_tv.send(WsEvent::Metadata {
+                            title: title.clone(), artist: artist.clone(), duration,
+                        });
+                    }
+                    let pos = state.borrow().current_position_secs();
+                    let is_playing = state.borrow().play_started_at.is_some();
+                    bridge_tv.send(WsEvent::Position { pos });
+                    bridge_tv.send(WsEvent::State { playing: is_playing });
+                    if is_playing {
                         if let Some(id) = *current_track_db_tv.borrow() {
                             bridge_tv.send(WsEvent::Stream { id, seek: pos });
                         }
                     }
                 } else {
+                    // Switched back to local output
+                    switching_tv.set(true);
+                    local_btn_tv.set_active(true);
+                    switching_tv.set(false);
                     state.borrow().sink.set_volume(volume_scale_tv.get_value() as f32);
+                }
+            });
+        }
+        {
+            let state               = state.clone();
+            let tv_output_local     = tv_output.clone();
+            let tv_btn_local        = tv_btn.clone();
+            let volume_scale_local  = volume_scale.clone();
+            let switching_local     = output_switching.clone();
+            local_btn.connect_toggled(move |btn| {
+                if switching_local.get() { return; }
+                if btn.get_active() {
+                    // User explicitly clicked Local — switch away from TV
+                    *tv_output_local.borrow_mut() = false;
+                    switching_local.set(true);
+                    tv_btn_local.set_active(false);
+                    switching_local.set(false);
+                    state.borrow().sink.set_volume(volume_scale_local.get_value() as f32);
+                } else {
+                    // Prevent deselecting Local without selecting something else
+                    switching_local.set(true);
+                    btn.set_active(true);
+                    switching_local.set(false);
                 }
             });
         }
@@ -1070,6 +1186,9 @@ impl PlayerView {
             let waveform_area_t      = waveform_area.clone();
             let overview_area_t      = overview_area.clone();
             let waveform_dur_t       = waveform_dur.clone();
+            let last_metadata_timer  = last_metadata.clone();
+            let prev_count_timer     = prev_client_count.clone();
+            let current_track_id_t   = current_track_db_id.clone();
             let mut tick: u32        = 0;
             glib::timeout_add_local(100, move || {
                 tick += 1;
@@ -1146,7 +1265,8 @@ impl PlayerView {
                 }
 
                 // Keep TV button in sync with connection state
-                let tv_live = bridge_timer.tv_connected();
+                let tv_count = bridge_timer.client_count.load(std::sync::atomic::Ordering::Relaxed);
+                let tv_live = tv_count > 0;
                 if tv_btn_timer.get_sensitive() != tv_live {
                     tv_btn_timer.set_sensitive(tv_live);
                 }
@@ -1156,6 +1276,25 @@ impl PlayerView {
                     tv_btn_timer.set_active(false);
                     state.borrow().sink.set_volume(volume_scale_timer.get_value() as f32);
                 }
+                // When a new TV client connects, push full current state so it's in sync immediately
+                let prev_count = prev_count_timer.get();
+                if tv_count > prev_count {
+                    if let Some((ref title, ref artist, duration)) = *last_metadata_timer.borrow() {
+                        bridge_timer.send(WsEvent::Metadata {
+                            title: title.clone(), artist: artist.clone(), duration,
+                        });
+                    }
+                    let pos = state.borrow().current_position_secs();
+                    let is_playing = state.borrow().play_started_at.is_some();
+                    bridge_timer.send(WsEvent::Position { pos });
+                    bridge_timer.send(WsEvent::State { playing: is_playing });
+                    if is_playing && *tv_output_timer.borrow() {
+                        if let Some(id) = *current_track_id_t.borrow() {
+                            bridge_timer.send(WsEvent::Stream { id, seek: pos });
+                        }
+                    }
+                }
+                prev_count_timer.set(tv_count);
 
                 // Apply any seek requested by the TV
                 if let Some(seek_pos) = bridge_timer.take_seek() {
@@ -1232,8 +1371,8 @@ impl PlayerView {
                     waveform_area_t.queue_draw();
                     overview_area_t.queue_draw();
 
-                    // Broadcast position to TV every ~1 second
-                    if tick % 10 == 0 {
+                    // Broadcast position to TV every ~1 second (only when connected)
+                    if tick % 10 == 0 && bridge_timer.tv_connected() {
                         bridge_timer.send(WsEvent::Position { pos });
                     }
                 }

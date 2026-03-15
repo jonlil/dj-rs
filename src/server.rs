@@ -54,7 +54,6 @@ pub struct ServerBridge {
 impl ServerBridge {
     /// Broadcast an event to all connected TV clients.
     pub fn send(&self, event: WsEvent) {
-        eprintln!("[ws] send {:?}", event);
         let _ = self.events.send(event);
     }
 

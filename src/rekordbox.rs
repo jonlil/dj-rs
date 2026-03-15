@@ -665,8 +665,9 @@ impl Library {
     /// Load waveform data by parsing the ANLZ binary files on disk.
     ///
     /// Returns `(color_waveform, overview_waveform)` where:
-    /// - `color_waveform`: PWV3 section from `.EXT` file — 3 bytes/col (bass, mid, high).
+    /// - `color_waveform`: PWV7 section from `.2EX` file — 3 bytes/col (bass, mid, high).
     ///   Each byte: lower 5 bits = height (0–31), upper 3 bits = whiteness (0–7).
+    ///   Falls back to PWV3 from `.EXT` if `.2EX` is absent (PWV3 is 1 byte/col, see note).
     /// - `overview_waveform`: PWAV section from `.DAT` file — 1 byte/col, same encoding.
     ///
     /// `anlz_base` is the directory under which PIONEER/USBANLZ/… lives.
@@ -678,20 +679,25 @@ impl Library {
             None => return Ok((None, None)),
         };
 
-        // Resolve .DAT and .EXT absolute paths
+        // Resolve .DAT, .EXT, .2EX absolute paths
         let rel = rel_path.trim_start_matches('/');
-        let dat_path = anlz_base.join(rel);
-        let ext_path = dat_path.with_extension("EXT");
+        let dat_path  = anlz_base.join(rel);
+        let ext_path  = dat_path.with_extension("EXT");
+        let ex2_path  = dat_path.with_extension("2EX");
 
         let overview = dat_path.exists()
             .then(|| std::fs::read(&dat_path).ok())
             .flatten()
             .and_then(|data| anlz_extract_section(&data, b"PWAV"));
 
-        let color = ext_path.exists()
-            .then(|| std::fs::read(&ext_path).ok())
-            .flatten()
-            .and_then(|data| anlz_extract_section(&data, b"PWV3"));
+        // PWV7 (.2EX) — true 3-byte CDJ color waveform (bass/mid/high per column)
+        // PWV3 (.EXT) — 1 byte per column with color index; not used for zoomed rendering
+        let color = if ex2_path.exists() {
+            std::fs::read(&ex2_path).ok()
+                .and_then(|data| anlz_extract_section(&data, b"PWV7"))
+        } else {
+            None
+        };
 
         Ok((color, overview))
     }

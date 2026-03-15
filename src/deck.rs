@@ -182,14 +182,18 @@ impl DeckState {
     pub fn seek_to(&mut self, pos: f64) -> Result<(), String> {
         let was_playing = self.play_started_at.is_some();
         if self.sink.try_seek(Duration::from_secs_f64(pos)).is_err() {
-            // Sink was empty (track ended) — reload and seek
-            let path = self.file_path.clone().ok_or("No track loaded")?;
-            let (cursor, _) = read_file(&path)?;
-            let decoder = make_decoder(cursor).map_err(|e| e.to_string())?;
-            self.sink.clear();
-            self.sink.append(decoder);
-            let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
+            // Sink was empty or seek unsupported — reload from scratch
+            if let Some(path) = self.file_path.clone() {
+                if let Ok((cursor, _)) = read_file(&path) {
+                    if let Ok(decoder) = make_decoder(cursor) {
+                        self.sink.clear();
+                        self.sink.append(decoder);
+                        let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
+                    }
+                }
+            }
         }
+        // Always update position tracking regardless of whether the sink seek worked
         if was_playing {
             self.sink.play();
         }
