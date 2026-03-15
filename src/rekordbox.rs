@@ -1,4 +1,5 @@
 use rusqlite::{Connection, Result, params};
+use std::convert::TryInto;
 
 const DB_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 
@@ -51,6 +52,29 @@ pub struct HistorySession {
     pub track_count: u32,
 }
 
+/// A cue point, loop, or hot cue entry from djmdCue.
+///
+/// Kind mapping:
+///   0 = Memory cue (main CUE button)
+///   1 = Hot cue H1
+///   2 = Hot cue H2
+///   3 = Hot cue H3
+///   4 = Hot cue H4
+///   5 = Hot cue H5 (and above)
+#[derive(Debug, Clone)]
+pub struct CuePoint {
+    /// 0 = memory cue, 1–8 = hot cue slots H1–H8
+    pub kind: i32,
+    /// Start position in seconds
+    pub in_secs: f64,
+    /// Loop end position in seconds; None if this is a point cue (OutMsec == -1)
+    pub out_secs: Option<f64>,
+    /// Color index: -1 = none, 255 = default
+    pub color: i32,
+    /// Optional user label
+    pub comment: String,
+}
+
 pub struct TrackFilter {
     pub bpm_min: Option<f32>,
     pub bpm_max: Option<f32>,
@@ -79,6 +103,45 @@ fn map_track_row(row: &rusqlite::Row) -> rusqlite::Result<Track> {
         color_id:      row.get(13)?,
         image_path:    row.get(14)?,
     })
+}
+
+/// Extract the data payload of the first ANLZ section matching `tag` (e.g. b"PWAV", b"PWV3").
+///
+/// ANLZ section layout (all big-endian u32):
+///   [0..4]   tag          4-byte ASCII
+///   [4..8]   header_len   bytes from tag start to data start
+///   [8..12]  section_len  total section size including header
+///   [12..header_len] extra header fields (ignored)
+///   [header_len..section_len] data
+fn anlz_extract_section(file: &[u8], tag: &[u8; 4]) -> Option<Vec<u8>> {
+    let file_len = file.len();
+    let mut offset = 0usize;
+
+    // Skip the file-level PMAI header (header_len bytes)
+    if file_len < 8 || &file[0..4] != b"PMAI" {
+        return None;
+    }
+    let pmai_hdr = u32::from_be_bytes(file[4..8].try_into().ok()?) as usize;
+    offset = pmai_hdr;
+
+    while offset + 12 <= file_len {
+        let sec_tag = &file[offset..offset + 4];
+        let hdr_len = u32::from_be_bytes(file[offset+4..offset+8].try_into().ok()?) as usize;
+        let sec_len = u32::from_be_bytes(file[offset+8..offset+12].try_into().ok()?) as usize;
+
+        if hdr_len < 12 || sec_len < hdr_len || offset + sec_len > file_len {
+            break;
+        }
+
+        if sec_tag == tag {
+            let data_start = offset + hdr_len;
+            let data_end   = offset + sec_len;
+            return Some(file[data_start..data_end].to_vec());
+        }
+
+        offset += sec_len;
+    }
+    None
 }
 
 impl Library {
@@ -155,6 +218,16 @@ impl Library {
             rusqlite::params![new_path, id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Look up a track ID by its stored FolderPath. Used to resolve drag-and-drop paths.
+    /// The caller should try both the raw path and any reverse-mapped variant.
+    pub fn track_id_by_path(&self, path: &str) -> Option<i64> {
+        self.conn.query_row(
+            "SELECT ID FROM djmdContent WHERE FolderPath = ?1 AND rb_local_deleted = 0 LIMIT 1",
+            params![path],
+            |row| row.get::<_, String>(0),
+        ).ok().and_then(|s| s.parse().ok())
     }
 
     /// Return the raw `FolderPath` for a single track (before path-mapping).
@@ -569,6 +642,87 @@ impl Library {
 impl Track {
     pub fn bpm_display(&self) -> Option<f32> {
         self.bpm.map(|b| b as f32 / 100.0)
+    }
+}
+
+impl Library {
+    /// Load all cue/loop/hot-cue points for a track, ordered by kind then position.
+    /// Load waveform blobs for a track.
+    /// Returns `(color_waveform, overview_waveform)` — either may be None if rekordbox
+    /// hasn't analyzed the track yet.
+    /// `ColorWaveFormData`: 3 bytes per column (bass, mid, high).
+    /// Fetch the `AnalysisDataPath` stored in djmdContent for a track.
+    /// The path is relative (e.g. `/PIONEER/USBANLZ/08e/…/ANLZ0000.DAT`).
+    pub fn analysis_data_path(&self, content_id: i64) -> Option<String> {
+        let id_str = content_id.to_string();
+        self.conn.query_row(
+            "SELECT AnalysisDataPath FROM djmdContent WHERE ID = ?1",
+            params![id_str],
+            |row| row.get::<_, Option<String>>(0),
+        ).ok().flatten()
+    }
+
+    /// Load waveform data by parsing the ANLZ binary files on disk.
+    ///
+    /// Returns `(color_waveform, overview_waveform)` where:
+    /// - `color_waveform`: PWV7 section from `.2EX` file — 3 bytes/col (bass, mid, high).
+    ///   Each byte: lower 5 bits = height (0–31), upper 3 bits = whiteness (0–7).
+    ///   Falls back to PWV3 from `.EXT` if `.2EX` is absent (PWV3 is 1 byte/col, see note).
+    /// - `overview_waveform`: PWAV section from `.DAT` file — 1 byte/col, same encoding.
+    ///
+    /// `anlz_base` is the directory under which PIONEER/USBANLZ/… lives.
+    pub fn load_waveform(&self, content_id: i64, anlz_base: &std::path::Path)
+        -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>
+    {
+        let rel_path = match self.analysis_data_path(content_id) {
+            Some(p) => p,
+            None => return Ok((None, None)),
+        };
+
+        // Resolve .DAT, .EXT, .2EX absolute paths
+        let rel = rel_path.trim_start_matches('/');
+        let dat_path  = anlz_base.join(rel);
+        let ext_path  = dat_path.with_extension("EXT");
+        let ex2_path  = dat_path.with_extension("2EX");
+
+        let overview = dat_path.exists()
+            .then(|| std::fs::read(&dat_path).ok())
+            .flatten()
+            .and_then(|data| anlz_extract_section(&data, b"PWAV"));
+
+        // PWV7 (.2EX) — true 3-byte CDJ color waveform (bass/mid/high per column)
+        // PWV3 (.EXT) — 1 byte per column with color index; not used for zoomed rendering
+        let color = if ex2_path.exists() {
+            std::fs::read(&ex2_path).ok()
+                .and_then(|data| anlz_extract_section(&data, b"PWV7"))
+        } else {
+            None
+        };
+
+        Ok((color, overview))
+    }
+
+    pub fn load_cues(&self, content_id: i64) -> Result<Vec<CuePoint>> {
+        let id_str = content_id.to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT Kind, InMsec, OutMsec, Color, Comment
+             FROM djmdCue
+             WHERE ContentID = ?1
+             ORDER BY Kind, InMsec",
+        )?;
+        let cues = stmt.query_map([&id_str], |row| {
+            let out_msec: i32 = row.get(2)?;
+            Ok(CuePoint {
+                kind:     row.get(0)?,
+                in_secs:  row.get::<_, i32>(1)? as f64 / 1000.0,
+                out_secs: if out_msec >= 0 { Some(out_msec as f64 / 1000.0) } else { None },
+                color:    row.get(3)?,
+                comment:  row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+        Ok(cues)
     }
 }
 

@@ -77,6 +77,14 @@ pub struct DeckState {
     pub duration_secs: f64,
     pub play_started_at: Option<Instant>,
     pub accumulated_secs: f64,
+    /// Position the CUE button returns to (seconds). Set on track load; updated when CUE is pressed while stopped.
+    pub cue_position: f64,
+    /// Loop in point (seconds), set by the IN button.
+    pub loop_in: Option<f64>,
+    /// Loop out point (seconds), set by the OUT button.
+    pub loop_out: Option<f64>,
+    /// Whether the loop is currently active.
+    pub loop_active: bool,
 }
 
 impl DeckState {
@@ -100,6 +108,10 @@ impl DeckState {
             duration_secs: 0.0,
             play_started_at: None,
             accumulated_secs: 0.0,
+            cue_position: 0.0,
+            loop_in: None,
+            loop_out: None,
+            loop_active: false,
         }
     }
 
@@ -125,10 +137,15 @@ impl DeckState {
         self.sink.clear();
         self.sink.set_volume(vol);
         self.sink.append(decoder);
+        self.sink.pause();  // clear() may leave sink un-paused; enforce paused state after load
 
         self.file_path = Some(path);
         self.accumulated_secs = 0.0;
         self.play_started_at = None;
+        self.cue_position = 0.0;
+        self.loop_in = None;
+        self.loop_out = None;
+        self.loop_active = false;
         Ok(warning)
     }
 
@@ -165,20 +182,40 @@ impl DeckState {
     pub fn seek_to(&mut self, pos: f64) -> Result<(), String> {
         let was_playing = self.play_started_at.is_some();
         if self.sink.try_seek(Duration::from_secs_f64(pos)).is_err() {
-            // Sink was empty (track ended) — reload and seek
-            let path = self.file_path.clone().ok_or("No track loaded")?;
-            let (cursor, _) = read_file(&path)?;
-            let decoder = make_decoder(cursor).map_err(|e| e.to_string())?;
-            self.sink.clear();
-            self.sink.append(decoder);
-            let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
+            // Sink was empty or seek unsupported — reload from scratch
+            if let Some(path) = self.file_path.clone() {
+                if let Ok((cursor, _)) = read_file(&path) {
+                    if let Ok(decoder) = make_decoder(cursor) {
+                        self.sink.clear();
+                        self.sink.append(decoder);
+                        let _ = self.sink.try_seek(Duration::from_secs_f64(pos));
+                    }
+                }
+            }
         }
+        // Always update position tracking regardless of whether the sink seek worked
         if was_playing {
             self.sink.play();
         }
         self.accumulated_secs = pos;
         self.play_started_at = if was_playing { Some(Instant::now()) } else { None };
         Ok(())
+    }
+
+    /// If a loop is active and the playhead has passed the out point, seek back to in point.
+    /// Call this every timer tick while playing.
+    pub fn check_loop(&mut self) {
+        if !self.loop_active { return; }
+        if let (Some(loop_in), Some(loop_out)) = (self.loop_in, self.loop_out) {
+            if self.current_position_secs() >= loop_out {
+                let _ = self.seek_to(loop_in);
+            }
+        }
+    }
+
+    /// Clear the active loop without clearing the stored in/out points.
+    pub fn deactivate_loop(&mut self) {
+        self.loop_active = false;
     }
 
     pub fn current_position_secs(&self) -> f64 {

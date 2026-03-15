@@ -118,14 +118,3 @@ When the Next Up track auto-loads:
 - **Reordering a queue**: there is nothing to reorder with a single slot.
 - **Multiple decks sharing one queue**: each `PlayerView` has its own Next Up slot.
 
----
-
-## TODO
-
-- [ ] Add `next_up: Option<Track>` to player state (`DeckState` or future `Player`)
-- [ ] Add Next Up row widget to `PlayerView` (hidden by default, shown when slot is filled)
-- [ ] Add `[ × ]` button wired to clear the slot and hide the row
-- [ ] Rename/add "Queue next" to the browser right-click context menu
-- [ ] On `on_track_end` callback: if Next Up is set, call `do_load_track(track)` + `play()`
-- [ ] Browser status column: show `→` next to the queued track row
-- [ ] Clear the browser highlight when Next Up is consumed or cancelled

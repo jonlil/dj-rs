@@ -1,5 +1,6 @@
 use gtk::prelude::*;
 use gdk_pixbuf::prelude::*;
+use cairo;
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -47,6 +48,103 @@ pub(self) const T_DURATION_RAW: u32 = 12;  // raw duration seconds i32 as string
 
 // ─── PlayerView ──────────────────────────────────────────────────────────────
 
+// Minimum waveform width in pixels; it expands freely above this.
+const WAVEFORM_MIN_WIDTH: i32 = 400;
+
+// Hot cue colours (simple palette, H1–H8)
+const HOT_CUE_COLORS: [(f64, f64, f64); 8] = [
+    (0.90, 0.20, 0.20),  // H1 red
+    (0.90, 0.50, 0.10),  // H2 orange
+    (0.85, 0.80, 0.10),  // H3 yellow
+    (0.20, 0.72, 0.20),  // H4 green
+    (0.10, 0.80, 0.80),  // H5 cyan
+    (0.20, 0.40, 0.90),  // H6 blue
+    (0.62, 0.18, 0.85),  // H7 purple
+    (0.75, 0.75, 0.75),  // H8 light grey
+];
+
+fn hot_cue_color(slot: usize) -> (f64, f64, f64) {
+    HOT_CUE_COLORS[slot.saturating_sub(1).min(7)]
+}
+
+/// Pre-render the overview waveform to an off-screen surface.
+/// Uses color data (PWV7) when available, falls back to greyscale (PWAV).
+/// Returns None only on surface creation failure.
+fn render_overview_surface(
+    color:    &Option<Vec<u8>>,
+    overview: &Option<Vec<u8>>,
+    width:    i32,
+    height:   i32,
+) -> Option<cairo::ImageSurface> {
+    let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, width, height).ok()?;
+    let cr = cairo::Context::new(&surface);
+    let w = width  as f64;
+    let h = height as f64;
+    let half_h = h / 2.0;
+
+    cr.set_source_rgb(0.08, 0.08, 0.08);
+    cr.rectangle(0.0, 0.0, w, h);
+    cr.fill();
+
+    if let Some(ref data) = color {
+        let n = data.len() / 3;
+        if n > 0 {
+            let col_w = (w / n as f64).max(1.0);
+            for i in 0..n {
+                let x   = i as f64 / n as f64 * w;
+                let b0  = data[i * 3];
+                let b1  = data[i * 3 + 1];
+                let b2  = data[i * 3 + 2];
+                let bass = (b0 & 0x1F) as f64 / 31.0;
+                let mid  = (b1 & 0x1F) as f64 / 31.0;
+                let high = (b2 & 0x1F) as f64 / 31.0;
+                let bw = (b0 >> 5) as f64 / 7.0;
+                let mw = (b1 >> 5) as f64 / 7.0;
+                let hw = (b2 >> 5) as f64 / 7.0;
+
+                let h_bass = bass * half_h;
+                cr.set_source_rgb(1.0, 0.55 + bw * 0.45, bw * 0.5);
+                cr.rectangle(x, half_h - h_bass, col_w, h_bass * 2.0);
+                cr.fill();
+
+                let h_mid = mid * half_h * 0.80;
+                cr.set_source_rgb(mw * 0.5, 0.85 + mw * 0.15, mw * 0.3);
+                cr.rectangle(x, half_h - h_mid, col_w, h_mid * 2.0);
+                cr.fill();
+
+                let h_high = high * half_h * 0.60;
+                cr.set_source_rgb(0.35 + hw * 0.65, 0.65 + hw * 0.35, 1.0);
+                cr.rectangle(x, half_h - h_high, col_w, h_high * 2.0);
+                cr.fill();
+            }
+        }
+    } else if let Some(ref data) = overview {
+        let n = data.len() as f64;
+        if n > 0.0 {
+            let col_w = (w / n).max(1.0);
+            for (i, &byte) in data.iter().enumerate() {
+                let x     = i as f64 / n * w;
+                let bh    = (byte & 0x1F) as f64 / 31.0 * half_h;
+                let white = ((byte >> 5) & 0x07) as f64 / 7.0;
+                let v     = 0.35 + white * 0.45;
+                cr.set_source_rgb(v, v, v);
+                cr.rectangle(x, half_h - bh, col_w, bh * 2.0);
+                cr.fill();
+            }
+        }
+    } else {
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.6);
+        cr.set_line_width(1.0);
+        cr.move_to(0.0, half_h);
+        cr.line_to(w, half_h);
+        cr.stroke();
+    }
+
+    Some(surface)
+}
+
+/// Format loop length as a human-readable label given a length in seconds and BPM.
+
 pub struct PlayerView {
     pub container: gtk::Frame,
     pub volume_scale: gtk::Scale,
@@ -64,29 +162,28 @@ impl PlayerView {
         let on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
 
         let frame = gtk::Frame::new(Some(deck_label));
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        vbox.set_border_width(8);
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        vbox.set_border_width(6);
 
-        // ── Info row: [album art] [title / BPM] [artist / Key] ──────────────
-
-        // Album art — shows track/album art when available, grey otherwise
+        // ── Album art channel ─────────────────────────────────────────────────
         let art_image = gtk::Image::new();
-        art_image.set_size_request(80, 80);
+        art_image.set_size_request(48, 48);
+        art_image.set_no_show_all(true);  // only visible when art is loaded
 
-        // Channel for background image fetches → GTK thread display
         let (art_tx, art_rx) = glib::MainContext::channel::<Option<Vec<u8>>>(glib::PRIORITY_LOW);
         {
             let art_image_rx = art_image.clone();
             art_rx.attach(None, move |bytes_opt| {
                 match bytes_opt {
-                    None => art_image_rx.clear(),
+                    None => { art_image_rx.clear(); art_image_rx.hide(); },
                     Some(bytes) => {
                         let loader = gdk_pixbuf::PixbufLoader::new();
                         let _ = loader.write(&bytes);
                         let _ = loader.close();
                         if let Some(pb) = loader.get_pixbuf() {
-                            let scaled = pb.scale_simple(80, 80, gdk_pixbuf::InterpType::Bilinear);
+                            let scaled = pb.scale_simple(48, 48, gdk_pixbuf::InterpType::Bilinear);
                             art_image_rx.set_from_pixbuf(scaled.as_ref());
+                            art_image_rx.show();
                         }
                     }
                 }
@@ -94,12 +191,28 @@ impl PlayerView {
             });
         }
 
+        // ── Spotify enrichment channel (BPM, key, waveform) ──────────────────
+        // Receives analysis data fetched in a background thread when a Spotify
+        // track loads, and updates the labels + waveform on the GTK thread.
+        struct SpotifyEnrichment {
+            bpm_str:  String,
+            key_str:  String,
+            waveform: Option<crate::spotify::SpotifyWaveform>,
+        }
+        let (sp_enrich_tx, sp_enrich_rx) =
+            glib::MainContext::channel::<SpotifyEnrichment>(glib::PRIORITY_LOW);
+
+        // ── Header: art | [title BPM source] / [artist key time] ─────────────
         let track_label = gtk::Label::new(Some("No track loaded"));
         track_label.set_xalign(0.0);
         track_label.set_hexpand(true);
+        // Note: set_ellipsize skipped due to pango version mismatch in deps
 
         let bpm_label = gtk::Label::new(None::<&str>);
         bpm_label.set_xalign(1.0);
+
+        let source_badge = gtk::Label::new(None::<&str>);
+        source_badge.set_xalign(1.0);
 
         let artist_label = gtk::Label::new(None::<&str>);
         artist_label.set_xalign(0.0);
@@ -108,78 +221,556 @@ impl PlayerView {
         let key_label = gtk::Label::new(None::<&str>);
         key_label.set_xalign(1.0);
 
-        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        title_row.pack_start(&track_label, true,  true,  0);
-        title_row.pack_end  (&bpm_label,   false, false, 0);
-
-        let artist_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        artist_row.pack_start(&artist_label, true,  true,  0);
-        artist_row.pack_end  (&key_label,    false, false, 0);
-
-        let meta_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        meta_box.pack_start(&title_row,  false, false, 0);
-        meta_box.pack_start(&artist_row, false, false, 0);
-
-        let info_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        info_row.pack_start(&art_image, false, false, 0);
-        info_row.pack_start(&meta_box,  true,  true,  0);
-
-        // ── Waveform row: [waveform placeholder] [-M:SS] ─────────────────────
-
-        // Waveform placeholder — grey bar; replaced later with ANLZ colour waveform
-        let waveform_area = gtk::DrawingArea::new();
-        waveform_area.set_size_request(-1, 80);
-        waveform_area.set_hexpand(true);
-        waveform_area.connect_draw(|w, cr| {
-            let alloc = w.get_allocation();
-            cr.set_source_rgb(0.15, 0.15, 0.15);
-            cr.rectangle(0.0, 0.0, alloc.width as f64, alloc.height as f64);
-            cr.fill();
-            gtk::Inhibit(false)
-        });
-
-        // Time display (remaining)
         let time_label = gtk::Label::new(Some("-0:00"));
         time_label.set_xalign(1.0);
 
-        let wave_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        wave_row.pack_start(&waveform_area, true,  true,  0);
-        wave_row.pack_end  (&time_label,    false, false, 4);
+        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        title_row.pack_start(&track_label,  true,  true,  0);
+        title_row.pack_end  (&source_badge, false, false, 0);
+        title_row.pack_end  (&bpm_label,    false, false, 0);
+
+        let artist_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        artist_row.pack_start(&artist_label, true,  true,  0);
+        artist_row.pack_end  (&time_label,   false, false, 0);
+        artist_row.pack_end  (&key_label,    false, false, 4);
+
+        let meta_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        meta_box.set_valign(gtk::Align::Center);
+        meta_box.pack_start(&title_row,  false, false, 0);
+        meta_box.pack_start(&artist_row, false, false, 0);
+
+        let info_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        info_row.pack_start(&art_image, false, false, 0);
+        info_row.pack_start(&meta_box,  true,  true,  0);
+
+        // ── Waveform shared state ─────────────────────────────────────────────
+        let waveform_pos_secs: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        let waveform_dur: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        // seeking flag: true while scrubbing, prevents timer from fighting drag
+        let seeking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // TV output active state
+        let tv_output: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        // Pre-rendered overview waveform surface (width, height, surface); None = needs re-render
+        let overview_wf_surface: Rc<RefCell<Option<(i32, i32, cairo::ImageSurface)>>> =
+            Rc::new(RefCell::new(None));
+        // Pending debounced TV Stream event for overview seek (cancelled on new click)
+        let pending_tv_stream: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        // Last loaded track metadata for re-sending when TV output is toggled on or a new client connects
+        let last_metadata: Rc<RefCell<Option<(String, String, f64)>>> = Rc::new(RefCell::new(None));
+        // Prevents recursive toggling between local/TV output buttons
+        let output_switching: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // Tracks WS client count to detect new TV connections
+        let prev_client_count: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        // (in_secs, out_secs, hot_cue_slot 1-8)
+        let waveform_cues: Rc<RefCell<Vec<(f64, Option<f64>, usize)>>> = Rc::new(RefCell::new(Vec::new()));
+        // color waveform: 3 bytes/col (bass, mid, high), lower 5 bits=height, upper 3=whiteness
+        let color_waveform: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+        // overview waveform: 1 byte/col
+        let overview_waveform: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+        // whether a waveform drag is actively scrubbing
+        let waveform_dragging: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // was playing before scratch drag began
+        let scratch_was_playing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // x position at drag start + track position at drag start (for relative scrub)
+        let scratch_start_x:   Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        let scratch_start_pos: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+
+        // ── Spotify enrichment receiver ───────────────────────────────────────
+        {
+            let bpm_lbl_rx   = bpm_label.clone();
+            let key_lbl_rx   = key_label.clone();
+            let color_wf_rx  = color_waveform.clone();
+            let ov_wf_rx     = overview_waveform.clone();
+            let ov_surf_rx   = overview_wf_surface.clone();
+            let wf_dur_rx    = waveform_dur.clone();
+            sp_enrich_rx.attach(None, move |data| {
+                bpm_lbl_rx.set_text(&data.bpm_str);
+                key_lbl_rx.set_text(&data.key_str);
+                if let Some(wf) = data.waveform {
+                    wf_dur_rx.set(wf.duration);
+                    *color_wf_rx.borrow_mut()  = Some(wf.color);
+                    *ov_wf_rx.borrow_mut()     = Some(wf.overview);
+                    *ov_surf_rx.borrow_mut()   = None; // invalidate pre-rendered surface
+                }
+                glib::Continue(true)
+            });
+        }
+
+        // ── Zoomed waveform ───────────────────────────────────────────────────
+        // Playhead sits at ~25% from left; waveform scrolls right-to-left.
+        // Window = 6 seconds total (1.5s behind, 4.5s ahead).
+        const ZOOM_WINDOW: f64 = 6.0;   // seconds total visible
+        const PLAYHEAD_FRAC: f64 = 0.25; // playhead x = width * 0.25
+
+        let zoomed_area = gtk::DrawingArea::new();
+        zoomed_area.set_size_request(WAVEFORM_MIN_WIDTH, 120);
+        zoomed_area.set_hexpand(true);
+        zoomed_area.add_events(
+            gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::BUTTON_RELEASE_MASK
+            | gdk::EventMask::BUTTON1_MOTION_MASK,
+        );
+
+        {
+            let pos_cell   = waveform_pos_secs.clone();
+            let dur_cell   = waveform_dur.clone();
+            let cues_cell  = waveform_cues.clone();
+            let color_wave = color_waveform.clone();
+            zoomed_area.connect_draw(move |w, cr| {
+                let alloc  = w.get_allocation();
+                let width  = alloc.width  as f64;
+                let height = alloc.height as f64;
+                let ph_x   = width * PLAYHEAD_FRAC; // playhead pixel x
+                let px_per_s = width / ZOOM_WINDOW;
+
+                // Background
+                cr.set_source_rgb(0.10, 0.10, 0.10);
+                cr.rectangle(0.0, 0.0, width, height);
+                cr.fill();
+
+                let pos_secs = pos_cell.get();
+
+                // Draw waveform columns (PWV7 format: 3 bytes/col, bass/mid/high)
+                // Iterate over visible waveform columns only — much faster than per-pixel loop.
+                if let Some(ref data) = *color_wave.borrow() {
+                    let n_cols = data.len() / 3;
+                    let dur = dur_cell.get();
+                    if n_cols > 0 && dur > 0.0 {
+                        let samples_per_sec = n_cols as f64 / dur;
+                        let half_h = height / 2.0;
+                        let col_px_w = (px_per_s / samples_per_sec).max(1.0);
+
+                        let t_start = pos_secs - PLAYHEAD_FRAC * ZOOM_WINDOW;
+                        let t_end   = pos_secs + (1.0 - PLAYHEAD_FRAC) * ZOOM_WINDOW;
+                        let col_start = ((t_start * samples_per_sec).floor() as i64).max(0) as usize;
+                        let col_end   = (((t_end * samples_per_sec).ceil() as usize) + 1).min(n_cols);
+
+                        for col in col_start..col_end {
+                            let t = col as f64 / samples_per_sec;
+                            let x = ph_x + (t - pos_secs) * px_per_s;
+                            if x + col_px_w < 0.0 || x > width { continue; }
+
+                            let idx = col * 3;
+                            let b0 = data[idx];
+                            let b1 = data[idx + 1];
+                            let b2 = data[idx + 2];
+                            let bass = (b0 & 0x1F) as f64 / 31.0;
+                            let mid  = (b1 & 0x1F) as f64 / 31.0;
+                            let high = (b2 & 0x1F) as f64 / 31.0;
+                            let bw = (b0 >> 5) as f64 / 7.0;
+                            let mw = (b1 >> 5) as f64 / 7.0;
+                            let hw = (b2 >> 5) as f64 / 7.0;
+
+                            let h_bass = bass * half_h;
+                            cr.set_source_rgb(1.0, 0.55 + bw * 0.45, bw * 0.5);
+                            cr.rectangle(x, half_h - h_bass, col_px_w, h_bass * 2.0);
+                            cr.fill();
+
+                            let h_mid = mid * half_h * 0.80;
+                            cr.set_source_rgb(mw * 0.5, 0.85 + mw * 0.15, mw * 0.3);
+                            cr.rectangle(x, half_h - h_mid, col_px_w, h_mid * 2.0);
+                            cr.fill();
+
+                            let h_high = high * half_h * 0.60;
+                            cr.set_source_rgb(0.35 + hw * 0.65, 0.65 + hw * 0.35, 1.0);
+                            cr.rectangle(x, half_h - h_high, col_px_w, h_high * 2.0);
+                            cr.fill();
+                        }
+                    }
+                } else {
+                    // No waveform data — visible placeholder
+                    cr.set_source_rgba(0.4, 0.4, 0.4, 0.8);
+                    cr.set_line_width(1.0);
+                    cr.move_to(0.0, height / 2.0);
+                    cr.line_to(width, height / 2.0);
+                    cr.stroke();
+                }
+
+                // Cue markers and loop regions
+                for (in_secs, out_secs, slot) in cues_cell.borrow().iter() {
+                    let (r, g, b) = hot_cue_color(*slot);
+                    let x_in = ph_x + (in_secs - pos_secs) * px_per_s;
+                    if let Some(out) = out_secs {
+                        let x_out = ph_x + (out - pos_secs) * px_per_s;
+                        let x0 = x_in.max(0.0);
+                        let x1 = x_out.min(width);
+                        if x1 > x0 {
+                            cr.set_source_rgba(r, g, b, 0.18);
+                            cr.rectangle(x0, 0.0, x1 - x0, height);
+                            cr.fill();
+                            cr.set_source_rgba(r, g, b, 0.8);
+                            cr.set_line_width(1.5);
+                            cr.move_to(x_out, 0.0);
+                            cr.line_to(x_out, height);
+                            cr.stroke();
+                        }
+                    }
+                    if x_in < -8.0 || x_in > width + 8.0 { continue; }
+                    cr.set_source_rgb(r, g, b);
+                    cr.set_line_width(1.5);
+                    cr.move_to(x_in, 0.0);
+                    cr.line_to(x_in, height);
+                    cr.stroke();
+                    cr.move_to(x_in - 5.0, height);
+                    cr.line_to(x_in + 5.0, height);
+                    cr.line_to(x_in,       height - 8.0);
+                    cr.close_path();
+                    cr.fill();
+                }
+
+                // Playhead: white vertical line at PLAYHEAD_FRAC
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.set_line_width(2.0);
+                cr.move_to(ph_x, 0.0);
+                cr.line_to(ph_x, height);
+                cr.stroke();
+
+                // Red downward triangle at top of playhead
+                cr.set_source_rgb(0.9, 0.15, 0.15);
+                cr.move_to(ph_x - 7.0, 0.0);
+                cr.line_to(ph_x + 7.0, 0.0);
+                cr.line_to(ph_x,       12.0);
+                cr.close_path();
+                cr.fill();
+
+                gtk::Inhibit(false)
+            });
+        }
+
+        // Zoomed area interaction — CDJ scratch style
+        {
+            let state_z      = state.clone();
+            let pos_cell_z   = waveform_pos_secs.clone();
+            let dragging_z   = waveform_dragging.clone();
+            let was_playing  = scratch_was_playing.clone();
+            let start_x      = scratch_start_x.clone();
+            let start_pos    = scratch_start_pos.clone();
+            let seeking_z    = seeking.clone();
+            zoomed_area.connect_button_press_event(move |w, ev| {
+                let width  = w.get_allocation().width as f64;
+                let px_per_s = width / ZOOM_WINDOW;
+                let ph_x   = width * PLAYHEAD_FRAC;
+                let click_x = ev.get_position().0;
+                // Jump to the clicked time position immediately
+                let dur = state_z.borrow().duration_secs;
+                let cur = pos_cell_z.get();
+                let new_pos = (cur + (click_x - ph_x) / px_per_s).clamp(0.0, dur.max(0.0));
+                let playing = state_z.borrow().play_started_at.is_some();
+                was_playing.set(playing);
+                if playing { state_z.borrow_mut().pause(); }
+                let _ = state_z.borrow_mut().seek_to(new_pos);
+                pos_cell_z.set(new_pos);
+                start_x.set(click_x);
+                start_pos.set(new_pos);
+                dragging_z.set(true);
+                seeking_z.set(true);
+                gtk::Inhibit(false)
+            });
+        }
+        {
+            let state_z    = state.clone();
+            let pos_cell_z = waveform_pos_secs.clone();
+            let dragging_z = waveform_dragging.clone();
+            let start_x    = scratch_start_x.clone();
+            let start_pos  = scratch_start_pos.clone();
+            zoomed_area.connect_motion_notify_event(move |w, ev| {
+                if !dragging_z.get() { return gtk::Inhibit(false); }
+                let width    = w.get_allocation().width as f64;
+                let px_per_s = width / ZOOM_WINDOW;
+                let dur = state_z.borrow().duration_secs;
+                let new_pos = (start_pos.get() + (ev.get_position().0 - start_x.get()) / px_per_s)
+                    .clamp(0.0, dur.max(0.0));
+                let _ = state_z.borrow_mut().seek_to(new_pos);
+                pos_cell_z.set(new_pos);
+                gtk::Inhibit(false)
+            });
+        }
+        {
+            let state_z    = state.clone();
+            let dragging_z = waveform_dragging.clone();
+            let was_playing = scratch_was_playing.clone();
+            let seeking_z  = seeking.clone();
+            zoomed_area.connect_button_release_event(move |_, _| {
+                if dragging_z.get() {
+                    dragging_z.set(false);
+                    seeking_z.set(false);
+                    if was_playing.get() {
+                        state_z.borrow_mut().play();
+                    }
+                }
+                gtk::Inhibit(false)
+            });
+        }
+
+        // ── Overview waveform ─────────────────────────────────────────────────
+        let overview_area = gtk::DrawingArea::new();
+        overview_area.set_size_request(WAVEFORM_MIN_WIDTH, 32);
+        overview_area.set_hexpand(true);
+        overview_area.add_events(
+            gdk::EventMask::BUTTON_PRESS_MASK
+            | gdk::EventMask::BUTTON_RELEASE_MASK
+            | gdk::EventMask::BUTTON1_MOTION_MASK,
+        );
+
+        {
+            let pos_cell      = waveform_pos_secs.clone();
+            let dur_cell      = waveform_dur.clone();
+            let cues_cell     = waveform_cues.clone();
+            let color_wave_ov = color_waveform.clone();
+            let ov_wave       = overview_waveform.clone();
+            let state_ov_draw = state.clone();
+            let ov_surface    = overview_wf_surface.clone();
+            overview_area.connect_draw(move |w, cr| {
+                let alloc  = w.get_allocation();
+                let width  = alloc.width  as f64;
+                let height = alloc.height as f64;
+                let half_h = height / 2.0;
+                let dur    = dur_cell.get().max(state_ov_draw.borrow().duration_secs);
+                let pos    = pos_cell.get();
+
+                // Ensure the pre-rendered surface matches current widget dimensions
+                let needs_render = {
+                    let s = ov_surface.borrow();
+                    s.as_ref().map_or(true, |(sw, sh, _)| *sw != alloc.width || *sh != alloc.height)
+                };
+                if needs_render {
+                    let new_surf = render_overview_surface(
+                        &color_wave_ov.borrow(),
+                        &ov_wave.borrow(),
+                        alloc.width, alloc.height,
+                    );
+                    *ov_surface.borrow_mut() = new_surf.map(|s| (alloc.width, alloc.height, s));
+                }
+
+                // Blit the pre-rendered waveform surface
+                {
+                    let s = ov_surface.borrow();
+                    if let Some((_, _, ref surf)) = *s {
+                        cr.set_source_surface(surf, 0.0, 0.0);
+                        cr.paint();
+                    }
+                }
+
+                if dur > 0.0 {
+                    let ph_x = (pos / dur * width).clamp(0.0, width);
+
+                    // Played portion overlay (darker tint left of playhead)
+                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+                    cr.rectangle(0.0, 0.0, ph_x, height);
+                    cr.fill();
+
+                    // Cue ticks
+                    for (in_secs, _, slot) in cues_cell.borrow().iter() {
+                        let (r, g, b) = hot_cue_color(*slot);
+                        let x = (in_secs / dur * width).clamp(0.0, width);
+                        cr.set_source_rgb(r, g, b);
+                        cr.rectangle(x - 1.0, 0.0, 2.0, height);
+                        cr.fill();
+                    }
+
+                    // Playhead: white vertical line
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(2.0);
+                    cr.move_to(ph_x, 0.0);
+                    cr.line_to(ph_x, height);
+                    cr.stroke();
+
+                    // Red downward triangle at top of playhead
+                    cr.set_source_rgb(0.9, 0.15, 0.15);
+                    cr.move_to(ph_x - 5.0, 0.0);
+                    cr.line_to(ph_x + 5.0, 0.0);
+                    cr.line_to(ph_x,       8.0);
+                    cr.close_path();
+                    cr.fill();
+                }
+
+                gtk::Inhibit(false)
+            });
+        }
+
+        // Overview click/drag → seek
+        // Visual position updates immediately on press/drag; the actual audio seek
+        // and TV stream restart happen only on release to avoid hammering ffmpeg.
+        // TV Stream events are debounced: a pending one is cancelled if a new press arrives.
+        {
+            let pos_cell_ov      = waveform_pos_secs.clone();
+            let dur_cell_ov      = waveform_dur.clone();
+            let seeking_ov       = seeking.clone();
+            let state_ov         = state.clone();
+            let pending_ov_press = pending_tv_stream.clone();
+            overview_area.connect_button_press_event(move |w, ev| {
+                let dur = dur_cell_ov.get().max(state_ov.borrow().duration_secs);
+                if dur <= 0.0 { return gtk::Inhibit(false); }
+                // Cancel any pending debounced Stream event from the previous click
+                if let Some(id) = pending_ov_press.borrow_mut().take() {
+                    glib::source_remove(id);
+                }
+                let frac = (ev.get_position().0 / w.get_allocation().width as f64).clamp(0.0, 1.0);
+                seeking_ov.set(true);
+                pos_cell_ov.set(frac * dur);
+                gtk::Inhibit(false)
+            });
+        }
+        {
+            let pos_cell_ov  = waveform_pos_secs.clone();
+            let dur_cell_ov  = waveform_dur.clone();
+            let state_ov     = state.clone();
+            overview_area.connect_motion_notify_event(move |w, ev| {
+                if ev.get_state().contains(gdk::ModifierType::BUTTON1_MASK) {
+                    let dur = dur_cell_ov.get().max(state_ov.borrow().duration_secs);
+                    if dur <= 0.0 { return gtk::Inhibit(false); }
+                    let frac = (ev.get_position().0 / w.get_allocation().width as f64).clamp(0.0, 1.0);
+                    pos_cell_ov.set(frac * dur);
+                }
+                gtk::Inhibit(false)
+            });
+        }
+        {
+            let state_ov         = state.clone();
+            let pos_cell_ov      = waveform_pos_secs.clone();
+            let dur_cell_ov      = waveform_dur.clone();
+            let seeking_ov_rel   = seeking.clone();
+            let bridge_ov        = bridge.clone();
+            let tv_output_ov     = tv_output.clone();
+            let track_id_ov      = current_track_db_id.clone();
+            let pending_ov_rel   = pending_tv_stream.clone();
+            overview_area.connect_button_release_event(move |_, _| {
+                seeking_ov_rel.set(false);
+                let dur = dur_cell_ov.get().max(state_ov.borrow().duration_secs);
+                if dur <= 0.0 { return gtk::Inhibit(false); }
+                let new_pos = pos_cell_ov.get();
+                let _ = state_ov.borrow_mut().seek_to(new_pos);
+                bridge_ov.send(WsEvent::Position { pos: new_pos });
+                if *tv_output_ov.borrow() {
+                    if let Some(id) = *track_id_ov.borrow() {
+                        // Debounce: cancel previous pending Stream, schedule a new one
+                        if let Some(old) = pending_ov_rel.borrow_mut().take() {
+                            glib::source_remove(old);
+                        }
+                        let bridge_d  = bridge_ov.clone();
+                        let pending_d = pending_ov_rel.clone();
+                        let sid = glib::timeout_add_local(300, move || {
+                            *pending_d.borrow_mut() = None;
+                            bridge_d.send(WsEvent::Stream { id, seek: new_pos });
+                            glib::Continue(false)
+                        });
+                        *pending_ov_rel.borrow_mut() = Some(sid);
+                    }
+                }
+                gtk::Inhibit(false)
+            });
+        }
+
+        // Bundle both areas as the waveform_area alias used later by timer
+        let waveform_area = zoomed_area.clone();
 
         // ── Position slider ───────────────────────────────────────────────────
-
         let pos_adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 0.001, 0.01, 0.0);
         let position_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&pos_adj));
         position_scale.set_draw_value(false);
         position_scale.set_hexpand(true);
         position_scale.set_sensitive(false);
 
-        // True while the user is holding the mouse button down on the slider
-        let seeking: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // ── Round transport buttons (CSS) ─────────────────────────────────────
+        let transport_css = gtk::CssProvider::new();
+        let _ = transport_css.load_from_data(
+            b"button.transport-btn { border-radius: 22px; min-width: 52px; min-height: 44px; padding: 0; font-size: 16px; font-weight: bold; }"
+        );
 
-        // ── Controls: [Cue] [▶/❚❚]  +  Convert/TV toggle (right) ───────────
+        let play_btn = gtk::Button::with_label("▶");
+        {
+            let ctx = play_btn.get_style_context();
+            ctx.add_class("transport-btn");
+            gtk::StyleContext::add_provider(&ctx, &transport_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
 
-        let play_btn    = gtk::Button::with_label("▶  Play");
-        let cue_btn     = gtk::Button::with_label("Cue");
-        let tv_btn      = gtk::ToggleButton::with_label("TV");
-        let convert_btn = gtk::Button::with_label("Convert to FLAC");
+        let cue_btn = gtk::Button::with_label("CUE");
+        {
+            let ctx = cue_btn.get_style_context();
+            ctx.add_class("transport-btn");
+            gtk::StyleContext::add_provider(&ctx, &transport_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
+
+        // ── Output toggle buttons ─────────────────────────────────────────────
+        let tv_btn    = gtk::ToggleButton::with_label("TV");
         tv_btn.set_sensitive(false);
+        let local_btn = gtk::ToggleButton::with_label("● Loc");
+        local_btn.set_active(true);
+
+        let out_label = gtk::Label::new(Some("Out"));
+        let out_row   = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        out_row.pack_start(&local_btn, false, false, 0);
+        out_row.pack_start(&tv_btn,    false, false, 0);
+
+        // ── Left column: [CUE] [▶] Out [● Loc][TV] ───────────────────────────
+        let left_col = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        left_col.set_size_request(90, -1);
+        left_col.pack_start(&cue_btn,   false, false, 0);
+        left_col.pack_start(&play_btn,  false, false, 0);
+        left_col.pack_start(&out_label, false, false, 2);
+        left_col.pack_start(&out_row,   false, false, 0);
+
+        // ── Hot cue buttons A–H (single row) ─────────────────────────────────
+        let hot_cue_btns: Vec<gtk::Button> = ["A","B","C","D","E","F","G","H"].iter()
+            .map(|lbl| {
+                let btn = gtk::Button::with_label(lbl);
+                btn.set_size_request(32, 28);
+                btn
+            })
+            .collect();
+
+        let hot_cue_grid = gtk::Grid::new();
+        hot_cue_grid.set_row_spacing(2);
+        hot_cue_grid.set_column_spacing(2);
+        for (i, btn) in hot_cue_btns.iter().enumerate() {
+            btn.set_sensitive(false);
+            hot_cue_grid.attach(btn, i as i32, 0, 1, 1);
+        }
+
+        let cue_loop_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        cue_loop_row.pack_start(&hot_cue_grid, false, false, 0);
+
+        // ── Cue list panel (right side, 8 clickable rows) ────────────────────
+        let cue_slot_labels = ["A","B","C","D","E","F","G","H"];
+        let mut cue_list_time_labels: Vec<gtk::Label> = Vec::new();
+        let mut cue_list_btns: Vec<gtk::Button> = Vec::new();
+        let cue_list_box = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        cue_list_box.set_size_request(130, -1);
+
+        for i in 0..8usize {
+            let (r, g, b) = hot_cue_color(i + 1);
+            let hex = format!("#{:02x}{:02x}{:02x}",
+                (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+            let letter_lbl = gtk::Label::new(None);
+            letter_lbl.set_markup(&format!("<span color=\"{hex}\" weight=\"bold\">{}</span>", cue_slot_labels[i]));
+            let time_lbl = gtk::Label::new(Some("  ──"));
+            time_lbl.set_xalign(0.0);
+            cue_list_time_labels.push(time_lbl.clone());
+
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            row_box.pack_start(&letter_lbl, false, false, 2);
+            row_box.pack_start(&time_lbl,   true,  false, 0);
+
+            let row_btn = gtk::Button::new();
+            row_btn.add(&row_box);
+            row_btn.set_sensitive(false);
+            cue_list_btns.push(row_btn.clone());
+            cue_list_box.pack_start(&row_btn, false, false, 0);
+        }
+
+        // ── Convert + error labels (hidden normally) ──────────────────────────
+        let convert_btn = gtk::Button::with_label("Convert to FLAC");
         convert_btn.set_no_show_all(true);
 
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        controls.pack_start(&cue_btn,     false, false, 0);
-        controls.pack_start(&play_btn,    false, false, 0);
-        controls.pack_end  (&tv_btn,      false, false, 0);
-        controls.pack_end  (&convert_btn, false, false, 0);
+        let error_label = gtk::Label::new(None::<&str>);
+        error_label.set_xalign(0.0);
+        error_label.set_line_wrap(true);
+        error_label.set_no_show_all(true);
 
-        // Volume scale (hidden, used programmatically)
+        // ── Volume (hidden, used programmatically) ────────────────────────────
         let vol_adj = gtk::Adjustment::new(1.0, 0.0, 1.5, 0.01, 0.1, 0.0);
         let volume_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&vol_adj));
 
-        // TV output active state (shared across closures on the GTK thread)
-        let tv_output: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-
-        // Wire volume slider so it respects TV-output mute
         {
             let state = state.clone();
             let tv_output_vol = tv_output.clone();
@@ -190,20 +781,22 @@ impl PlayerView {
             });
         }
 
-        // ── Error label (hidden until a load fails) ───────────────────────────
-
-        let error_label = gtk::Label::new(None::<&str>);
-        error_label.set_xalign(0.0);
-        error_label.set_line_wrap(true);
-        error_label.set_no_show_all(true);
 
         // ── Assemble ──────────────────────────────────────────────────────────
+        let center_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        center_col.pack_start(&zoomed_area,   true, true, 0);
+        center_col.pack_start(&overview_area, false, true, 0);
 
-        vbox.pack_start(&info_row,       false, false, 0);
-        vbox.pack_start(&wave_row,       false, false, 0);
-        vbox.pack_start(&position_scale, false, false, 0);
-        vbox.pack_start(&controls,       false, false, 0);
-        vbox.pack_start(&error_label,    false, false, 0);
+        let main_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        main_hbox.pack_start(&left_col,      false, false, 4);
+        main_hbox.pack_start(&center_col,    true,  true,  0);
+        main_hbox.pack_start(&cue_list_box,  false, false, 4);
+
+        vbox.pack_start(&info_row,     false, true,  0);
+        vbox.pack_start(&main_hbox,    true,  true,  4);
+        vbox.pack_start(&cue_loop_row, false, false, 0);
+        vbox.pack_start(&convert_btn,  false, false, 0);
+        vbox.pack_start(&error_label,  false, false, 0);
 
         frame.add(&vbox);
 
@@ -214,6 +807,7 @@ impl PlayerView {
             let artist_label       = artist_label.clone();
             let bpm_label          = bpm_label.clone();
             let key_label          = key_label.clone();
+            let source_badge       = source_badge.clone();
             let position_scale     = position_scale.clone();
             let time_label         = time_label.clone();
             let play_btn_load      = play_btn.clone();
@@ -223,6 +817,20 @@ impl PlayerView {
             let error_label_load   = error_label.clone();
             let convert_btn_load   = convert_btn.clone();
             let art_tx_load        = art_tx.clone();
+            let waveform_cues_load  = waveform_cues.clone();
+            let waveform_area_load  = waveform_area.clone();
+            let overview_area_load  = overview_area.clone();
+            let color_waveform_load = color_waveform.clone();
+            let overview_wf_load    = overview_waveform.clone();
+            let waveform_dur_load   = waveform_dur.clone();
+            let hot_cue_btns_load       = hot_cue_btns.clone();
+            let cue_loop_row_load       = cue_loop_row.clone();
+            let cue_list_btns_load      = cue_list_btns.clone();
+            let cue_list_time_lbl_load  = cue_list_time_labels.clone();
+            let config_load             = config.clone();
+            let last_metadata_load      = last_metadata.clone();
+            let tv_output_load          = tv_output.clone();
+            let ov_surface_load         = overview_wf_surface.clone();
             Rc::new(move |track: Track| {
                 // Stop Spotify if it was playing so the deck takes over
                 if spotify_load.is_active() {
@@ -232,32 +840,117 @@ impl PlayerView {
                     Some(p) => std::path::PathBuf::from(p),
                     None    => return,
                 };
+                let file_path_str = path.to_str().unwrap_or("").to_string();
                 let title  = track.title.clone();
                 let artist = track.artist.as_deref().unwrap_or("").to_string();
-                let bpm_str = track.bpm_display()
-                    .map(|b| format!("BPM: {:.1}", b))
-                    .unwrap_or_default();
-                let key_str = track.key.as_deref()
-                    .map(|k| format!("Key: {}", k))
-                    .unwrap_or_default();
+                let bpm_f  = track.bpm_display().unwrap_or(0.0) as f64;
+                let bpm_str = if bpm_f > 0.0 { format!("{:.1} BPM", bpm_f) } else { String::new() };
+                let key_str = track.key.as_deref().unwrap_or("").to_string();
                 let db_duration = track.duration_secs.map(|s| s as f64).unwrap_or(0.0);
                 let image_path  = track.image_path.clone();
+                let track_id    = track.id;
                 let load_result = state.borrow_mut().load(path);
                 match load_result {
                     Ok(warning) => {
-                        // DB duration is more reliable than rodio's total_duration
                         if db_duration > 0.0 {
                             state.borrow_mut().duration_secs = db_duration;
                         }
-                        if track.id != 0 {
-                            *current_db_id_load.borrow_mut() = Some(track.id);
+                        if track_id != 0 {
+                            *current_db_id_load.borrow_mut() = Some(track_id);
                         }
                         track_label.set_text(&title);
                         artist_label.set_text(&artist);
                         bpm_label.set_text(&bpm_str);
                         key_label.set_text(&key_str);
-                        play_btn_load.set_label("▶  Play");
+                        source_badge.set_text("♦ LIBRARY");
+                        play_btn_load.set_label("▶");
                         position_scale.set_sensitive(true);
+                        cue_loop_row_load.set_sensitive(true);
+
+                        // Load cue points from DB
+                        {
+                            let mut cues = waveform_cues_load.borrow_mut();
+                            cues.clear();
+                            // Reset all hot cue buttons and cue list to inactive
+                            for btn in &hot_cue_btns_load {
+                                btn.set_sensitive(false);
+                            }
+                            for (btn, lbl) in cue_list_btns_load.iter().zip(cue_list_time_lbl_load.iter()) {
+                                btn.set_sensitive(false);
+                                lbl.set_text("  ──");
+                            }
+                            if track_id != 0 {
+                                if let Some(db_path) = config_load.borrow().resolved_db_path() {
+                                    if let Ok(lib) = crate::rekordbox::Library::open(&db_path) {
+                                        if let Ok(cue_pts) = lib.load_cues(track_id) {
+                                            // Use the first memory cue (kind=0) as the CUE button position
+                                            if let Some(mem) = cue_pts.iter().find(|c| c.kind == 0) {
+                                                state.borrow_mut().cue_position = mem.in_secs;
+                                            }
+                                            for cp in &cue_pts {
+                                                let slot = cp.kind as usize; // 1-8 for hot cues
+                                                if slot >= 1 && slot <= 8 {
+                                                    cues.push((cp.in_secs, cp.out_secs, slot));
+                                                    let btn = &hot_cue_btns_load[slot - 1];
+                                                    let (r, g, b) = hot_cue_color(slot);
+                                                    btn.set_sensitive(true);
+                                                    // Apply colour via CSS
+                                                    let css = gtk::CssProvider::new();
+                                                    let hex = format!("#{:02x}{:02x}{:02x}",
+                                                        (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+                                                    let _ = css.load_from_data(
+                                                        format!("button {{ background: {hex}; color: #111; }}").as_bytes()
+                                                    );
+                                                    gtk::StyleContext::add_provider(
+                                                        &btn.get_style_context(), &css,
+                                                        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                                                    );
+                                                    // Update cue list panel
+                                                    let list_btn = &cue_list_btns_load[slot - 1];
+                                                    let list_lbl = &cue_list_time_lbl_load[slot - 1];
+                                                    list_btn.set_sensitive(true);
+                                                    list_lbl.set_text(&format!("  {}", fmt_time(cp.in_secs)));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Load waveform data from rekordbox DB
+                        let dur = state.borrow().duration_secs;
+                        waveform_dur_load.set(dur);
+                        *color_waveform_load.borrow_mut() = None;
+                        *overview_wf_load.borrow_mut()    = None;
+                        *ov_surface_load.borrow_mut()     = None; // invalidate pre-rendered surface
+                        {
+                            let cfg = config_load.borrow();
+                            if let Some(db_path) = cfg.resolved_db_path() {
+                                if let Ok(lib) = crate::rekordbox::Library::open(&db_path) {
+                                    // Resolve id: use track_id directly, or look up by path for D&D tracks
+                                    let resolved_id = if track_id != 0 {
+                                        track_id
+                                    } else {
+                                        let reversed = cfg.reverse_mappings(&file_path_str);
+                                        lib.track_id_by_path(&file_path_str)
+                                            .or_else(|| lib.track_id_by_path(&reversed))
+                                            .unwrap_or(0)
+                                    };
+                                    if resolved_id != 0 {
+                                        if let Some(base) = cfg.anlz_base_dir() {
+                                            if let Ok((color, overview)) = lib.load_waveform(resolved_id, &base) {
+                                                *color_waveform_load.borrow_mut() = color;
+                                                *overview_wf_load.borrow_mut()    = overview;
+                                                *ov_surface_load.borrow_mut()     = None; // force re-render with new data
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        waveform_area_load.queue_draw();
+                        overview_area_load.queue_draw();
+
                         if let Some(w) = warning {
                             error_label_load.set_text(&w);
                             error_label_load.show();
@@ -268,7 +961,7 @@ impl PlayerView {
                             error_label_load.set_text("");
                             error_label_load.hide();
                             convert_btn_load.hide();
-                        };
+                        }
                         // Load album art from rekordbox image path in background
                         let tx = art_tx_load.clone();
                         std::thread::spawn(move || {
@@ -281,11 +974,12 @@ impl PlayerView {
                         } else {
                             time_label.set_text("-?");
                         }
-                        bridge_load.send(WsEvent::Metadata {
-                            title,
-                            artist,
-                            duration: dur,
-                        });
+                        *last_metadata_load.borrow_mut() = Some((title.clone(), artist.clone(), dur));
+                        // If TV output is active, keep local sink muted (load() preserves volume)
+                        if *tv_output_load.borrow() {
+                            state.borrow().sink.set_volume(0.0);
+                        }
+                        bridge_load.send(WsEvent::Metadata { title, artist, duration: dur });
                         bridge_load.send(WsEvent::Position { pos: 0.0 });
                         bridge_load.send(WsEvent::State { playing: false });
                     }
@@ -337,22 +1031,22 @@ impl PlayerView {
                 if spotify_play.is_active() {
                     if spotify_play.is_paused() {
                         spotify_play.resume();
-                        play_btn_ref.set_label("❚❚  Pause");
+                        play_btn_ref.set_label("❚❚");
                     } else {
                         spotify_play.pause();
-                        play_btn_ref.set_label("▶  Play");
+                        play_btn_ref.set_label("▶");
                     }
                     return;
                 }
                 let is_playing = state.borrow().play_started_at.is_some();
                 if is_playing {
                     state.borrow_mut().pause();
-                    play_btn_ref.set_label("▶  Play");
+                    play_btn_ref.set_label("▶");
                     bridge_play.send(WsEvent::State { playing: false });
                 } else {
                     state.borrow_mut().play();
                     if state.borrow().play_started_at.is_some() {
-                        play_btn_ref.set_label("❚❚  Pause");
+                        play_btn_ref.set_label("❚❚");
                         if *tv_output_play.borrow() {
                             // Keep local audio muted; tell TV to stream
                             state.borrow().sink.set_volume(0.0);
@@ -367,7 +1061,7 @@ impl PlayerView {
             });
         }
 
-        // Cue button: stop and return to beginning
+        // CUE button: paused → jump to cue; playing → jump to cue and pause
         {
             let state          = state.clone();
             let play_btn       = play_btn.clone();
@@ -375,16 +1069,51 @@ impl PlayerView {
             let time_label     = time_label.clone();
             let bridge_cue     = bridge.clone();
             cue_btn.connect_clicked(move |_| {
-                state.borrow_mut().stop();
-                play_btn.set_label("▶  Play");
-                position_scale.set_value(0.0);
+                let cue_pos = state.borrow().cue_position;
+                let was_playing = state.borrow().play_started_at.is_some();
+                let _ = state.borrow_mut().seek_to(cue_pos);
+                if was_playing {
+                    state.borrow_mut().pause();
+                }
+                play_btn.set_label("▶");
                 let dur = state.borrow().duration_secs;
-                time_label.set_text(&format!(
-                    "-{}",
-                    if dur > 0.0 { fmt_time(dur) } else { "?".into() }
-                ));
+                let frac = if dur > 0.0 { (cue_pos / dur).min(1.0) } else { 0.0 };
+                position_scale.set_value(frac);
+                time_label.set_text(&format!("-{}", fmt_time((dur - cue_pos).max(0.0))));
                 bridge_cue.send(WsEvent::State    { playing: false });
-                bridge_cue.send(WsEvent::Position { pos: 0.0 });
+                bridge_cue.send(WsEvent::Position { pos: cue_pos });
+            });
+        }
+
+        // Hot cue buttons A–H: jump to stored position
+        for (i, btn) in hot_cue_btns.iter().enumerate() {
+            let slot             = i + 1;
+            let state            = state.clone();
+            let waveform_cues_hc = waveform_cues.clone();
+            btn.connect_clicked(move |_| {
+                let pos_opt = waveform_cues_hc.borrow()
+                    .iter()
+                    .find(|(_, _, s)| *s == slot)
+                    .map(|(p, _, _)| *p);
+                if let Some(pos) = pos_opt {
+                    let _ = state.borrow_mut().seek_to(pos);
+                }
+            });
+        }
+
+        // Cue list panel: click row to jump to cue
+        for (i, btn) in cue_list_btns.iter().enumerate() {
+            let slot             = i + 1;
+            let state            = state.clone();
+            let waveform_cues_cl = waveform_cues.clone();
+            btn.connect_clicked(move |_| {
+                let pos_opt = waveform_cues_cl.borrow()
+                    .iter()
+                    .find(|(_, _, s)| *s == slot)
+                    .map(|(p, _, _)| *p);
+                if let Some(pos) = pos_opt {
+                    let _ = state.borrow_mut().seek_to(pos);
+                }
             });
         }
 
@@ -474,26 +1203,80 @@ impl PlayerView {
             });
         }
 
-        // TV output toggle: mute local sink and stream to TV when active
+        // Output selection: Local and Samsung TV are mutually exclusive.
+        // output_switching prevents recursive toggling when one button activates/deactivates the other.
         {
-            let state               = state.clone();
-            let tv_output_btn       = tv_output.clone();
-            let bridge_tv           = bridge.clone();
-            let current_track_db_tv = current_track_db_id.clone();
-            let volume_scale_tv     = volume_scale.clone();
+            let state                   = state.clone();
+            let tv_output_btn           = tv_output.clone();
+            let bridge_tv               = bridge.clone();
+            let current_track_db_tv     = current_track_db_id.clone();
+            let volume_scale_tv         = volume_scale.clone();
+            let local_btn_tv            = local_btn.clone();
+            let switching_tv            = output_switching.clone();
+            let last_meta_tv            = last_metadata.clone();
+            let spotify_player_tv       = spotify_player.clone();
             tv_btn.connect_toggled(move |btn| {
+                if switching_tv.get() { return; }
                 let active = btn.get_active();
                 *tv_output_btn.borrow_mut() = active;
                 if active {
+                    // Switched to TV output
+                    switching_tv.set(true);
+                    local_btn_tv.set_active(false);
+                    switching_tv.set(false);
                     state.borrow().sink.set_volume(0.0);
-                    if state.borrow().play_started_at.is_some() {
-                        let pos = state.borrow().current_position_secs();
-                        if let Some(id) = *current_track_db_tv.borrow() {
+                    // Push current track state so the TV knows what's loaded
+                    if let Some((ref title, ref artist, duration)) = *last_meta_tv.borrow() {
+                        bridge_tv.send(WsEvent::Metadata {
+                            title: title.clone(), artist: artist.clone(), duration,
+                        });
+                    }
+                    let pos = state.borrow().current_position_secs();
+                    let is_playing = state.borrow().play_started_at.is_some();
+                    bridge_tv.send(WsEvent::Position { pos });
+                    bridge_tv.send(WsEvent::State { playing: is_playing });
+                    if is_playing {
+                        if spotify_player_tv.is_active() {
+                            // Spotify track — route live audio stream to TV
+                            spotify_player_tv.set_muted(true);
+                            bridge_tv.send(WsEvent::Spotifystream);
+                        } else if let Some(id) = *current_track_db_tv.borrow() {
                             bridge_tv.send(WsEvent::Stream { id, seek: pos });
                         }
                     }
                 } else {
+                    // Switched back to local output
+                    switching_tv.set(true);
+                    local_btn_tv.set_active(true);
+                    switching_tv.set(false);
                     state.borrow().sink.set_volume(volume_scale_tv.get_value() as f32);
+                    // Unmute Spotify if it was routed to TV
+                    if spotify_player_tv.is_active() {
+                        spotify_player_tv.set_muted(false);
+                    }
+                }
+            });
+        }
+        {
+            let state               = state.clone();
+            let tv_output_local     = tv_output.clone();
+            let tv_btn_local        = tv_btn.clone();
+            let volume_scale_local  = volume_scale.clone();
+            let switching_local     = output_switching.clone();
+            local_btn.connect_toggled(move |btn| {
+                if switching_local.get() { return; }
+                if btn.get_active() {
+                    // User explicitly clicked Local — switch away from TV
+                    *tv_output_local.borrow_mut() = false;
+                    switching_local.set(true);
+                    tv_btn_local.set_active(false);
+                    switching_local.set(false);
+                    state.borrow().sink.set_volume(volume_scale_local.get_value() as f32);
+                } else {
+                    // Prevent deselecting Local without selecting something else
+                    switching_local.set(true);
+                    btn.set_active(true);
+                    switching_local.set(false);
                 }
             });
         }
@@ -582,6 +1365,8 @@ impl PlayerView {
             let play_btn             = play_btn.clone();
             let track_label          = track_label.clone();
             let artist_label         = artist_label.clone();
+            let source_badge_t       = source_badge.clone();
+            let cue_loop_row_t       = cue_loop_row.clone();
             let current_track_db_id2 = current_track_db_id.clone();
             let on_track_end2        = on_track_end.clone();
             let bridge_timer         = bridge.clone();
@@ -590,9 +1375,23 @@ impl PlayerView {
             let volume_scale_timer   = volume_scale.clone();
             let spotify_player_timer = spotify_player.clone();
             let art_tx_timer         = art_tx.clone();
+            let sp_enrich_tx_timer   = sp_enrich_tx.clone();
             let config_timer         = config.clone();
             let seeking_timer        = seeking.clone();
+            let waveform_pos_t       = waveform_pos_secs.clone();
+            let waveform_area_t      = waveform_area.clone();
+            let overview_area_t      = overview_area.clone();
+            let waveform_dur_t       = waveform_dur.clone();
+            let last_metadata_timer  = last_metadata.clone();
+            let prev_count_timer     = prev_client_count.clone();
+            let current_track_id_t   = current_track_db_id.clone();
+            let color_waveform_t     = color_waveform.clone();
+            let overview_waveform_t  = overview_waveform.clone();
+            let ov_surface_t         = overview_wf_surface.clone();
+            let bpm_label_t          = bpm_label.clone();
+            let key_label_t          = key_label.clone();
             let mut tick: u32        = 0;
+            let mut spotify_was_active = false;
             glib::timeout_add_local(100, move || {
                 tick += 1;
 
@@ -625,48 +1424,105 @@ impl PlayerView {
 
                 // If Spotify (librespot) is the active audio source, update deck display from it
                 if spotify_player_timer.is_active() {
+                    let newly_active = !spotify_was_active;
+                    spotify_was_active = true;
+
                     // Pause local deck if it's still playing
                     if !state.borrow().sink.is_paused() {
                         state.borrow_mut().pause();
-                        play_btn.set_label("▶  Play");
+                        play_btn.set_label("▶");
                     }
+                    source_badge_t.set_text("♫ SPOTIFY");
+                    cue_loop_row_t.set_sensitive(false);
                     let (title, artist, dur) = spotify_player_timer.track_info();
                     let cur_text = track_label.get_text();
                     if cur_text != title {
                         track_label.set_text(&title);
                         artist_label.set_text(&artist);
                         position_scale.set_sensitive(true);
-                        // Fetch album art for the new Spotify track
+                        // Clear stale waveform/labels immediately
+                        bpm_label_t.set_text("");
+                        key_label_t.set_text("");
+                        *color_waveform_t.borrow_mut()  = None;
+                        *overview_waveform_t.borrow_mut() = None;
+                        *ov_surface_t.borrow_mut()      = None;
+                        waveform_area_t.queue_draw();
+                        overview_area_t.queue_draw();
+                        // Clear artwork immediately; new art will arrive async
+                        let _ = art_tx_timer.send(None);
+                        // Push new metadata to TV
+                        if bridge_timer.tv_connected() {
+                            bridge_timer.send(WsEvent::Metadata {
+                                title: title.clone(), artist: artist.clone(), duration: dur,
+                            });
+                            // Restart Spotify audio stream on TV for the new track
+                            if *tv_output_timer.borrow() {
+                                bridge_timer.send(WsEvent::Spotifystream);
+                            }
+                        }
                         let uri   = spotify_player_timer.current_uri();
                         let token = spotify_player_timer.access_token();
                         if let Some(token) = token {
                             if let Some(track_id) = uri.split(':').nth(2).map(|s| s.to_string()) {
-                                let tx = art_tx_timer.clone();
+                                // Fetch art
+                                let art_tx = art_tx_timer.clone();
+                                let tok2   = token.clone();
+                                let tid2   = track_id.clone();
                                 std::thread::spawn(move || {
-                                    let bytes = crate::spotify::fetch_track_image_url(&token, &track_id)
+                                    let bytes = crate::spotify::fetch_track_image_url(&tok2, &tid2)
                                         .and_then(|url| reqwest::blocking::get(&url).ok())
                                         .and_then(|r| r.bytes().ok())
                                         .map(|b| b.to_vec());
-                                    let _ = tx.send(bytes);
+                                    let _ = art_tx.send(bytes);
+                                });
+                                // Fetch audio features + analysis in background
+                                let enrich_tx = sp_enrich_tx_timer.clone();
+                                std::thread::spawn(move || {
+                                    let bpm_str = crate::spotify::fetch_audio_features(&token, &track_id)
+                                        .map(|f| {
+                                            let key = crate::spotify::to_camelot(f.key, f.mode);
+                                            (format!("{:.1} BPM", f.tempo), key)
+                                        });
+                                    let waveform = crate::spotify::fetch_audio_analysis(&token, &track_id);
+                                    let (bpm, key) = bpm_str.unwrap_or_default();
+                                    let _ = enrich_tx.send(SpotifyEnrichment {
+                                        bpm_str: bpm, key_str: key, waveform,
+                                    });
                                 });
                             }
                         }
                     }
                     // Sync play/pause button label with librespot state
-                    let expected_label = if spotify_player_timer.is_paused() { "▶  Play" } else { "❚❚  Pause" };
+                    let expected_label = if spotify_player_timer.is_paused() { "▶" } else { "❚❚" };
                     if play_btn.get_label().as_deref() != Some(expected_label) {
                         play_btn.set_label(expected_label);
                     }
                     let pos = spotify_player_timer.current_position_secs();
                     let fraction = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
-                    position_scale.set_value(fraction);
+                    if !seeking_timer.get() {
+                        position_scale.set_value(fraction);
+                    }
                     let remaining = if dur > 0.0 { (dur - pos).max(0.0) } else { 0.0 };
                     time_label.set_text(&format!("-{}", fmt_time(remaining)));
+                    // Route audio to TV if TV output is active (first activation)
+                    if newly_active && *tv_output_timer.borrow() {
+                        spotify_player_timer.set_muted(true);
+                        bridge_timer.send(WsEvent::Metadata {
+                            title: title.clone(), artist: artist.clone(), duration: dur,
+                        });
+                        bridge_timer.send(WsEvent::Spotifystream);
+                    }
+                    // Sync position to TV
+                    if bridge_timer.tv_connected() {
+                        bridge_timer.send(WsEvent::Position { pos });
+                    }
                     return glib::Continue(true);
                 }
+                spotify_was_active = false;
 
                 // Keep TV button in sync with connection state
-                let tv_live = bridge_timer.tv_connected();
+                let tv_count = bridge_timer.client_count.load(std::sync::atomic::Ordering::Relaxed);
+                let tv_live = tv_count > 0;
                 if tv_btn_timer.get_sensitive() != tv_live {
                     tv_btn_timer.set_sensitive(tv_live);
                 }
@@ -676,6 +1532,25 @@ impl PlayerView {
                     tv_btn_timer.set_active(false);
                     state.borrow().sink.set_volume(volume_scale_timer.get_value() as f32);
                 }
+                // When a new TV client connects, push full current state so it's in sync immediately
+                let prev_count = prev_count_timer.get();
+                if tv_count > prev_count {
+                    if let Some((ref title, ref artist, duration)) = *last_metadata_timer.borrow() {
+                        bridge_timer.send(WsEvent::Metadata {
+                            title: title.clone(), artist: artist.clone(), duration,
+                        });
+                    }
+                    let pos = state.borrow().current_position_secs();
+                    let is_playing = state.borrow().play_started_at.is_some();
+                    bridge_timer.send(WsEvent::Position { pos });
+                    bridge_timer.send(WsEvent::State { playing: is_playing });
+                    if is_playing && *tv_output_timer.borrow() {
+                        if let Some(id) = *current_track_id_t.borrow() {
+                            bridge_timer.send(WsEvent::Stream { id, seek: pos });
+                        }
+                    }
+                }
+                prev_count_timer.set(tv_count);
 
                 // Apply any seek requested by the TV
                 if let Some(seek_pos) = bridge_timer.take_seek() {
@@ -713,7 +1588,7 @@ impl PlayerView {
                         st.play_started_at = None;
                         st.accumulated_secs = 0.0;
                     }
-                    play_btn.set_label("▶  Play");
+                    play_btn.set_label("▶");
                     position_scale.set_value(0.0);
                     let dur = state.borrow().duration_secs;
                     time_label.set_text(&format!("-{}", fmt_time(dur)));
@@ -724,7 +1599,7 @@ impl PlayerView {
                         do_load(track);
                         state.borrow_mut().play();
                         if state.borrow().play_started_at.is_some() {
-                            play_btn.set_label("❚❚  Pause");
+                            play_btn.set_label("❚❚");
                             if *tv_output_timer.borrow() {
                                 state.borrow().sink.set_volume(0.0);
                                 if let Some(id) = *current_track_db_id2.borrow() {
@@ -747,13 +1622,37 @@ impl PlayerView {
                     position_scale.set_value(fraction);
                     let remaining = if dur > 0.0 { (dur - pos).max(0.0) } else { 0.0 };
                     time_label.set_text(&format!("-{}", fmt_time(remaining)));
+                    waveform_pos_t.set(pos);
+                    waveform_dur_t.set(dur);
+                    waveform_area_t.queue_draw();
+                    overview_area_t.queue_draw();
 
-                    // Broadcast position to TV every ~1 second
-                    if tick % 10 == 0 {
+                    // Broadcast position to TV every ~1 second (only when connected)
+                    if tick % 10 == 0 && bridge_timer.tv_connected() {
                         bridge_timer.send(WsEvent::Position { pos });
                     }
                 }
 
+                glib::Continue(true)
+            });
+        }
+
+        // Fast 60fps timer — updates zoomed waveform position and queues a redraw.
+        // Separate from the 100ms timer so the waveform scrolls smoothly during playback.
+        {
+            let state_fast    = state.clone();
+            let seeking_fast  = seeking.clone();
+            let pos_cell_fast = waveform_pos_secs.clone();
+            let zoomed_fast   = zoomed_area.clone();
+            glib::timeout_add_local(16, move || {
+                let is_playing = state_fast.borrow().play_started_at.is_some();
+                let is_seeking = seeking_fast.get();
+                if is_playing || is_seeking {
+                    if is_playing && !is_seeking {
+                        pos_cell_fast.set(state_fast.borrow().current_position_secs());
+                    }
+                    zoomed_fast.queue_draw();
+                }
                 glib::Continue(true)
             });
         }
@@ -784,6 +1683,7 @@ impl MainView {
         container.set_border_width(8);
 
         let spotify_player = LibrespotPlayer::new();
+        spotify_player.set_audio_tx(bridge.spotify_audio.clone());
         let player = PlayerView::new(window, "Player", bridge, spotify_player.clone(), config);
         let queue_fn = player.queue_fn.clone();
         let current_track_db_id = player.current_track_db_id.clone();

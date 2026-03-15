@@ -62,6 +62,43 @@ impl Config {
         }
         path.to_string()
     }
+
+    /// Reverse-apply mappings: convert a local path back to a rekordbox-stored path.
+    /// (Swaps `to` → `from` direction.)
+    pub fn reverse_mappings(&self, path: &str) -> String {
+        for m in &self.path_mappings {
+            if !m.to.is_empty() && path.starts_with(&m.to) {
+                return format!("{}{}", m.from, &path[m.to.len()..]);
+            }
+        }
+        path.to_string()
+    }
+
+    /// Return the local directory that is the root for ANLZ analysis files.
+    ///
+    /// Primary: the directory containing master.db (e.g. `~/.local/share/dj-rs/`).
+    /// Fallback: derived from the first path mapping's `from` parent + `share`
+    ///           (for dev setups where ANLZ files live in the project tree).
+    pub fn anlz_base_dir(&self) -> Option<PathBuf> {
+        // Primary: co-located with master.db
+        if let Some(db) = self.resolved_db_path() {
+            let db_dir = std::path::Path::new(&db).parent()?;
+            let pioneer = db_dir.join("PIONEER");
+            if pioneer.exists() {
+                return Some(db_dir.to_path_buf());
+            }
+        }
+        // Fallback: project-tree share dir next to music mapping
+        for m in &self.path_mappings {
+            if m.from.is_empty() { continue; }
+            let from = std::path::Path::new(&m.from);
+            let base = from.parent().unwrap_or(from).join("share");
+            if base.join("PIONEER").exists() {
+                return Some(base);
+            }
+        }
+        None
+    }
 }
 
 /// Default location for the Rekordbox library database on Linux:

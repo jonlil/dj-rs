@@ -290,3 +290,106 @@ pub fn fetch_track_image_url(access_token: &str, track_id: &str) -> Option<Strin
     images.last().or_else(|| images.first()).map(|i| i.url.clone())
 }
 
+// ── Audio features (BPM + key) ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AudioFeatures {
+    pub tempo: f32,
+    pub key:   i32,   // pitch class 0–11, -1 = unknown
+    pub mode:  i32,   // 0 = minor, 1 = major
+}
+
+pub fn fetch_audio_features(access_token: &str, track_id: &str) -> Option<AudioFeatures> {
+    Client::new()
+        .get(&format!("https://api.spotify.com/v1/audio-features/{track_id}"))
+        .bearer_auth(access_token)
+        .send().ok()?
+        .json::<AudioFeatures>().ok()
+}
+
+/// Convert Spotify pitch class + mode to Camelot notation (e.g. "8A", "9B").
+pub fn to_camelot(key: i32, mode: i32) -> String {
+    if !(0..=11).contains(&key) { return String::new(); }
+    // pitch class: 0=C, 1=C#, 2=D, 3=D#, 4=E, 5=F, 6=F#, 7=G, 8=G#, 9=A, 10=A#, 11=B
+    const MAJOR: [&str; 12] = ["8B","3B","10B","5B","12B","7B","2B","9B","4B","11B","6B","1B"];
+    const MINOR: [&str; 12] = ["5A","12A","7A","2A","9A","4A","11A","6A","1A","8A","3A","10A"];
+    if mode == 1 { MAJOR[key as usize].to_string() }
+    else          { MINOR[key as usize].to_string() }
+}
+
+// ── Audio analysis → waveform ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AudioAnalysisResponse {
+    segments: Vec<AnalysisSegment>,
+    track:    AnalysisTrackMeta,
+}
+
+#[derive(Deserialize)]
+struct AnalysisTrackMeta {
+    duration: f64,
+}
+
+#[derive(Deserialize)]
+struct AnalysisSegment {
+    start:        f64,
+    loudness_max: f32,
+    timbre:       Vec<f32>,
+}
+
+pub struct SpotifyWaveform {
+    /// PWV7: 3 bytes/col (bass, mid, high). lower 5 bits = height 0–31.
+    pub color:    Vec<u8>,
+    /// PWAV: 1 byte/col, same encoding.
+    pub overview: Vec<u8>,
+    pub duration: f64,
+}
+
+/// Fetch audio analysis and build PWV7/PWAV waveform buffers.
+pub fn fetch_audio_analysis(access_token: &str, track_id: &str) -> Option<SpotifyWaveform> {
+    let resp: AudioAnalysisResponse = Client::new()
+        .get(&format!("https://api.spotify.com/v1/audio-analysis/{track_id}"))
+        .bearer_auth(access_token)
+        .send().ok()?
+        .json().ok()?;
+
+    let duration = resp.track.duration;
+    let segments = resp.segments;
+    if segments.is_empty() || duration <= 0.0 { return None; }
+
+    // ~10 columns/second, capped to 10 000
+    let n_cols = ((duration * 10.0) as usize).clamp(100, 10_000);
+    let secs_per_col = duration / n_cols as f64;
+
+    // Pre-build sorted start-time list for binary search
+    let starts: Vec<f64> = segments.iter().map(|s| s.start).collect();
+
+    let mut color    = Vec::with_capacity(n_cols * 3);
+    let mut overview = Vec::with_capacity(n_cols);
+
+    for col in 0..n_cols {
+        let t   = col as f64 * secs_per_col;
+        let idx = starts.partition_point(|&s| s <= t).saturating_sub(1);
+        let seg = &segments[idx];
+
+        // Normalise loudness_max from dB (−60..0) → 0..1
+        let energy = ((seg.loudness_max + 60.0) / 60.0).clamp(0.0, 1.0);
+
+        // timbre[1] ≈ spectral brightness (range ~−100..+100)
+        let brightness = seg.timbre.get(1)
+            .map(|&v| ((v + 100.0) / 200.0).clamp(0.0, 1.0))
+            .unwrap_or(0.5);
+
+        let bass_h = (energy              * 31.0) as u8;
+        let mid_h  = (energy * 0.75       * 31.0) as u8;
+        let high_h = (energy * brightness  * 31.0) as u8;
+
+        color.push(bass_h & 0x1F);
+        color.push(mid_h  & 0x1F);
+        color.push(high_h & 0x1F);
+        overview.push(bass_h & 0x1F);
+    }
+
+    Some(SpotifyWaveform { color, overview, duration })
+}
+
