@@ -191,6 +191,17 @@ impl PlayerView {
             });
         }
 
+        // ── Spotify enrichment channel (BPM, key, waveform) ──────────────────
+        // Receives analysis data fetched in a background thread when a Spotify
+        // track loads, and updates the labels + waveform on the GTK thread.
+        struct SpotifyEnrichment {
+            bpm_str:  String,
+            key_str:  String,
+            waveform: Option<crate::spotify::SpotifyWaveform>,
+        }
+        let (sp_enrich_tx, sp_enrich_rx) =
+            glib::MainContext::channel::<SpotifyEnrichment>(glib::PRIORITY_LOW);
+
         // ── Header: art | [title BPM source] / [artist key time] ─────────────
         let track_label = gtk::Label::new(Some("No track loaded"));
         track_label.set_xalign(0.0);
@@ -263,6 +274,27 @@ impl PlayerView {
         // x position at drag start + track position at drag start (for relative scrub)
         let scratch_start_x:   Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         let scratch_start_pos: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+
+        // ── Spotify enrichment receiver ───────────────────────────────────────
+        {
+            let bpm_lbl_rx   = bpm_label.clone();
+            let key_lbl_rx   = key_label.clone();
+            let color_wf_rx  = color_waveform.clone();
+            let ov_wf_rx     = overview_waveform.clone();
+            let ov_surf_rx   = overview_wf_surface.clone();
+            let wf_dur_rx    = waveform_dur.clone();
+            sp_enrich_rx.attach(None, move |data| {
+                bpm_lbl_rx.set_text(&data.bpm_str);
+                key_lbl_rx.set_text(&data.key_str);
+                if let Some(wf) = data.waveform {
+                    wf_dur_rx.set(wf.duration);
+                    *color_wf_rx.borrow_mut()  = Some(wf.color);
+                    *ov_wf_rx.borrow_mut()     = Some(wf.overview);
+                    *ov_surf_rx.borrow_mut()   = None; // invalidate pre-rendered surface
+                }
+                glib::Continue(true)
+            });
+        }
 
         // ── Zoomed waveform ───────────────────────────────────────────────────
         // Playhead sits at ~25% from left; waveform scrolls right-to-left.
@@ -1174,14 +1206,15 @@ impl PlayerView {
         // Output selection: Local and Samsung TV are mutually exclusive.
         // output_switching prevents recursive toggling when one button activates/deactivates the other.
         {
-            let state               = state.clone();
-            let tv_output_btn       = tv_output.clone();
-            let bridge_tv           = bridge.clone();
-            let current_track_db_tv = current_track_db_id.clone();
-            let volume_scale_tv     = volume_scale.clone();
-            let local_btn_tv        = local_btn.clone();
-            let switching_tv        = output_switching.clone();
-            let last_meta_tv        = last_metadata.clone();
+            let state                   = state.clone();
+            let tv_output_btn           = tv_output.clone();
+            let bridge_tv               = bridge.clone();
+            let current_track_db_tv     = current_track_db_id.clone();
+            let volume_scale_tv         = volume_scale.clone();
+            let local_btn_tv            = local_btn.clone();
+            let switching_tv            = output_switching.clone();
+            let last_meta_tv            = last_metadata.clone();
+            let spotify_player_tv       = spotify_player.clone();
             tv_btn.connect_toggled(move |btn| {
                 if switching_tv.get() { return; }
                 let active = btn.get_active();
@@ -1203,7 +1236,11 @@ impl PlayerView {
                     bridge_tv.send(WsEvent::Position { pos });
                     bridge_tv.send(WsEvent::State { playing: is_playing });
                     if is_playing {
-                        if let Some(id) = *current_track_db_tv.borrow() {
+                        if spotify_player_tv.is_active() {
+                            // Spotify track — route live audio stream to TV
+                            spotify_player_tv.set_muted(true);
+                            bridge_tv.send(WsEvent::Spotifystream);
+                        } else if let Some(id) = *current_track_db_tv.borrow() {
                             bridge_tv.send(WsEvent::Stream { id, seek: pos });
                         }
                     }
@@ -1213,6 +1250,10 @@ impl PlayerView {
                     local_btn_tv.set_active(true);
                     switching_tv.set(false);
                     state.borrow().sink.set_volume(volume_scale_tv.get_value() as f32);
+                    // Unmute Spotify if it was routed to TV
+                    if spotify_player_tv.is_active() {
+                        spotify_player_tv.set_muted(false);
+                    }
                 }
             });
         }
@@ -1334,6 +1375,7 @@ impl PlayerView {
             let volume_scale_timer   = volume_scale.clone();
             let spotify_player_timer = spotify_player.clone();
             let art_tx_timer         = art_tx.clone();
+            let sp_enrich_tx_timer   = sp_enrich_tx.clone();
             let config_timer         = config.clone();
             let seeking_timer        = seeking.clone();
             let waveform_pos_t       = waveform_pos_secs.clone();
@@ -1343,7 +1385,13 @@ impl PlayerView {
             let last_metadata_timer  = last_metadata.clone();
             let prev_count_timer     = prev_client_count.clone();
             let current_track_id_t   = current_track_db_id.clone();
+            let color_waveform_t     = color_waveform.clone();
+            let overview_waveform_t  = overview_waveform.clone();
+            let ov_surface_t         = overview_wf_surface.clone();
+            let bpm_label_t          = bpm_label.clone();
+            let key_label_t          = key_label.clone();
             let mut tick: u32        = 0;
+            let mut spotify_was_active = false;
             glib::timeout_add_local(100, move || {
                 tick += 1;
 
@@ -1376,10 +1424,13 @@ impl PlayerView {
 
                 // If Spotify (librespot) is the active audio source, update deck display from it
                 if spotify_player_timer.is_active() {
+                    let newly_active = !spotify_was_active;
+                    spotify_was_active = true;
+
                     // Pause local deck if it's still playing
                     if !state.borrow().sink.is_paused() {
                         state.borrow_mut().pause();
-                        play_btn.set_label("▶  Play");
+                        play_btn.set_label("▶");
                     }
                     source_badge_t.set_text("♫ SPOTIFY");
                     cue_loop_row_t.set_sensitive(false);
@@ -1389,34 +1440,85 @@ impl PlayerView {
                         track_label.set_text(&title);
                         artist_label.set_text(&artist);
                         position_scale.set_sensitive(true);
-                        // Fetch album art for the new Spotify track
+                        // Clear stale waveform/labels immediately
+                        bpm_label_t.set_text("");
+                        key_label_t.set_text("");
+                        *color_waveform_t.borrow_mut()  = None;
+                        *overview_waveform_t.borrow_mut() = None;
+                        *ov_surface_t.borrow_mut()      = None;
+                        waveform_area_t.queue_draw();
+                        overview_area_t.queue_draw();
+                        // Clear artwork immediately; new art will arrive async
+                        let _ = art_tx_timer.send(None);
+                        // Push new metadata to TV
+                        if bridge_timer.tv_connected() {
+                            bridge_timer.send(WsEvent::Metadata {
+                                title: title.clone(), artist: artist.clone(), duration: dur,
+                            });
+                            // Restart Spotify audio stream on TV for the new track
+                            if *tv_output_timer.borrow() {
+                                bridge_timer.send(WsEvent::Spotifystream);
+                            }
+                        }
                         let uri   = spotify_player_timer.current_uri();
                         let token = spotify_player_timer.access_token();
                         if let Some(token) = token {
                             if let Some(track_id) = uri.split(':').nth(2).map(|s| s.to_string()) {
-                                let tx = art_tx_timer.clone();
+                                // Fetch art
+                                let art_tx = art_tx_timer.clone();
+                                let tok2   = token.clone();
+                                let tid2   = track_id.clone();
                                 std::thread::spawn(move || {
-                                    let bytes = crate::spotify::fetch_track_image_url(&token, &track_id)
+                                    let bytes = crate::spotify::fetch_track_image_url(&tok2, &tid2)
                                         .and_then(|url| reqwest::blocking::get(&url).ok())
                                         .and_then(|r| r.bytes().ok())
                                         .map(|b| b.to_vec());
-                                    let _ = tx.send(bytes);
+                                    let _ = art_tx.send(bytes);
+                                });
+                                // Fetch audio features + analysis in background
+                                let enrich_tx = sp_enrich_tx_timer.clone();
+                                std::thread::spawn(move || {
+                                    let bpm_str = crate::spotify::fetch_audio_features(&token, &track_id)
+                                        .map(|f| {
+                                            let key = crate::spotify::to_camelot(f.key, f.mode);
+                                            (format!("{:.1} BPM", f.tempo), key)
+                                        });
+                                    let waveform = crate::spotify::fetch_audio_analysis(&token, &track_id);
+                                    let (bpm, key) = bpm_str.unwrap_or_default();
+                                    let _ = enrich_tx.send(SpotifyEnrichment {
+                                        bpm_str: bpm, key_str: key, waveform,
+                                    });
                                 });
                             }
                         }
                     }
                     // Sync play/pause button label with librespot state
-                    let expected_label = if spotify_player_timer.is_paused() { "▶  Play" } else { "❚❚  Pause" };
+                    let expected_label = if spotify_player_timer.is_paused() { "▶" } else { "❚❚" };
                     if play_btn.get_label().as_deref() != Some(expected_label) {
                         play_btn.set_label(expected_label);
                     }
                     let pos = spotify_player_timer.current_position_secs();
                     let fraction = if dur > 0.0 { (pos / dur).min(1.0) } else { 0.0 };
-                    position_scale.set_value(fraction);
+                    if !seeking_timer.get() {
+                        position_scale.set_value(fraction);
+                    }
                     let remaining = if dur > 0.0 { (dur - pos).max(0.0) } else { 0.0 };
                     time_label.set_text(&format!("-{}", fmt_time(remaining)));
+                    // Route audio to TV if TV output is active (first activation)
+                    if newly_active && *tv_output_timer.borrow() {
+                        spotify_player_timer.set_muted(true);
+                        bridge_timer.send(WsEvent::Metadata {
+                            title: title.clone(), artist: artist.clone(), duration: dur,
+                        });
+                        bridge_timer.send(WsEvent::Spotifystream);
+                    }
+                    // Sync position to TV
+                    if bridge_timer.tv_connected() {
+                        bridge_timer.send(WsEvent::Position { pos });
+                    }
                     return glib::Continue(true);
                 }
+                spotify_was_active = false;
 
                 // Keep TV button in sync with connection state
                 let tv_count = bridge_timer.client_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -1486,7 +1588,7 @@ impl PlayerView {
                         st.play_started_at = None;
                         st.accumulated_secs = 0.0;
                     }
-                    play_btn.set_label("▶  Play");
+                    play_btn.set_label("▶");
                     position_scale.set_value(0.0);
                     let dur = state.borrow().duration_secs;
                     time_label.set_text(&format!("-{}", fmt_time(dur)));
@@ -1497,7 +1599,7 @@ impl PlayerView {
                         do_load(track);
                         state.borrow_mut().play();
                         if state.borrow().play_started_at.is_some() {
-                            play_btn.set_label("❚❚  Pause");
+                            play_btn.set_label("❚❚");
                             if *tv_output_timer.borrow() {
                                 state.borrow().sink.set_volume(0.0);
                                 if let Some(id) = *current_track_db_id2.borrow() {
@@ -1581,6 +1683,7 @@ impl MainView {
         container.set_border_width(8);
 
         let spotify_player = LibrespotPlayer::new();
+        spotify_player.set_audio_tx(bridge.spotify_audio.clone());
         let player = PlayerView::new(window, "Player", bridge, spotify_player.clone(), config);
         let queue_fn = player.queue_fn.clone();
         let current_track_db_id = player.current_track_db_id.clone();

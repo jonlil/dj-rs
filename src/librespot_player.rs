@@ -2,7 +2,7 @@ use gtk::prelude::*;
 use rodio::{OutputStream, OutputStreamHandle, Sink, buffer::SamplesBuffer};
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
 use std::time::Instant;
 
 use librespot_playback::audio_backend::{Sink as LibrespotSink, SinkResult};
@@ -12,8 +12,10 @@ use librespot_playback::decoder::AudioPacket;
 // ── Custom audio sink: librespot → glib channel → rodio ──────────────────────
 
 struct GlibSink {
-    sender:     glib::Sender<(u64, Vec<f32>)>,
-    generation: Arc<AtomicU64>,
+    sender:        glib::Sender<(u64, Vec<f32>)>,
+    generation:    Arc<AtomicU64>,
+    /// Optional broadcast channel for TV live streaming.
+    spotify_audio: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Vec<f32>>>>>,
 }
 
 impl LibrespotSink for GlibSink {
@@ -21,7 +23,13 @@ impl LibrespotSink for GlibSink {
         if let AudioPacket::Samples(samples) = packet {
             let gen = self.generation.load(Ordering::Relaxed);
             let f32_samples: Vec<f32> = samples.iter().map(|&s| s as f32).collect();
-            let _ = self.sender.send((gen, f32_samples));
+            let _ = self.sender.send((gen, f32_samples.clone()));
+            // Forward to TV live stream if a sender is registered
+            if let Ok(guard) = self.spotify_audio.try_lock() {
+                if let Some(ref tx) = *guard {
+                    let _ = tx.send(f32_samples);
+                }
+            }
         }
         Ok(())
     }
@@ -64,6 +72,8 @@ pub struct LibrespotPlayer {
     access_token:        Rc<RefCell<Option<String>>>,
     /// Incremented on every seek/play so stale buffered packets are discarded.
     generation:          Arc<AtomicU64>,
+    /// Shared with GlibSink for TV live streaming.
+    spotify_audio:       Arc<Mutex<Option<tokio::sync::broadcast::Sender<Vec<f32>>>>>,
 }
 
 impl LibrespotPlayer {
@@ -94,12 +104,13 @@ impl LibrespotPlayer {
         let current_uri      = Rc::new(RefCell::new(String::new()));
         let access_token     = Rc::new(RefCell::new(None::<String>));
         let generation       = Arc::new(AtomicU64::new(0));
+        let spotify_audio    = Arc::new(Mutex::new(None::<tokio::sync::broadcast::Sender<Vec<f32>>>));
 
         let player = Rc::new(Self {
             cmd_tx, _stream, handle, sink, active_btn, loaded, paused,
             play_started_at, seek_offset_secs,
             track_duration_secs, track_title, track_artist, current_uri,
-            access_token, generation,
+            access_token, generation, spotify_audio,
         });
 
         // GTK main thread: receive decoded f32 samples and append to the sink
@@ -128,13 +139,26 @@ impl LibrespotPlayer {
         });
 
         // Background thread: owns the tokio runtime and librespot session/player
-        let gen_arc = player.generation.clone();
+        let gen_arc      = player.generation.clone();
+        let sp_audio_arc = player.spotify_audio.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime for librespot");
-            rt.block_on(run_player_loop(cmd_rx, audio_tx, gen_arc));
+            rt.block_on(run_player_loop(cmd_rx, audio_tx, gen_arc, sp_audio_arc));
         });
 
         player
+    }
+
+    /// Register the broadcast sender for TV live-stream audio forwarding.
+    pub fn set_audio_tx(&self, tx: tokio::sync::broadcast::Sender<Vec<f32>>) {
+        *self.spotify_audio.lock().unwrap() = Some(tx);
+    }
+
+    /// Mute or unmute the local rodio sink (used when routing audio to TV).
+    pub fn set_muted(&self, muted: bool) {
+        if let Some(ref s) = *self.sink.borrow() {
+            s.set_volume(if muted { 0.0 } else { 1.0 });
+        }
     }
 
     /// Replace the current sink with a fresh one to flush buffered audio.
@@ -261,9 +285,10 @@ impl LibrespotPlayer {
 // ── Async player loop (runs on background tokio thread) ──────────────────────
 
 async fn run_player_loop(
-    mut cmd_rx:  tokio::sync::mpsc::UnboundedReceiver<PlayerCmd>,
-    audio_tx:    glib::Sender<(u64, Vec<f32>)>,
-    generation:  Arc<AtomicU64>,
+    mut cmd_rx:    tokio::sync::mpsc::UnboundedReceiver<PlayerCmd>,
+    audio_tx:      glib::Sender<(u64, Vec<f32>)>,
+    generation:    Arc<AtomicU64>,
+    spotify_audio: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Vec<f32>>>>>,
 ) {
     use librespot_core::{Session, SessionConfig, authentication::Credentials, SpotifyUri};
     use librespot_playback::{
@@ -280,13 +305,18 @@ async fn run_player_loop(
                 let session = Session::new(SessionConfig::default(), None);
                 match session.connect(Credentials::with_access_token(token), false).await {
                     Ok(()) => {
-                        let tx  = audio_tx.clone();
-                        let gen = generation.clone();
+                        let tx      = audio_tx.clone();
+                        let gen     = generation.clone();
+                        let sp_arc  = spotify_audio.clone();
                         let p = Player::new(
                             PlayerConfig::default(),
                             session,
                             Box::new(NoOpVolume),
-                            move || Box::new(GlibSink { sender: tx.clone(), generation: gen.clone() }),
+                            move || Box::new(GlibSink {
+                                sender:        tx.clone(),
+                                generation:    gen.clone(),
+                                spotify_audio: sp_arc.clone(),
+                            }),
                         );
                         player = Some(p);
                     }
