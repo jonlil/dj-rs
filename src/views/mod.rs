@@ -1,6 +1,7 @@
 use gtk::prelude::*;
 use gdk_pixbuf::prelude::*;
 use cairo;
+
 use std::rc::Rc;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -80,41 +81,42 @@ fn render_overview_surface(
     let cr = cairo::Context::new(&surface);
     let w = width  as f64;
     let h = height as f64;
-    let half_h = h / 2.0;
 
     cr.set_source_rgb(0.08, 0.08, 0.08);
     cr.rectangle(0.0, 0.0, w, h);
     cr.fill();
+
+    let half_h = h / 2.0;
 
     if let Some(ref data) = color {
         let n = data.len() / 3;
         if n > 0 {
             let col_w = (w / n as f64).max(1.0);
             for i in 0..n {
-                let x   = i as f64 / n as f64 * w;
-                let b0  = data[i * 3];
-                let b1  = data[i * 3 + 1];
-                let b2  = data[i * 3 + 2];
+                let x    = i as f64 / n as f64 * w;
+                let b0   = data[i * 3];
+                let b1   = data[i * 3 + 1];
+                let b2   = data[i * 3 + 2];
                 let bass = (b0 & 0x1F) as f64 / 31.0;
                 let mid  = (b1 & 0x1F) as f64 / 31.0;
                 let high = (b2 & 0x1F) as f64 / 31.0;
-                let bw = (b0 >> 5) as f64 / 7.0;
-                let mw = (b1 >> 5) as f64 / 7.0;
-                let hw = (b2 >> 5) as f64 / 7.0;
+                let bw   = (b0 >> 5) as f64 / 7.0;
+                let mw   = (b1 >> 5) as f64 / 7.0;
+                let hw   = (b2 >> 5) as f64 / 7.0;
 
-                let h_bass = bass * half_h;
-                cr.set_source_rgb(1.0, 0.55 + bw * 0.45, bw * 0.5);
-                cr.rectangle(x, half_h - h_bass, col_w, h_bass * 2.0);
-                cr.fill();
-
-                let h_mid = mid * half_h * 0.80;
-                cr.set_source_rgb(mw * 0.5, 0.85 + mw * 0.15, mw * 0.3);
-                cr.rectangle(x, half_h - h_mid, col_w, h_mid * 2.0);
-                cr.fill();
-
-                let h_high = high * half_h * 0.60;
-                cr.set_source_rgb(0.35 + hw * 0.65, 0.65 + hw * 0.35, 1.0);
-                cr.rectangle(x, half_h - h_high, col_w, h_high * 2.0);
+                // Stereo mirrored, Pioneer-style color blend (blue=bass, orange=high)
+                let energy   = bass.max(mid.max(high));
+                let bar_half = energy * half_h;
+                if bar_half < 0.5 { continue; }
+                let total = (bass + mid + high).max(0.001);
+                let bf = bass / total;
+                let hf = high / total;
+                let w_avg = (bw + mw + hw) / 3.0;
+                let r = (bf * 0.05 + hf * 1.0  + w_avg * 0.4).min(1.0);
+                let g = (bf * 0.40 + hf * 0.60 + w_avg * 0.3).min(1.0);
+                let b = (bf * 1.0  + hf * 0.05 + w_avg * 0.2).min(1.0);
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(x, half_h - bar_half, col_w, bar_half * 2.0);
                 cr.fill();
             }
         }
@@ -123,12 +125,12 @@ fn render_overview_surface(
         if n > 0.0 {
             let col_w = (w / n).max(1.0);
             for (i, &byte) in data.iter().enumerate() {
-                let x     = i as f64 / n * w;
-                let bh    = (byte & 0x1F) as f64 / 31.0 * half_h;
-                let white = ((byte >> 5) & 0x07) as f64 / 7.0;
-                let v     = 0.35 + white * 0.45;
+                let x        = i as f64 / n * w;
+                let bar_half = (byte & 0x1F) as f64 / 31.0 * half_h;
+                let white    = ((byte >> 5) & 0x07) as f64 / 7.0;
+                let v        = 0.35 + white * 0.45;
                 cr.set_source_rgb(v, v, v);
-                cr.rectangle(x, half_h - bh, col_w, bh * 2.0);
+                cr.rectangle(x, half_h - bar_half, col_w, bar_half * 2.0);
                 cr.fill();
             }
         }
@@ -162,8 +164,8 @@ impl PlayerView {
         let on_track_end: Rc<RefCell<Option<Rc<dyn Fn(i64)>>>> = Rc::new(RefCell::new(None));
 
         let frame = gtk::Frame::new(Some(deck_label));
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        vbox.set_border_width(6);
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        vbox.set_border_width(10);
 
         // ── Album art channel ─────────────────────────────────────────────────
         let art_image = gtk::Image::new();
@@ -317,31 +319,41 @@ impl PlayerView {
             let cues_cell  = waveform_cues.clone();
             let color_wave = color_waveform.clone();
             zoomed_area.connect_draw(move |w, cr| {
-                let alloc  = w.get_allocation();
-                let width  = alloc.width  as f64;
-                let height = alloc.height as f64;
-                let ph_x   = width * PLAYHEAD_FRAC; // playhead pixel x
+                let alloc    = w.get_allocation();
+                let width    = alloc.width  as f64;
+                let height   = alloc.height as f64;
+                let ph_x     = width * PLAYHEAD_FRAC;
                 let px_per_s = width / ZOOM_WINDOW;
 
+                // Strip at the top reserved for cue/playhead triangles
+                const CUE_TOP: f64 = 18.0;
+                let wf_h = height - CUE_TOP; // waveform zone height
+
                 // Background
-                cr.set_source_rgb(0.10, 0.10, 0.10);
+                cr.set_source_rgb(0.08, 0.08, 0.08);
                 cr.rectangle(0.0, 0.0, width, height);
                 cr.fill();
 
+                // Subtle separator line between cue strip and waveform
+                cr.set_source_rgb(0.18, 0.18, 0.18);
+                cr.set_line_width(1.0);
+                cr.move_to(0.0, CUE_TOP);
+                cr.line_to(width, CUE_TOP);
+                cr.stroke();
+
                 let pos_secs = pos_cell.get();
 
-                // Draw waveform columns (PWV7 format: 3 bytes/col, bass/mid/high)
-                // Iterate over visible waveform columns only — much faster than per-pixel loop.
+                // Draw waveform columns — stereo mirrored, Pioneer color convention
+                let center_y = CUE_TOP + wf_h / 2.0;
                 if let Some(ref data) = *color_wave.borrow() {
                     let n_cols = data.len() / 3;
-                    let dur = dur_cell.get();
+                    let dur    = dur_cell.get();
                     if n_cols > 0 && dur > 0.0 {
                         let samples_per_sec = n_cols as f64 / dur;
-                        let half_h = height / 2.0;
                         let col_px_w = (px_per_s / samples_per_sec).max(1.0);
 
-                        let t_start = pos_secs - PLAYHEAD_FRAC * ZOOM_WINDOW;
-                        let t_end   = pos_secs + (1.0 - PLAYHEAD_FRAC) * ZOOM_WINDOW;
+                        let t_start   = pos_secs - PLAYHEAD_FRAC * ZOOM_WINDOW;
+                        let t_end     = pos_secs + (1.0 - PLAYHEAD_FRAC) * ZOOM_WINDOW;
                         let col_start = ((t_start * samples_per_sec).floor() as i64).max(0) as usize;
                         let col_end   = (((t_end * samples_per_sec).ceil() as usize) + 1).min(n_cols);
 
@@ -350,39 +362,39 @@ impl PlayerView {
                             let x = ph_x + (t - pos_secs) * px_per_s;
                             if x + col_px_w < 0.0 || x > width { continue; }
 
-                            let idx = col * 3;
-                            let b0 = data[idx];
-                            let b1 = data[idx + 1];
-                            let b2 = data[idx + 2];
+                            let idx  = col * 3;
+                            let b0   = data[idx];
+                            let b1   = data[idx + 1];
+                            let b2   = data[idx + 2];
                             let bass = (b0 & 0x1F) as f64 / 31.0;
                             let mid  = (b1 & 0x1F) as f64 / 31.0;
                             let high = (b2 & 0x1F) as f64 / 31.0;
-                            let bw = (b0 >> 5) as f64 / 7.0;
-                            let mw = (b1 >> 5) as f64 / 7.0;
-                            let hw = (b2 >> 5) as f64 / 7.0;
+                            let bw   = (b0 >> 5) as f64 / 7.0;
+                            let mw   = (b1 >> 5) as f64 / 7.0;
+                            let hw   = (b2 >> 5) as f64 / 7.0;
 
-                            let h_bass = bass * half_h;
-                            cr.set_source_rgb(1.0, 0.55 + bw * 0.45, bw * 0.5);
-                            cr.rectangle(x, half_h - h_bass, col_px_w, h_bass * 2.0);
-                            cr.fill();
-
-                            let h_mid = mid * half_h * 0.80;
-                            cr.set_source_rgb(mw * 0.5, 0.85 + mw * 0.15, mw * 0.3);
-                            cr.rectangle(x, half_h - h_mid, col_px_w, h_mid * 2.0);
-                            cr.fill();
-
-                            let h_high = high * half_h * 0.60;
-                            cr.set_source_rgb(0.35 + hw * 0.65, 0.65 + hw * 0.35, 1.0);
-                            cr.rectangle(x, half_h - h_high, col_px_w, h_high * 2.0);
+                            // Stereo mirrored, Pioneer color blend (blue=bass, orange=high)
+                            let energy   = bass.max(mid.max(high));
+                            let bar_half = energy * wf_h / 2.0;
+                            if bar_half < 0.5 { continue; }
+                            let total = (bass + mid + high).max(0.001);
+                            let bf = bass / total;
+                            let hf = high / total;
+                            let w_avg = (bw + mw + hw) / 3.0;
+                            let r = (bf * 0.05 + hf * 1.0  + w_avg * 0.4).min(1.0);
+                            let g = (bf * 0.40 + hf * 0.60 + w_avg * 0.3).min(1.0);
+                            let b = (bf * 1.0  + hf * 0.05 + w_avg * 0.2).min(1.0);
+                            cr.set_source_rgb(r, g, b);
+                            cr.rectangle(x, center_y - bar_half, col_px_w, bar_half * 2.0);
                             cr.fill();
                         }
                     }
                 } else {
-                    // No waveform data — visible placeholder
-                    cr.set_source_rgba(0.4, 0.4, 0.4, 0.8);
+                    // No waveform data — center line placeholder
+                    cr.set_source_rgba(0.3, 0.3, 0.3, 0.8);
                     cr.set_line_width(1.0);
-                    cr.move_to(0.0, height / 2.0);
-                    cr.line_to(width, height / 2.0);
+                    cr.move_to(0.0, center_y);
+                    cr.line_to(width, center_y);
                     cr.stroke();
                 }
 
@@ -396,40 +408,42 @@ impl PlayerView {
                         let x1 = x_out.min(width);
                         if x1 > x0 {
                             cr.set_source_rgba(r, g, b, 0.18);
-                            cr.rectangle(x0, 0.0, x1 - x0, height);
+                            cr.rectangle(x0, CUE_TOP, x1 - x0, wf_h);
                             cr.fill();
                             cr.set_source_rgba(r, g, b, 0.8);
                             cr.set_line_width(1.5);
-                            cr.move_to(x_out, 0.0);
+                            cr.move_to(x_out, CUE_TOP);
                             cr.line_to(x_out, height);
                             cr.stroke();
                         }
                     }
                     if x_in < -8.0 || x_in > width + 8.0 { continue; }
+                    // Vertical line through waveform zone
                     cr.set_source_rgb(r, g, b);
                     cr.set_line_width(1.5);
-                    cr.move_to(x_in, 0.0);
+                    cr.move_to(x_in, CUE_TOP);
                     cr.line_to(x_in, height);
                     cr.stroke();
-                    cr.move_to(x_in - 5.0, height);
-                    cr.line_to(x_in + 5.0, height);
-                    cr.line_to(x_in,       height - 8.0);
+                    // Downward triangle in the cue strip
+                    cr.move_to(x_in - 7.0, 1.0);
+                    cr.line_to(x_in + 7.0, 1.0);
+                    cr.line_to(x_in,       CUE_TOP - 1.0);
                     cr.close_path();
                     cr.fill();
                 }
 
-                // Playhead: white vertical line at PLAYHEAD_FRAC
+                // Playhead: white vertical line through waveform zone
                 cr.set_source_rgb(1.0, 1.0, 1.0);
                 cr.set_line_width(2.0);
-                cr.move_to(ph_x, 0.0);
+                cr.move_to(ph_x, CUE_TOP);
                 cr.line_to(ph_x, height);
                 cr.stroke();
 
-                // Red downward triangle at top of playhead
+                // Red downward triangle in the cue strip for playhead
                 cr.set_source_rgb(0.9, 0.15, 0.15);
-                cr.move_to(ph_x - 7.0, 0.0);
-                cr.line_to(ph_x + 7.0, 0.0);
-                cr.line_to(ph_x,       12.0);
+                cr.move_to(ph_x - 7.0, 1.0);
+                cr.line_to(ph_x + 7.0, 1.0);
+                cr.line_to(ph_x,       CUE_TOP - 1.0);
                 cr.close_path();
                 cr.fill();
 
@@ -664,6 +678,9 @@ impl PlayerView {
         // Bundle both areas as the waveform_area alias used later by timer
         let waveform_area = zoomed_area.clone();
 
+        // ── Waveform stack (zoomed + small gap + overview) ────────────────────
+        // (assembled further below into center_col)
+
         // ── Position slider ───────────────────────────────────────────────────
         let pos_adj = gtk::Adjustment::new(0.0, 0.0, 1.0, 0.001, 0.01, 0.0);
         let position_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&pos_adj));
@@ -673,21 +690,43 @@ impl PlayerView {
 
         // ── Round transport buttons (CSS) ─────────────────────────────────────
         let transport_css = gtk::CssProvider::new();
-        let _ = transport_css.load_from_data(
-            b"button.transport-btn { border-radius: 22px; min-width: 52px; min-height: 44px; padding: 0; font-size: 16px; font-weight: bold; }"
-        );
+        let _ = transport_css.load_from_data(b"\
+            button.transport-btn {\
+                border-radius: 50%;\
+                min-width: 52px; min-height: 52px;\
+                padding: 0; font-size: 16px; font-weight: bold;\
+            }\
+            button.play-btn {\
+                color: #1DB954;\
+                border-color: #1DB954; border-width: 2px; border-style: solid;\
+                background-color: #0d2e1a;\
+            }\
+            button.play-btn:hover { background-color: #122e1c; }\
+            button.cue-btn {\
+                color: #6699ff;\
+                border-color: #3366cc; border-width: 2px; border-style: solid;\
+                background-color: #0d1a3a;\
+            }\
+            button.cue-btn:hover { background-color: #111e42; }\
+        ");
 
         let play_btn = gtk::Button::with_label("▶");
+        play_btn.set_size_request(52, 52);
+        play_btn.set_halign(gtk::Align::Center);
         {
             let ctx = play_btn.get_style_context();
             ctx.add_class("transport-btn");
+            ctx.add_class("play-btn");
             gtk::StyleContext::add_provider(&ctx, &transport_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
 
         let cue_btn = gtk::Button::with_label("CUE");
+        cue_btn.set_size_request(52, 52);
+        cue_btn.set_halign(gtk::Align::Center);
         {
             let ctx = cue_btn.get_style_context();
             ctx.add_class("transport-btn");
+            ctx.add_class("cue-btn");
             gtk::StyleContext::add_provider(&ctx, &transport_css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
 
@@ -703,11 +742,11 @@ impl PlayerView {
         out_row.pack_start(&tv_btn,    false, false, 0);
 
         // ── Left column: [CUE] [▶] Out [● Loc][TV] ───────────────────────────
-        let left_col = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        left_col.set_size_request(90, -1);
+        let left_col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        left_col.set_size_request(70, -1);
         left_col.pack_start(&cue_btn,   false, false, 0);
         left_col.pack_start(&play_btn,  false, false, 0);
-        left_col.pack_start(&out_label, false, false, 2);
+        left_col.pack_start(&out_label, false, false, 4);
         left_col.pack_start(&out_row,   false, false, 0);
 
         // ── Hot cue buttons A–H (single row) ─────────────────────────────────
@@ -734,8 +773,8 @@ impl PlayerView {
         let cue_slot_labels = ["A","B","C","D","E","F","G","H"];
         let mut cue_list_time_labels: Vec<gtk::Label> = Vec::new();
         let mut cue_list_btns: Vec<gtk::Button> = Vec::new();
-        let cue_list_box = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        cue_list_box.set_size_request(130, -1);
+        let cue_list_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        cue_list_box.set_size_request(150, -1);
 
         for i in 0..8usize {
             let (r, g, b) = hot_cue_color(i + 1);
@@ -743,15 +782,17 @@ impl PlayerView {
                 (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
             let letter_lbl = gtk::Label::new(None);
             letter_lbl.set_markup(&format!("<span color=\"{hex}\" weight=\"bold\">{}</span>", cue_slot_labels[i]));
-            let time_lbl = gtk::Label::new(Some("  ──"));
+            let time_lbl = gtk::Label::new(Some("──"));
             time_lbl.set_xalign(0.0);
             cue_list_time_labels.push(time_lbl.clone());
 
-            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            row_box.pack_start(&letter_lbl, false, false, 2);
-            row_box.pack_start(&time_lbl,   true,  false, 0);
+            let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row_box.set_border_width(2);
+            row_box.pack_start(&letter_lbl, false, false, 4);
+            row_box.pack_start(&time_lbl,   true,  true,  0);
 
             let row_btn = gtk::Button::new();
+            row_btn.set_size_request(-1, 30);
             row_btn.add(&row_box);
             row_btn.set_sensitive(false);
             cue_list_btns.push(row_btn.clone());
@@ -783,19 +824,18 @@ impl PlayerView {
 
 
         // ── Assemble ──────────────────────────────────────────────────────────
-        let center_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        center_col.pack_start(&zoomed_area,   true, true, 0);
+        let center_col = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        center_col.pack_start(&zoomed_area,   true,  true, 0);
         center_col.pack_start(&overview_area, false, true, 0);
 
-        let main_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let main_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         main_hbox.pack_start(&left_col,      false, false, 4);
         main_hbox.pack_start(&center_col,    true,  true,  0);
         main_hbox.pack_start(&cue_list_box,  false, false, 4);
 
-        vbox.pack_start(&info_row,     false, true,  0);
-        vbox.pack_start(&main_hbox,    true,  true,  4);
-        vbox.pack_start(&cue_loop_row, false, false, 0);
-        vbox.pack_start(&convert_btn,  false, false, 0);
+        vbox.pack_start(&info_row,    false, true,  0);
+        vbox.pack_start(&main_hbox,   true,  true,  4);
+        vbox.pack_start(&convert_btn, false, false, 0);
         vbox.pack_start(&error_label,  false, false, 0);
 
         frame.add(&vbox);
@@ -909,7 +949,12 @@ impl PlayerView {
                                                     let list_btn = &cue_list_btns_load[slot - 1];
                                                     let list_lbl = &cue_list_time_lbl_load[slot - 1];
                                                     list_btn.set_sensitive(true);
-                                                    list_lbl.set_text(&format!("  {}", fmt_time(cp.in_secs)));
+                                                    let display = if cp.comment.is_empty() {
+                                                        fmt_time(cp.in_secs)
+                                                    } else {
+                                                        format!("{} {}", fmt_time(cp.in_secs), cp.comment)
+                                                    };
+                                                    list_lbl.set_text(&display);
                                                 }
                                             }
                                         }
