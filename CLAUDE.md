@@ -23,6 +23,16 @@ src/
   server.rs             — axum HTTP/WS server (port 7879), TV stream via ffmpeg
   dlna.rs               — DLNA renderer discovery
   tags.rs               — lofty tag read/write (ISRC, MusicBrainz, AcoustID)
+  bin/
+    dj_iced.rs          — iced app entry point
+    ui/
+      mod.rs            — App struct, Message enum, update(), view(), subscriptions
+      browser.rs        — Icon bar, sidebar tree, track list, Spotify browser
+      player.rs         — PlayerState (display), overview+zoomed waveform canvases
+      contact.rs        — ContactState + contact detail view
+      gig.rs            — GigState + gig detail view with Spotify match UI
+      settings.rs       — SettingsState + path mappings / Spotify OAuth view
+      theme.rs          — Color constants, layout dimensions
   views/
     mod.rs              — PlayerView + MainView (all GTK wiring, ~3400 lines)
     browser.rs          — Library/playlist browser tree + track list
@@ -278,6 +288,38 @@ If `track_id == 0` (drag-and-drop), `lib.track_id_by_path(path)` looks up by `Fo
 - Audio path: librespot OGG → f64 samples → glib channel → GTK thread → rodio `SamplesBuffer`
 - When Spotify active: local deck is paused, play button controls librespot, timer returns early (no waveform rendering for Spotify)
 - Required OAuth scopes: `streaming playlist-read-private playlist-read-collaborative user-modify-playback-state user-read-playback-state`
+
+---
+
+## Iced UI architecture (src/bin/dj_iced.rs + src/bin/ui/)
+
+### Two-layer player design
+- **`PlayerState`** (in `player.rs`): display-only state — title, artist, BPM, key, `play_pos_secs`, waveform data, cue points. No audio.
+- **`DeckState`** (in `deck.rs`, shared with GTK): actual rodio audio engine — Sink, play/pause/seek/loop.
+- `App` owns both. `TrackClicked` loads audio into the deck AND updates PlayerState display fields. A 60fps `AudioTick` subscription syncs `play_pos_secs` from `deck.current_position_secs()`.
+
+### View routing
+Detail views (contact/gig/settings) replace the track list area; icon bar + sidebar tree stay visible:
+```
+main_area = if settings → settings::view()
+            elif gig    → gig::view()
+            elif contact → contact::view()
+            else        → browser track list
+```
+Detail is passed as `Option<Element>` into `browser::view()`.
+
+### Performance rule
+`SectionClicked` (icon bar) does NOT clear contact/gig state — dropping `text_editor::Content` and re-rendering the track list is expensive. Only explicit navigation (`NodeSelected`, `ContactOpened`) clears detail views.
+
+### Subscriptions
+- **16ms** (`AudioTick`): updates `play_pos_secs` from deck, checks loop bounds, detects track end
+- **5min** (`Tick`): refreshes Spotify OAuth token via `spawn_blocking`
+
+### Overview waveform interaction
+Canvas `Program::update` handles mouse press/move/release → sends `OverviewSeek(frac)` → `deck.seek_to(frac * duration)`. Supports click-to-seek and drag-to-scrub.
+
+### Text clipping
+All dynamic text in sidebar, track list, and detail views must be wrapped in `container(...).width(Fill).clip(true)` to prevent overflow. Tree/list rows use `container(...).height(TREE_ROW_H).align_y(Alignment::Center)` for vertical centering.
 
 ---
 
