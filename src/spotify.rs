@@ -180,6 +180,79 @@ struct ArtistObject {
     name: String,
 }
 
+// ── User playlists ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UserPlaylist {
+    pub id: String,
+    pub name: String,
+    pub track_count: u32,
+    pub owner: String,
+}
+
+#[derive(Deserialize)]
+struct PlaylistsPage {
+    items: Vec<PlaylistObject>,
+    next:  Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PlaylistObject {
+    id:     String,
+    name:   String,
+    tracks: PlaylistTracksRef,
+    owner:  PlaylistOwner,
+}
+
+#[derive(Deserialize)]
+struct PlaylistTracksRef {
+    total: u32,
+}
+
+#[derive(Deserialize)]
+struct PlaylistOwner {
+    display_name: Option<String>,
+}
+
+/// Fetches the authenticated user's playlists.
+pub fn fetch_user_playlists(access_token: &str) -> Result<Vec<UserPlaylist>, String> {
+    let client = Client::new();
+    let mut playlists = Vec::new();
+    let mut url = "https://api.spotify.com/v1/me/playlists?limit=50".to_string();
+
+    loop {
+        let resp = client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(format!("Spotify API error {}: {}", status, body));
+        }
+
+        let page: PlaylistsPage = resp.json().map_err(|e| e.to_string())?;
+
+        for pl in page.items {
+            playlists.push(UserPlaylist {
+                id: pl.id,
+                name: pl.name,
+                track_count: pl.tracks.total,
+                owner: pl.owner.display_name.unwrap_or_default(),
+            });
+        }
+
+        match page.next {
+            Some(next_url) => url = next_url,
+            None => break,
+        }
+    }
+
+    Ok(playlists)
+}
+
 // ── Playlist fetch ────────────────────────────────────────────────────────────
 
 /// Fetches all tracks from a Spotify playlist URL.

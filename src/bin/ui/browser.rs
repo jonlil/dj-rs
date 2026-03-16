@@ -3,7 +3,8 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Fill, Font};
 use dj_rs::rekordbox::{Playlist, Track};
-use dj_rs::gig::{Contact, CustomerType, Gig, GigStore, GIG_FOLDERS};
+use dj_rs::gig::{Contact, CustomerType, GigStore};
+use dj_rs::spotify::{SpotifyTrack, UserPlaylist};
 use super::theme as t;
 use super::Message;
 
@@ -13,36 +14,22 @@ use super::Message;
 pub enum Section {
     Library,
     Spotify,
-    Private,
-    Corporate,
-    Venues,
+    Contacts,
 }
 
 impl Section {
     pub fn icon(&self) -> &'static str {
         match self {
-            Section::Library   => "♫",
-            Section::Spotify   => "S",
-            Section::Private   => "◉",
-            Section::Corporate => "⊞",
-            Section::Venues    => "⬟",
+            Section::Library  => "♫",
+            Section::Spotify  => "S",
+            Section::Contacts => "◉",
         }
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Section::Library   => "LIBRARY",
-            Section::Spotify   => "SPOTIFY",
-            Section::Private   => "PRIVATE",
-            Section::Corporate => "CORPORATE",
-            Section::Venues    => "VENUES",
-        }
-    }
-    pub fn customer_type(&self) -> Option<CustomerType> {
-        match self {
-            Section::Private   => Some(CustomerType::Private),
-            Section::Corporate => Some(CustomerType::Corporate),
-            Section::Venues    => Some(CustomerType::Venue),
-            _                  => None,
+            Section::Library  => "LIBRARY",
+            Section::Spotify  => "SPOTIFY",
+            Section::Contacts => "CONTACTS",
         }
     }
 }
@@ -60,11 +47,7 @@ pub struct TreeNode {
 
 pub fn build_tree(playlists: &[Playlist], parent_id: Option<i64>) -> Vec<TreeNode> {
     playlists.iter()
-        .filter(|p| {
-            p.parent_id == parent_id
-            // hide gig output folders at the root level
-            && !(parent_id.is_none() && GIG_FOLDERS.contains(&p.name.as_str()))
-        })
+        .filter(|p| p.parent_id == parent_id)
         .map(|p| TreeNode {
             id: p.id,
             name: p.name.clone(),
@@ -81,6 +64,7 @@ pub fn build_tree(playlists: &[Playlist], parent_id: Option<i64>) -> Vec<TreeNod
 pub enum Selection {
     All,
     Playlist(i64),
+    SpotifyPlaylist(String), // spotify playlist id
     History(i64),
     None,
 }
@@ -92,12 +76,21 @@ pub struct BrowserState {
     pub sidebar_open: bool,
     pub playlists: Vec<Playlist>,
     pub expanded: std::collections::HashSet<i64>,
-    pub expanded_contacts: std::collections::HashSet<String>,
-    pub expanded_gig_folders: std::collections::HashSet<i64>,
     pub selection: Selection,
     pub tracks: Vec<Track>,
     pub search: String,
     pub gig_store: GigStore,
+    // Spotify section
+    pub spotify_playlists: Vec<UserPlaylist>,
+    pub spotify_tracks: Vec<SpotifyTrackRow>,
+    pub spotify_loading: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpotifyTrackRow {
+    pub spotify: SpotifyTrack,
+    pub in_library: bool,
+    pub library_track_id: Option<i64>,
 }
 
 impl BrowserState {
@@ -107,28 +100,43 @@ impl BrowserState {
             sidebar_open: true,
             playlists,
             expanded: std::collections::HashSet::new(),
-            expanded_contacts: std::collections::HashSet::new(),
-            expanded_gig_folders: std::collections::HashSet::new(),
             selection: Selection::All,
             tracks: Vec::new(),
             search: String::new(),
             gig_store,
+            spotify_playlists: Vec::new(),
+            spotify_tracks: Vec::new(),
+            spotify_loading: false,
         }
     }
 }
 
 // ── View ──────────────────────────────────────────────────────────────────────
 
-pub fn view(state: &BrowserState) -> Element<Message> {
+pub fn view<'a>(state: &'a BrowserState, detail: Option<Element<'a, Message>>, active_contact_id: Option<&str>) -> Element<'a, Message> {
     let icon_bar = view_icon_bar(&state.section, state.sidebar_open);
 
     let tree = if state.sidebar_open {
-        view_tree(state)
+        view_tree(state, active_contact_id)
     } else {
         column![].into()
     };
 
-    let main = view_main(state);
+    let main = match detail {
+        Some(d) => d,
+        None => {
+            if state.section == Section::Spotify && !state.spotify_tracks.is_empty() {
+                view_spotify_main(state)
+            } else if state.section == Section::Spotify && state.spotify_loading {
+                container(text("Loading tracks…").size(14).color(t::TEXT_DIM))
+                    .width(Fill).height(Fill)
+                    .align_x(Alignment::Center).align_y(Alignment::Center)
+                    .into()
+            } else {
+                view_main(state)
+            }
+        }
+    };
 
     let body = row![icon_bar, tree, main].height(Fill);
 
@@ -145,7 +153,7 @@ pub fn view(state: &BrowserState) -> Element<Message> {
 // ── Icon bar ──────────────────────────────────────────────────────────────────
 
 fn view_icon_bar(active: &Section, _sidebar_open: bool) -> Element<'static, Message> {
-    let sections = [Section::Library, Section::Spotify, Section::Private, Section::Corporate, Section::Venues];
+    let sections = [Section::Library, Section::Spotify, Section::Contacts];
 
     let icons: Vec<Element<Message>> = sections.iter().map(|s| {
         let is_active = s == active;
@@ -181,8 +189,32 @@ fn view_icon_bar(active: &Section, _sidebar_open: bool) -> Element<'static, Mess
         btn.into()
     }).collect();
 
+    let settings_btn = button(
+        container(
+            text("⚙").size(20).color(t::TEXT_DIM).font(Font::DEFAULT)
+        )
+        .width(t::ICON_BAR_W)
+        .height(t::ICON_BAR_W)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center),
+    )
+    .padding(0)
+    .style(|_, status| button::Style {
+        background: Some(Background::Color(
+            if matches!(status, button::Status::Hovered) { t::BG_HOVER } else { t::BG_ICON }
+        )),
+        border: Border::default(),
+        text_color: Color::WHITE,
+        ..Default::default()
+    })
+    .on_press(Message::SettingsClicked);
+
     container(
-        Column::with_children(icons).spacing(2).padding([8, 0])
+        column![
+            Column::with_children(icons).spacing(2).padding([8, 0]),
+            space::vertical(),
+            container(settings_btn).padding([8, 0]),
+        ]
     )
     .width(t::ICON_BAR_W)
     .height(Fill)
@@ -195,7 +227,7 @@ fn view_icon_bar(active: &Section, _sidebar_open: bool) -> Element<'static, Mess
 
 // ── Tree panel ────────────────────────────────────────────────────────────────
 
-fn view_tree(state: &BrowserState) -> Element<Message> {
+fn view_tree<'a>(state: &'a BrowserState, active_contact_id: Option<&str>) -> Element<'a, Message> {
     let header = container(
         text(state.section.label())
             .size(11)
@@ -215,23 +247,8 @@ fn view_tree(state: &BrowserState) -> Element<Message> {
 
     let content: Element<Message> = match state.section {
         Section::Library => view_library_tree(state),
-        Section::Private | Section::Corporate | Section::Venues => {
-            let ctype = state.section.customer_type().unwrap();
-            view_contacts_tree(
-                &state.gig_store,
-                &state.playlists,
-                &state.expanded_contacts,
-                &state.expanded_gig_folders,
-                &state.selection,
-                ctype,
-            )
-        }
-        Section::Spotify => {
-            container(text("Coming soon").size(13).color(t::TEXT_DIM))
-                .width(Fill).height(Fill)
-                .align_x(Alignment::Center).align_y(Alignment::Center)
-                .into()
-        }
+        Section::Contacts => view_contacts_list(&state.gig_store, active_contact_id),
+        Section::Spotify => view_spotify_tree(state),
     };
 
     let panel = column![header, separator, content].height(Fill);
@@ -263,196 +280,248 @@ fn view_library_tree(state: &BrowserState) -> Element<Message> {
     ).height(Fill).into()
 }
 
-fn view_contacts_tree(
-    store: &GigStore,
-    playlists: &[Playlist],
-    expanded_contacts: &std::collections::HashSet<String>,
-    expanded_gig_folders: &std::collections::HashSet<i64>,
-    selection: &Selection,
-    filter_type: CustomerType,
-) -> Element<'static, Message> {
-    let contacts: Vec<&Contact> = store.contacts.iter()
-        .filter(|c| c.customer_type == filter_type)
-        .collect();
-
-    if contacts.is_empty() {
+fn view_spotify_tree(state: &BrowserState) -> Element<Message> {
+    if state.spotify_playlists.is_empty() {
         return container(
-            text("No contacts yet").size(13).color(t::TEXT_DIM)
+            column![
+                text("No playlists loaded").size(13).color(t::TEXT_DIM),
+                text("Connecting to Spotify…").size(11).color(t::TEXT_DIM),
+            ].spacing(4).align_x(Alignment::Center),
         )
         .width(Fill).height(Fill)
         .align_x(Alignment::Center).align_y(Alignment::Center)
         .into();
     }
 
+    let rows: Vec<Element<Message>> = state.spotify_playlists.iter().map(|pl| {
+        let is_selected = state.selection == Selection::SpotifyPlaylist(pl.id.clone());
+        let pl_id = pl.id.clone();
+        let count = if pl.track_count > 0 {
+            text(format!("{}", pl.track_count)).size(11).color(t::TEXT_DIM)
+        } else {
+            text("").size(11).color(Color::TRANSPARENT)
+        };
+
+        let label_row = row![
+            container(text("")).width(12.0),
+            text(&pl.name).size(13).color(if is_selected { Color::WHITE } else { t::TEXT_PRIMARY }),
+            space::horizontal(),
+            count,
+        ]
+        .align_y(Alignment::Center)
+        .padding([0, 8]);
+
+        button(label_row)
+            .width(Fill)
+            .height(t::TREE_ROW_H)
+            .padding(0)
+            .style(move |_, status| {
+                let bg = if is_selected {
+                    t::BG_ACTIVE
+                } else if matches!(status, button::Status::Hovered) {
+                    t::BG_HOVER
+                } else {
+                    Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    border: Border::default(),
+                    text_color: Color::WHITE,
+                    ..Default::default()
+                }
+            })
+            .on_press(Message::SpotifyPlaylistSelected(pl_id))
+            .into()
+    }).collect();
+
+    scrollable(Column::with_children(rows).spacing(0))
+        .height(Fill)
+        .into()
+}
+
+fn view_spotify_main(state: &BrowserState) -> Element<Message> {
+    // Column headers
+    let headers = container(
+        row![
+            text("").width(24),
+            text("TITLE").size(11).color(t::TEXT_DIM).width(Fill),
+            text("ARTIST").size(11).color(t::TEXT_DIM).width(160),
+            text("TIME").size(11).color(t::TEXT_DIM).width(46),
+            text("STATUS").size(11).color(t::TEXT_DIM).width(80),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
+    )
+    .padding([0, 8])
+    .height(t::HEADER_H)
+    .width(Fill)
+    .style(|_| iced::widget::container::Style {
+        background: Some(Background::Color(t::BG_PANEL)),
+        ..Default::default()
+    });
+
+    let rows: Vec<Element<Message>> = state.spotify_tracks.iter().enumerate().map(|(i, tr)| {
+        let bg = if i % 2 == 0 { t::BG_BASE } else { t::BG_ROW };
+        let dur_secs = tr.spotify.duration_ms / 1000;
+        let dur_str = format!("{}:{:02}", dur_secs / 60, dur_secs % 60);
+
+        let (status_text, status_color) = if tr.in_library {
+            ("✓ In library", t::ACCENT_GREEN)
+        } else {
+            ("Missing", Color::from_rgb(0.9, 0.7, 0.2))
+        };
+
+        let indicator_color = if tr.in_library { t::ACCENT_GREEN } else { Color::from_rgb(0.9, 0.7, 0.2) };
+        let indicator = container(
+            text("●").size(8).color(indicator_color)
+        )
+        .width(24)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+
+        let row_content = row![
+            indicator,
+            container(text(&tr.spotify.title).size(14).color(t::TEXT_PRIMARY)).width(Fill).clip(true),
+            container(text(&tr.spotify.artist).size(13).color(t::TEXT_SECONDARY)).width(160).clip(true),
+            text(dur_str).size(13).color(t::TEXT_DIM).width(46),
+            text(status_text).size(12).color(status_color).width(80),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .padding([0, 8]);
+
+        container(row_content)
+            .width(Fill)
+            .height(t::TRACK_ROW_H)
+            .style(move |_| iced::widget::container::Style {
+                background: Some(Background::Color(bg)),
+                ..Default::default()
+            })
+            .into()
+    }).collect();
+
+    let track_list = scrollable(Column::with_children(rows).spacing(0))
+        .height(Fill);
+
+    // Summary bar
+    let in_lib = state.spotify_tracks.iter().filter(|t| t.in_library).count();
+    let missing = state.spotify_tracks.len() - in_lib;
+    let summary = container(
+        row![
+            text(format!("{} tracks", state.spotify_tracks.len())).size(12).color(t::TEXT_SECONDARY),
+            space::horizontal(),
+            text(format!("✓ {} in library", in_lib)).size(12).color(t::ACCENT_GREEN),
+            text(format!("  ·  {} missing", missing)).size(12).color(Color::from_rgb(0.9, 0.7, 0.2)),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 8])
+    .width(Fill)
+    .style(|_| iced::widget::container::Style {
+        background: Some(Background::Color(t::BG_PANEL)),
+        ..Default::default()
+    });
+
+    container(column![headers, track_list, summary].height(Fill).width(Fill))
+        .height(Fill)
+        .width(Fill)
+        .clip(true)
+        .into()
+}
+
+fn view_contacts_list<'a>(store: &GigStore, active_contact_id: Option<&str>) -> Element<'a, Message> {
     let mut rows: Vec<Element<Message>> = Vec::new();
 
-    for contact in contacts {
-        let is_expanded = expanded_contacts.contains(&contact.id);
-        let arrow = if is_expanded { "▾ " } else { "▸ " };
-        let label = format!("{}{}", arrow, contact.name);
+    // "+ New Contact" button at top
+    let add_btn = button(
+        row![
+            container(text("")).width(20.0),
+            text("+ New Contact").size(13).color(t::ACCENT_BLUE),
+        ]
+        .align_y(Alignment::Center)
+        .padding([0, 8]),
+    )
+    .width(Fill)
+    .height(t::TREE_ROW_H)
+    .padding(0)
+    .style(|_, status| button::Style {
+        background: Some(Background::Color(
+            if matches!(status, button::Status::Hovered) { t::BG_HOVER } else { Color::TRANSPARENT }
+        )),
+        border: Border::default(),
+        text_color: Color::WHITE,
+        ..Default::default()
+    })
+    .on_press(Message::ContactAdd);
+    rows.push(add_btn.into());
 
-        // ── Contact header row ────────────────────────────────────────────────
-        let header = button(
-            row![
-                container(text("")).width(12.0),
-                text(label).size(14).color(t::TEXT_PRIMARY),
-            ]
-            .align_y(Alignment::Center)
-            .padding([0, 8]),
+    let types = [
+        (CustomerType::Private,   "PRIVATE"),
+        (CustomerType::Corporate, "CORPORATE"),
+        (CustomerType::Venue,     "VENUES"),
+    ];
+
+    for (ct, header_label) in &types {
+        let contacts: Vec<&Contact> = store.contacts.iter()
+            .filter(|c| &c.customer_type == ct)
+            .collect();
+
+        if contacts.is_empty() {
+            continue;
+        }
+
+        // Group header
+        let header = container(
+            text(*header_label).size(10).color(t::TEXT_DIM).font(Font::MONOSPACE),
         )
-        .width(Fill).height(t::TREE_ROW_H).padding(0)
-        .style(|_, status| button::Style {
-            background: Some(Background::Color(
-                if matches!(status, button::Status::Hovered) { t::BG_HOVER } else { Color::TRANSPARENT }
-            )),
-            border: Border::default(),
-            text_color: Color::WHITE,
-            ..Default::default()
-        })
-        .on_press(Message::ContactToggled(contact.id.clone()));
+        .padding([6, 12])
+        .width(Fill);
         rows.push(header.into());
 
-        if !is_expanded { continue; }
+        for contact in contacts {
+            let badge_color = match ct {
+                CustomerType::Private   => Color::from_rgb(0.4, 0.6, 1.0),
+                CustomerType::Corporate => Color::from_rgb(1.0, 0.7, 0.3),
+                CustomerType::Venue     => Color::from_rgb(0.5, 0.9, 0.5),
+            };
+            let contact_id = contact.id.clone();
+            let is_active = active_contact_id == Some(contact.id.as_str());
+            let name = contact.name.clone();
+            let gig_count = store.gigs.iter().filter(|g| g.contact_id == contact_id).count();
 
-        // ── Contact children ──────────────────────────────────────────────────
-        if let Some(folder_id) = contact.rekordbox_folder_id {
-            // Use actual rekordbox playlist hierarchy
-            let mut children: Vec<&Playlist> = playlists.iter()
-                .filter(|p| p.parent_id == Some(folder_id))
-                .collect();
-            children.sort_by_key(|p| p.id);
+            let count_label = if gig_count > 0 {
+                text(format!("{}", gig_count)).size(11).color(t::TEXT_DIM)
+            } else {
+                text("").size(11).color(Color::TRANSPARENT)
+            };
 
-            for child in children {
-                if child.attribute == 1 {
-                    // Gig subfolder — find matching Gig in store
-                    let gig = store.gigs.iter()
-                        .find(|g| g.rekordbox_folder_id == Some(child.id));
-                    let gig_label = gig
-                        .map(|g| g.format_label())
-                        .unwrap_or_else(|| child.name.clone());
-                    let gig_id = gig.map(|g| g.id.clone());
-                    let folder_id = child.id;
-                    let gig_folder_expanded = expanded_gig_folders.contains(&folder_id);
-                    let gig_arrow = if gig_folder_expanded { "▾ " } else { "▸ " };
+            let row_content = row![
+                container(text("●").size(8).color(badge_color))
+                    .width(20)
+                    .align_y(Alignment::Center),
+                text(name).size(13).color(if is_active { Color::WHITE } else { t::TEXT_PRIMARY }),
+                space::horizontal(),
+                count_label,
+            ]
+            .align_y(Alignment::Center)
+            .padding([0, 8]);
 
-                    let gig_row = button(
-                        row![
-                            container(text("")).width(26.0),
-                            text(format!("{}{}", gig_arrow, gig_label))
-                                .size(13).color(t::TEXT_SECONDARY),
-                        ]
-                        .align_y(Alignment::Center).padding([0, 8]),
-                    )
-                    .width(Fill).height(t::TREE_ROW_H).padding(0)
-                    .style(|_, status| button::Style {
-                        background: Some(Background::Color(
-                            if matches!(status, button::Status::Hovered) { t::BG_HOVER } else { Color::TRANSPARENT }
-                        )),
-                        border: Border::default(),
-                        text_color: Color::WHITE,
-                        ..Default::default()
-                    })
-                    .on_press(Message::GigFolderToggled(folder_id, gig_id));
-                    rows.push(gig_row.into());
-
-                    // ── Set playlists under gig folder ────────────────────────
-                    if gig_folder_expanded {
-                        let mut set_pls: Vec<&Playlist> = playlists.iter()
-                            .filter(|p| p.parent_id == Some(folder_id))
-                            .collect();
-                        set_pls.sort_by_key(|p| p.id);
-
-                        for pl in set_pls {
-                            let is_sel = *selection == Selection::Playlist(pl.id);
-                            let count = if pl.track_count > 0 {
-                                format!(" ({})", pl.track_count)
-                            } else {
-                                String::new()
-                            };
-                            let pl_id = pl.id;
-                            let set_row = button(
-                                row![
-                                    container(text("")).width(40.0),
-                                    text(format!("{}{}", pl.name, count))
-                                        .size(12).color(if is_sel { Color::WHITE } else { t::TEXT_DIM }),
-                                ]
-                                .align_y(Alignment::Center).padding([0, 8]),
-                            )
-                            .width(Fill).height(t::TREE_ROW_H).padding(0)
-                            .style(move |_, status| button::Style {
-                                background: Some(Background::Color(
-                                    if is_sel { t::BG_ACTIVE }
-                                    else if matches!(status, button::Status::Hovered) { t::BG_HOVER }
-                                    else { Color::TRANSPARENT }
-                                )),
-                                border: Border::default(),
-                                text_color: Color::WHITE,
-                                ..Default::default()
-                            })
-                            .on_press(Message::NodeSelected(Selection::Playlist(pl_id)));
-                            rows.push(set_row.into());
-                        }
-                    }
-                } else {
-                    // Pool playlist — directly selectable
-                    let is_sel = *selection == Selection::Playlist(child.id);
-                    let count = if child.track_count > 0 {
-                        format!(" ({})", child.track_count)
-                    } else {
-                        String::new()
-                    };
-                    let pl_id = child.id;
-                    let pool_row = button(
-                        row![
-                            container(text("")).width(26.0),
-                            text(format!("{}{}", child.name, count))
-                                .size(13).color(if is_sel { Color::WHITE } else { t::TEXT_SECONDARY }),
-                        ]
-                        .align_y(Alignment::Center).padding([0, 8]),
-                    )
-                    .width(Fill).height(t::TREE_ROW_H).padding(0)
-                    .style(move |_, status| button::Style {
-                        background: Some(Background::Color(
-                            if is_sel { t::BG_ACTIVE }
-                            else if matches!(status, button::Status::Hovered) { t::BG_HOVER }
-                            else { Color::TRANSPARENT }
-                        )),
-                        border: Border::default(),
-                        text_color: Color::WHITE,
-                        ..Default::default()
-                    })
-                    .on_press(Message::NodeSelected(Selection::Playlist(pl_id)));
-                    rows.push(pool_row.into());
-                }
-            }
-        } else {
-            // No rekordbox folder — fall back to gigs from JSON store
-            for gig in store.gigs.iter().filter(|g| g.contact_id == contact.id) {
-                let gig_label = gig.format_label();
-                let playlist_id = gig.rekordbox_folder_id;
-                let gig_id = gig.id.clone();
-                let gig_row = button(
-                    row![
-                        container(text("")).width(26.0),
-                        text(gig_label).size(13).color(t::TEXT_SECONDARY),
-                    ]
-                    .align_y(Alignment::Center).padding([0, 8]),
-                )
-                .width(Fill).height(t::TREE_ROW_H).padding(0)
-                .style(|_, status| button::Style {
+            let btn = button(row_content)
+                .width(Fill)
+                .height(t::TREE_ROW_H)
+                .padding(0)
+                .style(move |_, status| button::Style {
                     background: Some(Background::Color(
-                        if matches!(status, button::Status::Hovered) { t::BG_HOVER } else { Color::TRANSPARENT }
+                        if is_active { t::BG_ACTIVE }
+                        else if matches!(status, button::Status::Hovered) { t::BG_HOVER }
+                        else { Color::TRANSPARENT }
                     )),
                     border: Border::default(),
                     text_color: Color::WHITE,
                     ..Default::default()
                 })
-                .on_press(Message::GigFolderToggled(
-                    playlist_id.unwrap_or(0),
-                    Some(gig_id),
-                ));
-                rows.push(gig_row.into());
-            }
+                .on_press(Message::ContactOpened(contact_id));
+            rows.push(btn.into());
         }
     }
 
