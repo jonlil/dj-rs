@@ -304,14 +304,20 @@ fn view_spotify_tree(state: &BrowserState) -> Element<Message> {
 
         let label_row = row![
             container(text("")).width(12.0),
-            text(&pl.name).size(13).color(if is_selected { Color::WHITE } else { t::TEXT_PRIMARY }),
-            space::horizontal(),
+            container(
+                text(&pl.name).size(13).color(if is_selected { Color::WHITE } else { t::TEXT_PRIMARY })
+            ).width(Fill).clip(true),
             count,
         ]
         .align_y(Alignment::Center)
         .padding([0, 8]);
 
-        button(label_row)
+        button(
+            container(label_row)
+                .width(Fill)
+                .height(t::TREE_ROW_H)
+                .align_y(Alignment::Center)
+        )
             .width(Fill)
             .height(t::TREE_ROW_H)
             .padding(0)
@@ -393,6 +399,7 @@ fn view_spotify_main(state: &BrowserState) -> Element<Message> {
         container(row_content)
             .width(Fill)
             .height(t::TRACK_ROW_H)
+            .align_y(Alignment::Center)
             .style(move |_| iced::widget::container::Style {
                 background: Some(Background::Color(bg)),
                 ..Default::default()
@@ -499,8 +506,9 @@ fn view_contacts_list<'a>(store: &GigStore, active_contact_id: Option<&str>) -> 
                 container(text("●").size(8).color(badge_color))
                     .width(20)
                     .align_y(Alignment::Center),
-                text(name).size(13).color(if is_active { Color::WHITE } else { t::TEXT_PRIMARY }),
-                space::horizontal(),
+                container(
+                    text(name).size(13).color(if is_active { Color::WHITE } else { t::TEXT_PRIMARY })
+                ).width(Fill).clip(true),
                 count_label,
             ]
             .align_y(Alignment::Center)
@@ -558,8 +566,9 @@ fn render_tree_node(
 
     let label_row = row![
         container(text("")).width(indent),
-        text(label).size(14).color(if is_selected { Color::WHITE } else { t::TEXT_PRIMARY }),
-        space::horizontal(),
+        container(
+            text(label).size(14).color(if is_selected { Color::WHITE } else { t::TEXT_PRIMARY })
+        ).width(Fill).clip(true),
         count_text,
     ]
     .align_y(Alignment::Center)
@@ -571,7 +580,12 @@ fn render_tree_node(
         Message::NodeSelected(Selection::Playlist(node.id))
     };
 
-    let row_btn = button(label_row)
+    let row_btn = button(
+        container(label_row)
+            .width(Fill)
+            .height(t::TREE_ROW_H)
+            .align_y(Alignment::Center)
+    )
         .width(Fill)
         .height(t::TREE_ROW_H)
         .padding(0)
@@ -605,14 +619,19 @@ fn render_tree_node(
 fn tree_row_btn(label: &str, _depth: usize, selected: bool, msg: Message) -> Element<Message> {
     let label = label.to_string();
     button(
-        row![
-            container(text("")).width(12.0),
-            text(label)
-                .size(14)
-                .color(if selected { Color::WHITE } else { t::TEXT_PRIMARY }),
-        ]
-        .align_y(Alignment::Center)
-        .padding([0, 8]),
+        container(
+            row![
+                container(text("")).width(12.0),
+                container(
+                    text(label).size(14).color(if selected { Color::WHITE } else { t::TEXT_PRIMARY })
+                ).width(Fill).clip(true),
+            ]
+            .align_y(Alignment::Center)
+            .padding([0, 8])
+        )
+        .width(Fill)
+        .height(t::TREE_ROW_H)
+        .align_y(Alignment::Center),
     )
     .width(Fill)
     .height(t::TREE_ROW_H)

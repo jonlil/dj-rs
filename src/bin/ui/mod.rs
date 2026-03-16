@@ -9,6 +9,7 @@ use iced::widget::{column, container, text_editor};
 use iced::{Element, Fill, Subscription, Task, Theme};
 use dj_rs::rekordbox::{CuePoint, Library, Track};
 use dj_rs::config::Config;
+use dj_rs::deck::DeckState;
 use dj_rs::gig::{CustomerType, GigStore, PendingBuyTrack};
 use browser::{BrowserState, Selection};
 use contact::ContactState;
@@ -77,9 +78,12 @@ pub enum Message {
     // Player transport
     CuePressed,
     PlayPressed,
+    OverviewSeek(f64), // fraction 0.0–1.0 of track duration
     // Player data loading
     WaveformLoaded(Option<Vec<u8>>, Option<Vec<u8>>),
     CuesLoaded(Vec<CuePoint>),
+    // Audio tick (60fps position update)
+    AudioTick(std::time::Instant),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -87,9 +91,11 @@ pub enum Message {
 pub struct App {
     pub browser: BrowserState,
     pub player: PlayerState,
+    pub deck: DeckState,
     pub contact: Option<ContactState>,
     pub gig: Option<GigState>,
     pub settings: Option<SettingsState>,
+    config: Config,
     db_path: String,
     anlz_base: Option<String>,
     spotify_token: Option<String>,
@@ -131,12 +137,16 @@ impl App {
         browser.tracks = all_tracks;
         browser.selection = Selection::All;
 
+        let deck = DeckState::new();
+
         (Self {
             browser,
             player: PlayerState::new(),
+            deck,
             contact: None,
             gig: None,
             settings: None,
+            config,
             db_path,
             anlz_base,
             spotify_token,
@@ -262,6 +272,25 @@ impl App {
 
             Message::TrackClicked(id) => {
                 if let Some(track) = self.browser.tracks.iter().find(|t| t.id == id) {
+                    // Load audio into the deck
+                    if let Some(ref fp) = track.file_path {
+                        let resolved = self.config.apply_mappings(fp);
+                        let path = std::path::PathBuf::from(&resolved);
+                        if path.exists() {
+                            match self.deck.load(path) {
+                                Ok(_) => {
+                                    // Override duration from DB if available
+                                    if let Some(dur) = track.duration_secs {
+                                        if dur > 0 {
+                                            self.deck.duration_secs = dur as f64;
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to load track: {}", e),
+                            }
+                        }
+                    }
+
                     self.player.load_track(
                         track.id,
                         track.title.clone(),
@@ -270,6 +299,10 @@ impl App {
                         track.bpm.map(|b| b as f32 / 100.0),
                         track.key.clone(),
                     );
+                    // Sync duration from deck if DB didn't have it
+                    if self.player.duration_secs.is_none() && self.deck.duration_secs > 0.0 {
+                        self.player.duration_secs = Some(self.deck.duration_secs as i32);
+                    }
                 }
 
                 // Load cues
@@ -311,6 +344,10 @@ impl App {
             }
 
             Message::CuesLoaded(cues) => {
+                // Set CUE position from first memory cue (kind==0)
+                if let Some(mem_cue) = cues.iter().find(|c| c.kind == 0) {
+                    self.player.cue_pos_secs = mem_cue.in_secs;
+                }
                 self.player.cue_points = cues;
                 Task::none()
             }
@@ -645,6 +682,7 @@ impl App {
                     let mut config = Config::load();
                     config.path_mappings = ss.to_mappings();
                     config.save();
+                    self.config = config;
                 }
                 if let Some(ref mut ss) = self.settings {
                     ss.dirty = false;
@@ -770,12 +808,47 @@ impl App {
             }
 
             Message::CuePressed => {
-                self.player.play_pos_secs = self.player.cue_pos_secs;
+                let cue = self.player.cue_pos_secs;
+                let _ = self.deck.seek_to(cue);
+                self.deck.pause();
+                self.player.play_pos_secs = cue;
+                self.player.is_playing = false;
                 Task::none()
             }
 
             Message::PlayPressed => {
-                self.player.is_playing = !self.player.is_playing;
+                if self.player.is_playing {
+                    self.deck.pause();
+                    self.player.is_playing = false;
+                } else {
+                    self.deck.play();
+                    self.player.is_playing = true;
+                }
+                self.player.play_pos_secs = self.deck.current_position_secs();
+                Task::none()
+            }
+
+            Message::OverviewSeek(frac) => {
+                let dur = self.player.duration_secs.unwrap_or(0) as f64;
+                if dur > 0.0 {
+                    let target = frac * dur;
+                    let _ = self.deck.seek_to(target);
+                    self.player.play_pos_secs = target;
+                }
+                Task::none()
+            }
+
+            Message::AudioTick(_) => {
+                if self.player.is_playing {
+                    self.player.play_pos_secs = self.deck.current_position_secs();
+                    // Check if track ended
+                    let dur = self.deck.duration_secs;
+                    if dur > 0.0 && self.player.play_pos_secs >= dur - 0.1 {
+                        self.deck.pause();
+                        self.player.is_playing = false;
+                    }
+                    self.deck.check_loop();
+                }
                 Task::none()
             }
         }
@@ -808,9 +881,12 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // Refresh Spotify token every 5 minutes
-        iced::time::every(std::time::Duration::from_secs(300))
-            .map(Message::Tick)
+        let spotify_refresh = iced::time::every(std::time::Duration::from_secs(300))
+            .map(Message::Tick);
+        // 60fps tick for smooth waveform animation while playing
+        let audio_tick = iced::time::every(std::time::Duration::from_millis(16))
+            .map(Message::AudioTick);
+        Subscription::batch([spotify_refresh, audio_tick])
     }
 
     pub fn theme(&self) -> Theme {

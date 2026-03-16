@@ -1,5 +1,5 @@
 use iced::widget::{button, canvas, column, container, row, scrollable, space, text, Column};
-use iced::widget::canvas::{Frame, Geometry, Path, Stroke, path};
+use iced::widget::canvas::{Event, Frame, Geometry, Path, Stroke, path};
 use iced::{Alignment, Background, Border, Color, Element, Fill, Font, Point, Rectangle, Renderer, Size, Theme};
 use iced::mouse;
 use dj_rs::rekordbox::CuePoint;
@@ -309,9 +309,47 @@ struct OverviewCanvas {
 }
 
 impl canvas::Program<Message, Theme, Renderer> for OverviewCanvas {
-    type State = ();
+    type State = bool; // whether mouse is pressed
 
-    fn draw(&self, _state: &(), renderer: &Renderer, _theme: &Theme,
+    fn update(&self, state: &mut bool, event: &Event, bounds: Rectangle,
+        cursor: mouse::Cursor) -> Option<canvas::Action<Message>>
+    {
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    *state = true;
+                    let frac = (pos.x / bounds.width).clamp(0.0, 1.0) as f64;
+                    return Some(canvas::Action::publish(Message::OverviewSeek(frac)).and_capture());
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if *state {
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let frac = (pos.x / bounds.width).clamp(0.0, 1.0) as f64;
+                        return Some(canvas::Action::publish(Message::OverviewSeek(frac)).and_capture());
+                    }
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if *state {
+                    *state = false;
+                    return Some(canvas::Action::capture());
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn mouse_interaction(&self, _state: &bool, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
+        if cursor.is_over(bounds) {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(&self, _state: &bool, renderer: &Renderer, _theme: &Theme,
         bounds: Rectangle, _cursor: mouse::Cursor) -> Vec<Geometry<Renderer>>
     {
         let w = bounds.width;

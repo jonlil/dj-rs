@@ -99,7 +99,7 @@ pub fn view(state: &GigState) -> Element<Message> {
     let save_btn = flat_btn("Save", t::ACCENT_BLUE, Message::GigSave);
 
     let header = container(
-        row![back_btn, title, space::horizontal(), saved_label, save_btn]
+        row![back_btn, container(title).clip(true), space::horizontal(), saved_label, save_btn]
             .spacing(8)
             .align_y(Alignment::Center),
     )
@@ -250,6 +250,8 @@ pub fn view(state: &GigState) -> Element<Message> {
                     .size(13).color(t::TEXT_SECONDARY),
             )
             .padding([2, 8])
+            .width(Fill)
+            .clip(true)
             .into()
         }).collect();
 
@@ -314,10 +316,12 @@ fn view_matched_row<'a>(entry: &MatchResultEntry, accepted: &std::collections::H
 
     container(
         row![
-            column![
-                text(spotify_label).size(13).color(t::TEXT_PRIMARY),
-                text(local_label).size(12).color(t::TEXT_SECONDARY),
-            ].spacing(1).width(Fill),
+            container(
+                column![
+                    text(spotify_label).size(13).color(t::TEXT_PRIMARY),
+                    text(local_label).size(12).color(t::TEXT_SECONDARY),
+                ].spacing(1)
+            ).width(Fill).clip(true),
             accept_btn,
         ]
         .align_y(Alignment::Center)
@@ -350,10 +354,12 @@ fn view_missing_row<'a>(entry: &MatchResultEntry, buy_list: &[PendingBuyTrack]) 
 
     container(
         row![
-            column![
-                text(spotify_label).size(13).color(t::TEXT_PRIMARY),
-                text(dur_str).size(11).color(t::TEXT_DIM),
-            ].spacing(1).width(Fill),
+            container(
+                column![
+                    text(spotify_label).size(13).color(t::TEXT_PRIMARY),
+                    text(dur_str).size(11).color(t::TEXT_DIM),
+                ].spacing(1)
+            ).width(Fill).clip(true),
             buy_btn,
             deny_btn,
         ]
@@ -377,7 +383,7 @@ fn view_skipped_row<'a>(entry: &MatchResultEntry) -> Element<'a, Message> {
 
     container(
         row![
-            text(spotify_label).size(13).color(t::TEXT_DIM).width(Fill),
+            container(text(spotify_label).size(13).color(t::TEXT_DIM)).width(Fill).clip(true),
             undo_btn,
         ]
         .align_y(Alignment::Center)

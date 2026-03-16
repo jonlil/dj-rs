@@ -63,7 +63,7 @@ pub fn view<'a>(state: &'a ContactState, gigs: &[Gig]) -> Element<'a, Message> {
 
     let header = container(
         row![
-            title,
+            container(title).clip(true),
             type_badge,
             space::horizontal(),
             saved_label,
@@ -142,12 +142,14 @@ pub fn view<'a>(state: &'a ContactState, gigs: &[Gig]) -> Element<'a, Message> {
         };
 
         button(
-            column![
-                text(label).size(14).color(t::TEXT_PRIMARY),
-                text(detail).size(12).color(t::TEXT_DIM),
-            ]
-            .spacing(2)
-            .padding([6, 8]),
+            container(
+                column![
+                    text(label).size(14).color(t::TEXT_PRIMARY),
+                    text(detail).size(12).color(t::TEXT_DIM),
+                ]
+                .spacing(2)
+                .padding([6, 8])
+            ).width(Fill).clip(true),
         )
         .width(Fill)
         .padding(0)
