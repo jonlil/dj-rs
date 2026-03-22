@@ -9,7 +9,9 @@ use super::Message;
 // ── Settings state ──────────────────────────────────────────────────────────
 
 pub struct SettingsState {
+    pub db_path: String,
     pub path_mappings: Vec<MappingRow>,
+    pub music_library_path: String,
     pub spotify_connected: bool,
     pub spotify_status: String,
     pub dirty: bool,
@@ -30,7 +32,9 @@ impl SettingsState {
         let spotify_connected = config.spotify_access_token.is_some();
 
         Self {
+            db_path: config.resolved_db_path().unwrap_or_default(),
             path_mappings,
+            music_library_path: config.music_library_dir().to_string_lossy().into_owned(),
             spotify_connected,
             spotify_status: if spotify_connected {
                 "Connected".to_string()
@@ -76,6 +80,32 @@ pub fn view(state: &SettingsState) -> Element<Message> {
     .width(Fill);
 
     let sep = separator();
+
+    // ── Database Path ──────────────────────────────────────────────────────────
+    let db_header = text("Rekordbox Database").size(14).color(t::TEXT_PRIMARY);
+    let db_hint = text(
+        "Path to the Rekordbox master.db file (SQLCipher). Default: ~/.local/share/dj-rs/master.db"
+    ).size(12).color(t::TEXT_DIM);
+    let db_input = container(
+        text_input("~/.local/share/dj-rs/master.db", &state.db_path)
+            .on_input(Message::SettingsDbPathChanged)
+            .size(13)
+            .style(|_, _| iced::widget::text_input::Style {
+                background: Background::Color(t::BG_ROW),
+                border: Border { color: t::ACCENT_BORDER, width: 1.0, radius: 3.0.into() },
+                icon: Color::TRANSPARENT,
+                placeholder: t::TEXT_DIM,
+                value: t::TEXT_PRIMARY,
+                selection: t::ACCENT_BLUE,
+            }),
+    ).width(Fill);
+
+    let db_section = column![
+        db_header,
+        db_hint,
+        db_input,
+    ]
+    .spacing(8);
 
     // ── Path Mappings ─────────────────────────────────────────────────────────
     let mappings_header = text("Path Mappings").size(14).color(t::TEXT_PRIMARY);
@@ -130,6 +160,32 @@ pub fn view(state: &SettingsState) -> Element<Message> {
     ]
     .spacing(8);
 
+    // ── Music Library Path ──────────────────────────────────────────────────
+    let lib_path_header = text("Music Library Path").size(14).color(t::TEXT_PRIMARY);
+    let lib_path_hint = text(
+        "Where imported files are stored. Defaults to ~/Music/"
+    ).size(12).color(t::TEXT_DIM);
+    let lib_path_input = container(
+        text_input("~/Music", &state.music_library_path)
+            .on_input(Message::SettingsMusicPathChanged)
+            .size(13)
+            .style(|_, _| iced::widget::text_input::Style {
+                background: Background::Color(t::BG_ROW),
+                border: Border { color: t::ACCENT_BORDER, width: 1.0, radius: 3.0.into() },
+                icon: Color::TRANSPARENT,
+                placeholder: t::TEXT_DIM,
+                value: t::TEXT_PRIMARY,
+                selection: t::ACCENT_BLUE,
+            }),
+    ).width(Fill);
+
+    let lib_path_section = column![
+        lib_path_header,
+        lib_path_hint,
+        lib_path_input,
+    ]
+    .spacing(8);
+
     // ── Spotify ───────────────────────────────────────────────────────────────
     let spotify_header = text("Spotify").size(14).color(t::TEXT_PRIMARY);
 
@@ -150,7 +206,11 @@ pub fn view(state: &SettingsState) -> Element<Message> {
 
     // ── Assemble ──────────────────────────────────────────────────────────────
     let form = column![
+        db_section,
+        separator(),
         mappings_section,
+        separator(),
+        lib_path_section,
         separator(),
         spotify_section,
     ]

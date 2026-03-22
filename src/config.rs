@@ -10,6 +10,7 @@ pub struct Config {
     pub spotify_access_token: Option<String>,
     pub spotify_refresh_token: Option<String>,
     pub acoustid_api_key: Option<String>,
+    pub music_library_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +80,15 @@ impl Config {
     /// Primary: the directory containing master.db (e.g. `~/.local/share/dj-rs/`).
     /// Fallback: derived from the first path mapping's `from` parent + `share`
     ///           (for dev setups where ANLZ files live in the project tree).
+    /// Return the music library directory.
+    /// Uses `music_library_path` if set, otherwise `~/Music/`.
+    pub fn music_library_dir(&self) -> PathBuf {
+        self.music_library_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Music"))
+    }
+
     pub fn anlz_base_dir(&self) -> Option<PathBuf> {
         // Primary: co-located with master.db
         if let Some(db) = self.resolved_db_path() {

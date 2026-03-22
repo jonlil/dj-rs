@@ -71,6 +71,8 @@ pub enum Message {
     SettingsMappingToChanged(usize, String),
     SettingsMappingAdd,
     SettingsMappingRemove(usize),
+    SettingsDbPathChanged(String),
+    SettingsMusicPathChanged(String),
     SpotifyConnect,
     SpotifyConnectResult(Result<(String, String), String>),
     // Background
@@ -686,8 +688,24 @@ impl App {
             Message::SettingsSave => {
                 if let Some(ref ss) = self.settings {
                     let mut config = Config::load();
+                    config.db_path = if ss.db_path.is_empty() {
+                        None
+                    } else {
+                        Some(ss.db_path.clone())
+                    };
                     config.path_mappings = ss.to_mappings();
+                    config.music_library_path = if ss.music_library_path.is_empty() {
+                        None
+                    } else {
+                        Some(ss.music_library_path.clone())
+                    };
                     config.save();
+                    // Update live app state
+                    if let Some(ref db) = config.resolved_db_path() {
+                        self.db_path = db.clone();
+                    }
+                    self.anlz_base = config.anlz_base_dir()
+                        .map(|p| p.to_string_lossy().into_owned());
                     self.config = config;
                 }
                 if let Some(ref mut ss) = self.settings {
@@ -733,6 +751,22 @@ impl App {
                         ss.path_mappings.remove(idx);
                         ss.dirty = true;
                     }
+                }
+                Task::none()
+            }
+
+            Message::SettingsDbPathChanged(val) => {
+                if let Some(ref mut ss) = self.settings {
+                    ss.db_path = val;
+                    ss.dirty = true;
+                }
+                Task::none()
+            }
+
+            Message::SettingsMusicPathChanged(val) => {
+                if let Some(ref mut ss) = self.settings {
+                    ss.music_library_path = val;
+                    ss.dirty = true;
                 }
                 Task::none()
             }
