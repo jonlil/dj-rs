@@ -29,6 +29,7 @@ pub enum Message {
     NodeSelected(Selection),
     SearchChanged(String),
     TracksLoaded(Vec<Track>),
+    TrackSelected(i64),
     TrackClicked(i64),
     // Spotify browser
     SpotifyPlaylistsLoaded(Vec<dj_rs::spotify::UserPlaylist>),
@@ -268,6 +269,11 @@ impl App {
                         Message::TracksLoaded,
                     )
                 }
+            }
+
+            Message::TrackSelected(id) => {
+                self.browser.selected_track_id = Some(id);
+                Task::none()
             }
 
             Message::TrackClicked(id) => {

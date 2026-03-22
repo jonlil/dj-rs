@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, column, container, row, scrollable, space, text, text_input, Column,
+    button, column, container, mouse_area, row, scrollable, space, text, text_input, Column,
 };
 use iced::{Alignment, Background, Border, Color, Element, Fill, Font};
 use dj_rs::rekordbox::{Playlist, Track};
@@ -84,6 +84,7 @@ pub struct BrowserState {
     pub spotify_playlists: Vec<UserPlaylist>,
     pub spotify_tracks: Vec<SpotifyTrackRow>,
     pub spotify_loading: bool,
+    pub selected_track_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,7 @@ impl BrowserState {
             spotify_playlists: Vec::new(),
             spotify_tracks: Vec::new(),
             spotify_loading: false,
+            selected_track_id: None,
         }
     }
 }
@@ -707,6 +709,7 @@ fn view_main(state: &BrowserState) -> Element<Message> {
     // Track rows
     let rows: Vec<Element<Message>> = state.tracks.iter().enumerate().map(|(i, track)| {
         let bg = if i % 2 == 0 { t::BG_BASE } else { t::BG_ROW };
+        let is_selected = state.selected_track_id == Some(track.id);
         let bpm_str = track.bpm_display()
             .map(|b| format!("{:.1}", b))
             .unwrap_or_default();
@@ -727,19 +730,19 @@ fn view_main(state: &BrowserState) -> Element<Message> {
         .align_y(Alignment::Center)
         .padding([0, 8]);
 
-        button(row_content)
+        let styled_row = container(row_content)
             .width(Fill)
             .height(t::TRACK_ROW_H)
-            .padding(0)
-            .style(move |_, status| button::Style {
+            .style(move |_| iced::widget::container::Style {
                 background: Some(Background::Color(
-                    if matches!(status, button::Status::Hovered) { t::BG_HOVER } else { bg }
+                    if is_selected { t::BG_ACTIVE } else { bg }
                 )),
-                border: Border::default(),
-                text_color: Color::WHITE,
                 ..Default::default()
-            })
-            .on_press(Message::TrackClicked(track.id))
+            });
+
+        mouse_area(styled_row)
+            .on_press(Message::TrackSelected(track.id))
+            .on_double_click(Message::TrackClicked(track.id))
             .into()
     }).collect();
 
