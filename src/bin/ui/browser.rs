@@ -86,6 +86,10 @@ pub struct BrowserState {
     pub spotify_loading: bool,
     pub selected_track_id: Option<i64>,
     pub track_info_open: bool,
+    pub track_info_width: f32,
+    pub track_info_dragging: bool,
+    pub track_info_drag_start_x: f32,
+    pub track_info_drag_start_width: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,10 @@ impl BrowserState {
             spotify_loading: false,
             selected_track_id: None,
             track_info_open: false,
+            track_info_width: 260.0,
+            track_info_dragging: false,
+            track_info_drag_start_x: 0.0,
+            track_info_drag_start_width: 0.0,
         }
     }
 }
@@ -150,7 +158,7 @@ pub fn view<'a>(state: &'a BrowserState, detail: Option<Element<'a, Message>>, a
     } else {
         None
     };
-    let info_panel = view_track_info(selected_track, show_info);
+    let info_panel = view_track_info(selected_track, show_info, state.track_info_width);
     let body = row![icon_bar, tree, main, info_panel].height(Fill);
 
     container(body)
@@ -814,10 +822,23 @@ fn view_main(state: &BrowserState) -> Element<Message> {
 
 // ── Track info panel ──────────────────────────────────────────────────────────
 
-fn view_track_info<'a>(track: Option<&'a Track>, visible: bool) -> Element<'a, Message> {
+fn view_track_info<'a>(track: Option<&'a Track>, visible: bool, width: f32) -> Element<'a, Message> {
     if !visible {
         return container(column![]).width(0).height(Fill).into();
     }
+
+    // Drag handle on the left edge
+    let drag_handle = mouse_area(
+        container(column![])
+            .width(4)
+            .height(Fill)
+            .style(|_| iced::widget::container::Style {
+                background: Some(Background::Color(super::theme::SEPARATOR)),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::TrackInfoDragStart(0.0)) // x will come from global event
+    .interaction(iced::mouse::Interaction::ResizingHorizontally);
 
     let content: Element<Message> = if let Some(t) = track {
         let bpm_str = t.bpm_display()
@@ -898,17 +919,15 @@ fn view_track_info<'a>(track: Option<&'a Track>, visible: bool) -> Element<'a, M
         .into()
     };
 
-    container(content)
-        .width(260)
+    let panel = container(content)
+        .width(width - 4.0) // subtract drag handle width
         .height(Fill)
         .style(|_| iced::widget::container::Style {
             background: Some(Background::Color(super::theme::BG_PANEL)),
-            border: Border {
-                color: super::theme::SEPARATOR,
-                width: 1.0,
-                radius: 0.0.into(),
-            },
             ..Default::default()
-        })
+        });
+
+    row![drag_handle, panel]
+        .height(Fill)
         .into()
 }

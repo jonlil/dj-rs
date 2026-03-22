@@ -32,6 +32,9 @@ pub enum Message {
     TrackSelected(i64),
     TrackClicked(i64),
     ToggleTrackInfo,
+    TrackInfoDragStart(f32),   // cursor x
+    TrackInfoDragMove(f32),    // cursor x
+    TrackInfoDragEnd,
     // Spotify browser
     SpotifyPlaylistsLoaded(Vec<dj_rs::spotify::UserPlaylist>),
     SpotifyPlaylistSelected(String), // playlist_id
@@ -281,6 +284,33 @@ impl App {
 
             Message::ToggleTrackInfo => {
                 self.browser.track_info_open = !self.browser.track_info_open;
+                Task::none()
+            }
+
+            Message::TrackInfoDragStart(_) => {
+                self.browser.track_info_dragging = true;
+                self.browser.track_info_drag_start_x = 0.0; // set on first move
+                self.browser.track_info_drag_start_width = self.browser.track_info_width;
+                Task::none()
+            }
+
+            Message::TrackInfoDragMove(x) => {
+                if self.browser.track_info_dragging {
+                    if self.browser.track_info_drag_start_x == 0.0 {
+                        // First move — record start position
+                        self.browser.track_info_drag_start_x = x;
+                    } else {
+                        let delta = self.browser.track_info_drag_start_x - x;
+                        let new_width = (self.browser.track_info_drag_start_width + delta)
+                            .clamp(180.0, 500.0);
+                        self.browser.track_info_width = new_width;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::TrackInfoDragEnd => {
+                self.browser.track_info_dragging = false;
                 Task::none()
             }
 
@@ -927,16 +957,28 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let spotify_refresh = iced::time::every(std::time::Duration::from_secs(300))
-            .map(Message::Tick);
+        let mut subs: Vec<Subscription<Message>> = vec![
+            iced::time::every(std::time::Duration::from_secs(300)).map(Message::Tick),
+        ];
         // 60fps tick only while playing — avoids idle CPU burn
         if self.player.is_playing {
-            let audio_tick = iced::time::every(std::time::Duration::from_millis(16))
-                .map(Message::AudioTick);
-            Subscription::batch([spotify_refresh, audio_tick])
-        } else {
-            spotify_refresh
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(16)).map(Message::AudioTick),
+            );
         }
+        // Track mouse during info panel resize drag
+        if self.browser.track_info_dragging {
+            subs.push(iced::event::listen_with(|event, _, _| {
+                match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) =>
+                        Some(Message::TrackInfoDragMove(position.x)),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) =>
+                        Some(Message::TrackInfoDragEnd),
+                    _ => None,
+                }
+            }));
+        }
+        Subscription::batch(subs)
     }
 
     pub fn theme(&self) -> Theme {
