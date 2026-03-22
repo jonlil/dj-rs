@@ -923,10 +923,14 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let spotify_refresh = iced::time::every(std::time::Duration::from_secs(300))
             .map(Message::Tick);
-        // 60fps tick for smooth waveform animation while playing
-        let audio_tick = iced::time::every(std::time::Duration::from_millis(16))
-            .map(Message::AudioTick);
-        Subscription::batch([spotify_refresh, audio_tick])
+        // 60fps tick only while playing — avoids idle CPU burn
+        if self.player.is_playing {
+            let audio_tick = iced::time::every(std::time::Duration::from_millis(16))
+                .map(Message::AudioTick);
+            Subscription::batch([spotify_refresh, audio_tick])
+        } else {
+            spotify_refresh
+        }
     }
 
     pub fn theme(&self) -> Theme {
