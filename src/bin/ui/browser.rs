@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, space, text, text_input, Column,
+    button, column, container, lazy, mouse_area, row, scrollable, space, text, text_input, Column,
 };
 use iced::{Alignment, Background, Border, Color, Element, Fill, Font};
 use dj_rs::rekordbox::{Playlist, Track};
@@ -85,6 +85,7 @@ pub struct BrowserState {
     pub spotify_tracks: Vec<SpotifyTrackRow>,
     pub spotify_loading: bool,
     pub selected_track_id: Option<i64>,
+    pub track_info_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +110,7 @@ impl BrowserState {
             spotify_tracks: Vec::new(),
             spotify_loading: false,
             selected_track_id: None,
+            track_info_open: false,
         }
     }
 }
@@ -124,6 +126,7 @@ pub fn view<'a>(state: &'a BrowserState, detail: Option<Element<'a, Message>>, a
         column![].into()
     };
 
+    let has_detail = detail.is_some();
     let main = match detail {
         Some(d) => d,
         None => {
@@ -140,7 +143,15 @@ pub fn view<'a>(state: &'a BrowserState, detail: Option<Element<'a, Message>>, a
         }
     };
 
-    let body = row![icon_bar, tree, main].height(Fill);
+    let show_info = state.track_info_open && !has_detail;
+    let selected_track = if show_info {
+        state.selected_track_id
+            .and_then(|id| state.tracks.iter().find(|t| t.id == id))
+    } else {
+        None
+    };
+    let info_panel = view_track_info(selected_track, show_info);
+    let body = row![icon_bar, tree, main, info_panel].height(Fill);
 
     container(body)
         .width(Fill)
@@ -660,24 +671,55 @@ fn tree_row_btn(label: &str, _depth: usize, selected: bool, msg: Message) -> Ele
 // ── Main content (track list) ─────────────────────────────────────────────────
 
 fn view_main(state: &BrowserState) -> Element<Message> {
-    // Search bar
+    let info_active = state.track_info_open;
+
+    // Search bar + info toggle
+    let search_input = row![
+        text("⌕ ").size(14).color(t::TEXT_DIM),
+        text_input("Search...", &state.search)
+            .on_input(Message::SearchChanged)
+            .size(14)
+            .style(|_, _| iced::widget::text_input::Style {
+                background: Background::Color(Color::TRANSPARENT),
+                border: Border::default(),
+                icon: Color::TRANSPARENT,
+                placeholder: t::TEXT_DIM,
+                value: t::TEXT_PRIMARY,
+                selection: t::ACCENT_BLUE,
+            }),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(4);
+
+    // Vertical separator before toggle
+    let sep = container(column![])
+        .width(1)
+        .height(20)
+        .style(|_| iced::widget::container::Style {
+            background: Some(Background::Color(t::SEPARATOR)),
+            ..Default::default()
+        });
+
+    let info_btn = button(
+        text("✎").size(14).color(if info_active { t::ACCENT_BLUE } else { t::TEXT_DIM }),
+    )
+    .padding([4, 8])
+    .style(move |_, status| button::Style {
+        background: Some(Background::Color(
+            if info_active { t::BG_ACTIVE }
+            else if matches!(status, button::Status::Hovered) { t::BG_HOVER }
+            else { Color::TRANSPARENT }
+        )),
+        border: Border::default(),
+        text_color: Color::WHITE,
+        ..Default::default()
+    })
+    .on_press(Message::ToggleTrackInfo);
+
     let search = container(
-        row![
-            text("⌕ ").size(14).color(t::TEXT_DIM),
-            text_input("Search...", &state.search)
-                .on_input(Message::SearchChanged)
-                .size(14)
-                .style(|_, _| iced::widget::text_input::Style {
-                    background: Background::Color(Color::TRANSPARENT),
-                    border: Border::default(),
-                    icon: Color::TRANSPARENT,
-                    placeholder: t::TEXT_DIM,
-                    value: t::TEXT_PRIMARY,
-                    selection: t::ACCENT_BLUE,
-                }),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(4),
+        row![search_input, sep, info_btn]
+            .align_y(Alignment::Center)
+            .spacing(8),
     )
     .padding([6, 12])
     .width(Fill)
@@ -767,5 +809,106 @@ fn view_main(state: &BrowserState) -> Element<Message> {
         .height(Fill)
         .width(Fill)
         .clip(true)
+        .into()
+}
+
+// ── Track info panel ──────────────────────────────────────────────────────────
+
+fn view_track_info<'a>(track: Option<&'a Track>, visible: bool) -> Element<'a, Message> {
+    if !visible {
+        return container(column![]).width(0).height(Fill).into();
+    }
+
+    let content: Element<Message> = if let Some(t) = track {
+        let bpm_str = t.bpm_display()
+            .map(|b| format!("{:.1}", b))
+            .unwrap_or_else(|| "—".into());
+        let key_str = t.key.as_deref().unwrap_or("—");
+        let dur_str = t.duration_secs
+            .map(|s| format!("{}:{:02}", s / 60, s % 60))
+            .unwrap_or_else(|| "—".into());
+        let artist_str = t.artist.as_deref().unwrap_or("—");
+        let album_str = t.album.as_deref().unwrap_or("—");
+        let genre_str = t.genre.as_deref().unwrap_or("—");
+
+        let info_row = |label: &str, value: &str| -> Element<'a, Message> {
+            let l = label.to_string();
+            let v = value.to_string();
+            column![
+                text(l).size(10).color(super::theme::TEXT_DIM),
+                container(text(v).size(13).color(super::theme::TEXT_PRIMARY))
+                    .width(Fill).clip(true),
+            ]
+            .spacing(2)
+            .into()
+        };
+
+        scrollable(
+            column![
+                text("Track Info").size(12).color(super::theme::TEXT_DIM),
+                info_row("TITLE", &t.title),
+                info_row("ARTIST", artist_str),
+                info_row("ALBUM", album_str),
+                info_row("GENRE", genre_str),
+                // separator
+                container(column![]).width(Fill).height(1).style(|_| iced::widget::container::Style {
+                    background: Some(Background::Color(super::theme::SEPARATOR)),
+                    ..Default::default()
+                }),
+                row![
+                    column![
+                        text("BPM").size(10).color(super::theme::TEXT_DIM),
+                        text(bpm_str).size(13).color(super::theme::TEXT_PRIMARY),
+                    ].spacing(2).width(Fill),
+                    column![
+                        text("KEY").size(10).color(super::theme::TEXT_DIM),
+                        text(key_str).size(13).color(super::theme::TEXT_PRIMARY),
+                    ].spacing(2).width(Fill),
+                ].spacing(8),
+                row![
+                    column![
+                        text("DURATION").size(10).color(super::theme::TEXT_DIM),
+                        text(dur_str).size(13).color(super::theme::TEXT_PRIMARY),
+                    ].spacing(2).width(Fill),
+                    column![
+                        text("RATING").size(10).color(super::theme::TEXT_DIM),
+                        text(format!("{}", t.rating.unwrap_or(0))).size(13).color(super::theme::TEXT_PRIMARY),
+                    ].spacing(2).width(Fill),
+                ].spacing(8),
+                // separator
+                container(column![]).width(Fill).height(1).style(|_| iced::widget::container::Style {
+                    background: Some(Background::Color(super::theme::SEPARATOR)),
+                    ..Default::default()
+                }),
+                info_row("FILE", t.file_path.as_deref().unwrap_or("—")),
+            ]
+            .spacing(8)
+            .padding([12, 12]),
+        )
+        .height(Fill)
+        .into()
+    } else {
+        container(
+            text("Select a track").size(13).color(super::theme::TEXT_DIM),
+        )
+        .width(Fill)
+        .height(Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .into()
+    };
+
+    container(content)
+        .width(260)
+        .height(Fill)
+        .style(|_| iced::widget::container::Style {
+            background: Some(Background::Color(super::theme::BG_PANEL)),
+            border: Border {
+                color: super::theme::SEPARATOR,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
 }

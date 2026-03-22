@@ -31,6 +31,7 @@ pub enum Message {
     TracksLoaded(Vec<Track>),
     TrackSelected(i64),
     TrackClicked(i64),
+    ToggleTrackInfo,
     // Spotify browser
     SpotifyPlaylistsLoaded(Vec<dj_rs::spotify::UserPlaylist>),
     SpotifyPlaylistSelected(String), // playlist_id
@@ -275,6 +276,11 @@ impl App {
 
             Message::TrackSelected(id) => {
                 self.browser.selected_track_id = Some(id);
+                Task::none()
+            }
+
+            Message::ToggleTrackInfo => {
+                self.browser.track_info_open = !self.browser.track_info_open;
                 Task::none()
             }
 
