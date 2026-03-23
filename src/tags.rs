@@ -1,13 +1,9 @@
-/// Tag migration for transcoded audio files.
+/// Audio file tag reading, writing, and migration.
 ///
-/// When transcoding (e.g. M4A → FLAC), ffmpeg copies standard tags but
-/// custom atoms like AcoustID and MusicBrainz Recording ID may be lost or
-/// renamed. This module explicitly migrates the tags we care about.
-///
-/// Tags migrated:
-///   ISRC                      — International Standard Recording Code
-///   Acoustid Id               — AcoustID fingerprint lookup result
-///   MusicBrainz Recording Id  — MusicBrainz recording UUID
+/// When converting between formats (e.g. FLAC → AIFF), custom tags like
+/// AcoustID and MusicBrainz Recording ID are not automatically carried over.
+/// `migrate_tags` explicitly copies the tags we care about from source to
+/// destination. If the destination has no primary tag, one is created (ID3v2).
 use std::path::Path;
 use lofty::prelude::*;
 use lofty::probe::Probe;
@@ -52,8 +48,10 @@ pub fn write_tags(path: &Path, update: &TagUpdate) -> Result<(), String> {
         .read()
         .map_err(|e| format!("lofty read: {e}"))?;
 
-    let tag = file.primary_tag_mut()
-        .ok_or_else(|| "file has no primary tag".to_string())?;
+    if file.primary_tag().is_none() {
+        file.insert_tag(lofty::tag::Tag::new(lofty::tag::TagType::Id3v2));
+    }
+    let tag = file.primary_tag_mut().unwrap();
 
     if let Some(ref v) = update.title {
         tag.set_title(v.clone());
@@ -129,10 +127,10 @@ pub fn migrate_tags(src: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("lofty read dst: {e}"))?;
 
     {
-        let dst_tag = match dst_file.primary_tag_mut() {
-            Some(t) => t,
-            None => return Err("destination file has no primary tag".to_string()),
-        };
+        if dst_file.primary_tag().is_none() {
+            dst_file.insert_tag(lofty::tag::Tag::new(lofty::tag::TagType::Id3v2));
+        }
+        let dst_tag = dst_file.primary_tag_mut().unwrap();
 
         if let Some(ref v) = isrc {
             write_item(dst_tag, ItemKey::Isrc, v);
