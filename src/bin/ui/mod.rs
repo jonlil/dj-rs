@@ -11,6 +11,8 @@ use dj_rs::rekordbox::{CuePoint, Library, Track};
 use dj_rs::config::Config;
 use dj_rs::deck::DeckState;
 use dj_rs::gig::{CustomerType, GigStore, PendingBuyTrack};
+use dj_rs::services::gig as gig_svc;
+use dj_rs::services::track as track_svc;
 use browser::{BrowserState, Selection};
 use contact::ContactState;
 use gig::{GigState, MatchResultEntry, MatchStatus};
@@ -203,8 +205,13 @@ impl App {
                 self.browser.selection = sel.clone();
                 self.browser.tracks.clear();
                 let lib = self.lib.clone();
+                let query = match sel {
+                    Selection::All => track_svc::TrackQuery::All,
+                    Selection::Playlist(id) => track_svc::TrackQuery::Playlist(id),
+                    _ => return Task::none(),
+                };
                 Task::perform(
-                    async move { load_tracks(&lib, sel) },
+                    async move { track_svc::query_tracks(&lib, query) },
                     Message::TracksLoaded,
                 )
             }
@@ -231,13 +238,19 @@ impl App {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            load_spotify_tracks(token, playlist_id, &lib)
+                            track_svc::match_spotify_playlist(&token, &playlist_id, &lib)
                         })
                         .await
                         .map_err(|e| e.to_string())?
                     },
                     |result| match result {
-                        Ok(rows) => Message::SpotifyTracksLoaded(rows),
+                        Ok(rows) => Message::SpotifyTracksLoaded(
+                            rows.into_iter().map(|r| browser::SpotifyTrackRow {
+                                in_library: r.in_library,
+                                library_track_id: r.library_track_id,
+                                spotify: r.spotify,
+                            }).collect()
+                        ),
                         Err(_) => Message::SpotifyTracksLoaded(vec![]),
                     },
                 )
@@ -254,15 +267,18 @@ impl App {
                 let lib = self.lib.clone();
                 if query.is_empty() {
                     let sel = self.browser.selection.clone();
+                    let svc_query = match sel {
+                        Selection::All => track_svc::TrackQuery::All,
+                        Selection::Playlist(id) => track_svc::TrackQuery::Playlist(id),
+                        _ => return Task::none(),
+                    };
                     Task::perform(
-                        async move { load_tracks(&lib, sel) },
+                        async move { track_svc::query_tracks(&lib, svc_query) },
                         Message::TracksLoaded,
                     )
                 } else {
                     Task::perform(
-                        async move {
-                            lib.search_tracks(&query).unwrap_or_default()
-                        },
+                        async move { track_svc::search_tracks(&lib, &query) },
                         Message::TracksLoaded,
                     )
                 }
@@ -384,16 +400,7 @@ impl App {
             // ── Contact messages ──────────────────────────────────────────────
 
             Message::ContactAdd => {
-                let contact = dj_rs::gig::Contact {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name: String::new(),
-                    customer_type: CustomerType::Private,
-                    notes: String::new(),
-                    rekordbox_folder_id: None,
-                };
-                let contact_id = contact.id.clone();
-                self.browser.gig_store.contacts.push(contact);
-                self.browser.gig_store.save();
+                let contact_id = gig_svc::create_contact(&mut self.browser.gig_store);
                 if let Some(c) = self.browser.gig_store.contacts.iter().find(|c| c.id == contact_id) {
                     self.contact = Some(ContactState::from_contact(c));
                     self.gig = None;
@@ -449,12 +456,15 @@ impl App {
 
             Message::ContactSave => {
                 if let Some(ref cs) = self.contact {
-                    if let Some(c) = self.browser.gig_store.contacts.iter_mut().find(|c| c.id == cs.contact_id) {
-                        c.name = cs.name.clone();
-                        c.customer_type = cs.customer_type.clone();
-                        c.notes = cs.notes_text();
-                    }
-                    self.browser.gig_store.save();
+                    gig_svc::save_contact(
+                        &mut self.browser.gig_store,
+                        &cs.contact_id,
+                        gig_svc::ContactUpdate {
+                            name: cs.name.clone(),
+                            customer_type: cs.customer_type.clone(),
+                            notes: cs.notes_text(),
+                        },
+                    );
                 }
                 if let Some(ref mut cs) = self.contact {
                     cs.dirty = false;
@@ -464,10 +474,7 @@ impl App {
 
             Message::ContactDelete => {
                 if let Some(ref cs) = self.contact {
-                    let id = cs.contact_id.clone();
-                    self.browser.gig_store.contacts.retain(|c| c.id != id);
-                    self.browser.gig_store.gigs.retain(|g| g.contact_id != id);
-                    self.browser.gig_store.save();
+                    gig_svc::delete_contact(&mut self.browser.gig_store, &cs.contact_id);
                     self.contact = None;
                     self.gig = None;
                 }
@@ -476,27 +483,7 @@ impl App {
 
             Message::ContactAddGig => {
                 if let Some(ref cs) = self.contact {
-                    let gig = dj_rs::gig::Gig {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        contact_id: cs.contact_id.clone(),
-                        name: String::new(),
-                        date: None,
-                        start_time: None,
-                        end_time: None,
-                        location: None,
-                        tags: Vec::new(),
-                        notes: String::new(),
-                        spotify_playlist_url: None,
-                        cached_spotify_tracks: Vec::new(),
-                        accepted_track_ids: Vec::new(),
-                        pending_buy_tracks: Vec::new(),
-                        denied_spotify_ids: Vec::new(),
-                        rekordbox_folder_id: None,
-                    };
-                    let gig_id = gig.id.clone();
-                    self.browser.gig_store.gigs.push(gig);
-                    self.browser.gig_store.save();
-                    // Open the newly created gig
+                    let gig_id = gig_svc::create_gig(&mut self.browser.gig_store, &cs.contact_id);
                     if let Some(g) = self.browser.gig_store.gigs.iter().find(|g| g.id == gig_id) {
                         self.gig = Some(GigState::from_gig(g, &cs.name));
                     }
@@ -582,19 +569,23 @@ impl App {
 
             Message::GigSave => {
                 if let Some(ref gs) = self.gig {
-                    if let Some(g) = self.browser.gig_store.gigs.iter_mut().find(|g| g.id == gs.gig_id) {
-                        g.name = gs.name.clone();
-                        g.date = if gs.date.is_empty() { None } else { Some(gs.date.clone()) };
-                        g.start_time = if gs.start_time.is_empty() { None } else { Some(gs.start_time.clone()) };
-                        g.end_time = if gs.end_time.is_empty() { None } else { Some(gs.end_time.clone()) };
-                        g.location = if gs.location.is_empty() { None } else { Some(gs.location.clone()) };
-                        g.notes = gs.notes_text();
-                        g.spotify_playlist_url = if gs.spotify_url.is_empty() { None } else { Some(gs.spotify_url.clone()) };
-                        g.accepted_track_ids = gs.accepted_track_ids.iter().cloned().collect();
-                        g.pending_buy_tracks = gs.pending_buy_tracks.clone();
-                        g.denied_spotify_ids = gs.denied_spotify_ids.iter().cloned().collect();
-                    }
-                    self.browser.gig_store.save();
+                    let opt = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
+                    gig_svc::save_gig(
+                        &mut self.browser.gig_store,
+                        &gs.gig_id,
+                        gig_svc::GigUpdate {
+                            name: gs.name.clone(),
+                            date: opt(&gs.date),
+                            start_time: opt(&gs.start_time),
+                            end_time: opt(&gs.end_time),
+                            location: opt(&gs.location),
+                            notes: gs.notes_text(),
+                            spotify_playlist_url: opt(&gs.spotify_url),
+                            accepted_track_ids: gs.accepted_track_ids.iter().cloned().collect(),
+                            pending_buy_tracks: gs.pending_buy_tracks.clone(),
+                            denied_spotify_ids: gs.denied_spotify_ids.iter().cloned().collect(),
+                        },
+                    );
                 }
                 if let Some(ref mut gs) = self.gig {
                     gs.dirty = false;
@@ -611,10 +602,21 @@ impl App {
 
                     return Task::perform(
                         async move {
-                            run_match(token, url, &lib).await
+                            tokio::task::spawn_blocking(move || {
+                                track_svc::match_gig_playlist(&token, &url, &lib)
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?
                         },
                         |result| match result {
-                            Ok(entries) => Message::GigMatchResult(entries),
+                            Ok(entries) => Message::GigMatchResult(
+                                entries.into_iter().map(|e| MatchResultEntry {
+                                    spotify: e.spotify,
+                                    matched_track_id: e.matched_track_id,
+                                    matched_title: e.matched_title,
+                                    matched_artist: e.matched_artist,
+                                }).collect()
+                            ),
                             Err(e) => Message::GigMatchError(e),
                         },
                     );
@@ -973,54 +975,3 @@ impl App {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn load_tracks(lib: &Library, selection: Selection) -> Vec<Track> {
-    match selection {
-        Selection::All => lib.tracks().unwrap_or_default(),
-        Selection::Playlist(id) => lib.playlist_tracks(id).unwrap_or_default(),
-        _ => vec![],
-    }
-}
-
-fn load_spotify_tracks(
-    token: String,
-    playlist_id: String,
-    lib: &Library,
-) -> Result<Vec<browser::SpotifyTrackRow>, String> {
-    let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_id)?;
-
-    let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
-
-    let match_results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
-
-    Ok(match_results.into_iter().map(|r| {
-        browser::SpotifyTrackRow {
-            in_library: r.matched.is_some(),
-            library_track_id: r.matched.as_ref().map(|t| t.id),
-            spotify: r.spotify,
-        }
-    }).collect())
-}
-
-async fn run_match(
-    token: String,
-    playlist_url: String,
-    lib: &Library,
-) -> Result<Vec<MatchResultEntry>, String> {
-    let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_url)
-        .map_err(|e| e.to_string())?;
-
-    let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
-
-    let results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
-
-    Ok(results.into_iter().map(|r| {
-        MatchResultEntry {
-            matched_track_id: r.matched.as_ref().map(|t| t.id),
-            matched_title: r.matched.as_ref().map(|t| t.title.clone()),
-            matched_artist: r.matched.as_ref().and_then(|t| t.artist.clone()),
-            spotify: r.spotify,
-        }
-    }).collect())
-}
