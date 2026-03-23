@@ -11,6 +11,7 @@ use dj_rs::rekordbox::{CuePoint, Library, Track};
 use dj_rs::config::Config;
 use dj_rs::deck::DeckState;
 use dj_rs::gig::{CustomerType, GigStore, PendingBuyTrack};
+use dj_rs::services::track as track_svc;
 use browser::{BrowserState, Selection};
 use contact::ContactState;
 use gig::{GigState, MatchResultEntry, MatchStatus};
@@ -203,8 +204,13 @@ impl App {
                 self.browser.selection = sel.clone();
                 self.browser.tracks.clear();
                 let lib = self.lib.clone();
+                let query = match sel {
+                    Selection::All => track_svc::TrackQuery::All,
+                    Selection::Playlist(id) => track_svc::TrackQuery::Playlist(id),
+                    _ => return Task::none(),
+                };
                 Task::perform(
-                    async move { load_tracks(&lib, sel) },
+                    async move { track_svc::query_tracks(&lib, query) },
                     Message::TracksLoaded,
                 )
             }
@@ -231,13 +237,19 @@ impl App {
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            load_spotify_tracks(token, playlist_id, &lib)
+                            track_svc::match_spotify_playlist(&token, &playlist_id, &lib)
                         })
                         .await
                         .map_err(|e| e.to_string())?
                     },
                     |result| match result {
-                        Ok(rows) => Message::SpotifyTracksLoaded(rows),
+                        Ok(rows) => Message::SpotifyTracksLoaded(
+                            rows.into_iter().map(|r| browser::SpotifyTrackRow {
+                                in_library: r.in_library,
+                                library_track_id: r.library_track_id,
+                                spotify: r.spotify,
+                            }).collect()
+                        ),
                         Err(_) => Message::SpotifyTracksLoaded(vec![]),
                     },
                 )
@@ -254,15 +266,18 @@ impl App {
                 let lib = self.lib.clone();
                 if query.is_empty() {
                     let sel = self.browser.selection.clone();
+                    let svc_query = match sel {
+                        Selection::All => track_svc::TrackQuery::All,
+                        Selection::Playlist(id) => track_svc::TrackQuery::Playlist(id),
+                        _ => return Task::none(),
+                    };
                     Task::perform(
-                        async move { load_tracks(&lib, sel) },
+                        async move { track_svc::query_tracks(&lib, svc_query) },
                         Message::TracksLoaded,
                     )
                 } else {
                     Task::perform(
-                        async move {
-                            lib.search_tracks(&query).unwrap_or_default()
-                        },
+                        async move { track_svc::search_tracks(&lib, &query) },
                         Message::TracksLoaded,
                     )
                 }
@@ -612,13 +627,20 @@ impl App {
                     return Task::perform(
                         async move {
                             tokio::task::spawn_blocking(move || {
-                                run_match(&token, &url, &lib)
+                                track_svc::match_gig_playlist(&token, &url, &lib)
                             })
                             .await
                             .map_err(|e| e.to_string())?
                         },
                         |result| match result {
-                            Ok(entries) => Message::GigMatchResult(entries),
+                            Ok(entries) => Message::GigMatchResult(
+                                entries.into_iter().map(|e| MatchResultEntry {
+                                    spotify: e.spotify,
+                                    matched_track_id: e.matched_track_id,
+                                    matched_title: e.matched_title,
+                                    matched_artist: e.matched_artist,
+                                }).collect()
+                            ),
                             Err(e) => Message::GigMatchError(e),
                         },
                     );
@@ -977,51 +999,3 @@ impl App {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn load_tracks(lib: &Library, selection: Selection) -> Vec<Track> {
-    match selection {
-        Selection::All => lib.tracks().unwrap_or_default(),
-        Selection::Playlist(id) => lib.playlist_tracks(id).unwrap_or_default(),
-        _ => vec![],
-    }
-}
-
-fn load_spotify_tracks(
-    token: String,
-    playlist_id: String,
-    lib: &Library,
-) -> Result<Vec<browser::SpotifyTrackRow>, String> {
-    let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_id)?;
-
-    let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
-
-    let match_results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
-
-    Ok(match_results.into_iter().map(|r| {
-        browser::SpotifyTrackRow {
-            in_library: r.matched.is_some(),
-            library_track_id: r.matched.as_ref().map(|t| t.id),
-            spotify: r.spotify,
-        }
-    }).collect())
-}
-
-fn run_match(
-    token: &str,
-    playlist_url: &str,
-    lib: &Library,
-) -> Result<Vec<MatchResultEntry>, String> {
-    let spotify_tracks = dj_rs::spotify::fetch_playlist(token, playlist_url)?;
-    let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
-    let results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
-
-    Ok(results.into_iter().map(|r| {
-        MatchResultEntry {
-            matched_track_id: r.matched.as_ref().map(|t| t.id),
-            matched_title: r.matched.as_ref().map(|t| t.title.clone()),
-            matched_artist: r.matched.as_ref().and_then(|t| t.artist.clone()),
-            spotify: r.spotify,
-        }
-    }).collect())
-}
