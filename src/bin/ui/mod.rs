@@ -611,7 +611,11 @@ impl App {
 
                     return Task::perform(
                         async move {
-                            run_match(token, url, &lib).await
+                            tokio::task::spawn_blocking(move || {
+                                run_match(&token, &url, &lib)
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?
                         },
                         |result| match result {
                             Ok(entries) => Message::GigMatchResult(entries),
@@ -1003,16 +1007,13 @@ fn load_spotify_tracks(
     }).collect())
 }
 
-async fn run_match(
-    token: String,
-    playlist_url: String,
+fn run_match(
+    token: &str,
+    playlist_url: &str,
     lib: &Library,
 ) -> Result<Vec<MatchResultEntry>, String> {
-    let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_url)
-        .map_err(|e| e.to_string())?;
-
+    let spotify_tracks = dj_rs::spotify::fetch_playlist(token, playlist_url)?;
     let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
-
     let results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
 
     Ok(results.into_iter().map(|r| {
