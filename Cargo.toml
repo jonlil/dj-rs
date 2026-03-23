@@ -7,24 +7,13 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-glib = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "fs", "macros", "process"] }
-rupnp = "1"
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["fs"] }
-local-ip-address = "0.6"
 rodio = { version = "0.19", features = ["symphonia-all"] }
 cpal = { version = "0.15", features = ["jack"] }
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
-cairo-rs = "0.9"
-gdk = "0.13"
-gdk-pixbuf = "0.9"
-futures = "0.3.32"
-tokio-util = { version = "0.7", features = ["io"] }
-pango = "0.22.0"
 indexmap = "2.13.0"
 sha2 = "0.10"
 base64 = "0.22"
@@ -38,11 +27,3 @@ librespot-playback = { git = "https://github.com/librespot-org/librespot", branc
 uuid = { version = "1", features = ["v4"] }
 lofty = "0.22"
 iced = { version = "0.14", features = ["canvas", "tokio", "lazy"] }
-
-[dependencies.gtk]
-version = "0.9.0"
-features = ["v3_22"]
-
-[dependencies.gio]
-version = "*"
-features = ["v2_44"]
