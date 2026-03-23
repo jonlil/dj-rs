@@ -7,3 +7,4 @@ pub mod rekordbox;
 pub mod services;
 pub mod spotify;
 pub mod tags;
+pub mod transcode;
