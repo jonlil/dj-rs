@@ -103,7 +103,7 @@ pub struct App {
     pub gig: Option<GigState>,
     pub settings: Option<SettingsState>,
     config: Config,
-    db_path: String,
+    lib: Library,
     anlz_base: Option<String>,
     spotify_token: Option<String>,
     spotify_refresh_token: Option<String>,
@@ -122,21 +122,16 @@ impl App {
                     .into_owned()
             });
 
+        let lib = Library::open(&db_path).expect("failed to open database");
+
         let anlz_base = config.anlz_base_dir()
             .map(|p| p.to_string_lossy().into_owned());
 
         let spotify_token = config.spotify_access_token.clone();
         let spotify_refresh_token = config.spotify_refresh_token.clone();
 
-        let playlists = Library::open(&db_path)
-            .ok()
-            .and_then(|lib| lib.playlists().ok())
-            .unwrap_or_default();
-
-        let all_tracks = Library::open(&db_path)
-            .ok()
-            .and_then(|lib| lib.tracks().ok())
-            .unwrap_or_default();
+        let playlists = lib.playlists().unwrap_or_default();
+        let all_tracks = lib.tracks().unwrap_or_default();
 
         let gig_store = GigStore::load();
 
@@ -154,7 +149,7 @@ impl App {
             gig: None,
             settings: None,
             config,
-            db_path,
+            lib,
             anlz_base,
             spotify_token,
             spotify_refresh_token,
@@ -206,11 +201,10 @@ impl App {
                 self.gig = None;
                 self.settings = None;
                 self.browser.selection = sel.clone();
-                // Clear tracks immediately so the view doesn't render stale data
                 self.browser.tracks.clear();
-                let db_path = self.db_path.clone();
+                let lib = self.lib.clone();
                 Task::perform(
-                    async move { load_tracks(db_path, sel).await },
+                    async move { load_tracks(&lib, sel) },
                     Message::TracksLoaded,
                 )
             }
@@ -233,11 +227,11 @@ impl App {
                 self.gig = None;
                 self.settings = None;
                 let token = self.spotify_token.clone().unwrap_or_default();
-                let db_path = self.db_path.clone();
+                let lib = self.lib.clone();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            load_spotify_tracks(token, playlist_id, db_path)
+                            load_spotify_tracks(token, playlist_id, &lib)
                         })
                         .await
                         .map_err(|e| e.to_string())?
@@ -257,20 +251,17 @@ impl App {
 
             Message::SearchChanged(query) => {
                 self.browser.search = query.clone();
-                let db_path = self.db_path.clone();
+                let lib = self.lib.clone();
                 if query.is_empty() {
                     let sel = self.browser.selection.clone();
                     Task::perform(
-                        async move { load_tracks(db_path, sel).await },
+                        async move { load_tracks(&lib, sel) },
                         Message::TracksLoaded,
                     )
                 } else {
                     Task::perform(
                         async move {
-                            Library::open(&db_path)
-                                .ok()
-                                .and_then(|lib| lib.search_tracks(&query).ok())
-                                .unwrap_or_default()
+                            lib.search_tracks(&query).unwrap_or_default()
                         },
                         Message::TracksLoaded,
                     )
@@ -350,27 +341,21 @@ impl App {
                 }
 
                 // Load cues
-                let db = self.db_path.clone();
+                let lib = self.lib.clone();
                 let cue_task = Task::perform(
                     async move {
-                        Library::open(&db)
-                            .ok()
-                            .and_then(|lib| lib.load_cues(id).ok())
-                            .unwrap_or_default()
+                        lib.load_cues(id).unwrap_or_default()
                     },
                     Message::CuesLoaded,
                 );
 
                 // Load waveform if anlz_base is known
                 if let Some(base) = self.anlz_base.clone() {
-                    let db = self.db_path.clone();
+                    let lib = self.lib.clone();
                     let wf_task = Task::perform(
                         async move {
                             let base_path = std::path::Path::new(&base);
-                            Library::open(&db)
-                                .ok()
-                                .and_then(|lib| lib.load_waveform(id, base_path).ok())
-                                .map(|(c, o)| (c, o))
+                            lib.load_waveform(id, base_path).ok()
                                 .unwrap_or((None, None))
                         },
                         |(color, overview)| Message::WaveformLoaded(color, overview),
@@ -622,11 +607,11 @@ impl App {
                     gs.match_status = MatchStatus::Running;
                     let url = gs.spotify_url.clone();
                     let token = self.spotify_token.clone().unwrap_or_default();
-                    let db_path = self.db_path.clone();
+                    let lib = self.lib.clone();
 
                     return Task::perform(
                         async move {
-                            run_match(token, url, db_path).await
+                            run_match(token, url, &lib).await
                         },
                         |result| match result {
                             Ok(entries) => Message::GigMatchResult(entries),
@@ -736,9 +721,11 @@ impl App {
                         Some(ss.music_library_path.clone())
                     };
                     config.save();
-                    // Update live app state
-                    if let Some(ref db) = config.resolved_db_path() {
-                        self.db_path = db.clone();
+                    // Update live app state — reopen DB if path changed
+                    if let Some(ref db_path) = config.resolved_db_path() {
+                        if let Ok(new_lib) = Library::open(db_path) {
+                            self.lib = new_lib;
+                        }
                     }
                     self.anlz_base = config.anlz_base_dir()
                         .map(|p| p.to_string_lossy().into_owned());
@@ -986,18 +973,12 @@ impl App {
     }
 }
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-async fn load_tracks(db_path: String, selection: Selection) -> Vec<Track> {
+fn load_tracks(lib: &Library, selection: Selection) -> Vec<Track> {
     match selection {
-        Selection::All => Library::open(&db_path)
-            .ok()
-            .and_then(|lib| lib.tracks().ok())
-            .unwrap_or_default(),
-        Selection::Playlist(id) => Library::open(&db_path)
-            .ok()
-            .and_then(|lib| lib.playlist_tracks(id).ok())
-            .unwrap_or_default(),
+        Selection::All => lib.tracks().unwrap_or_default(),
+        Selection::Playlist(id) => lib.playlist_tracks(id).unwrap_or_default(),
         _ => vec![],
     }
 }
@@ -1005,14 +986,11 @@ async fn load_tracks(db_path: String, selection: Selection) -> Vec<Track> {
 fn load_spotify_tracks(
     token: String,
     playlist_id: String,
-    db_path: String,
+    lib: &Library,
 ) -> Result<Vec<browser::SpotifyTrackRow>, String> {
     let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_id)?;
 
-    let library_tracks = Library::open(&db_path)
-        .map_err(|e| e.to_string())?
-        .tracks()
-        .map_err(|e| e.to_string())?;
+    let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
 
     let match_results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
 
@@ -1028,28 +1006,21 @@ fn load_spotify_tracks(
 async fn run_match(
     token: String,
     playlist_url: String,
-    db_path: String,
+    lib: &Library,
 ) -> Result<Vec<MatchResultEntry>, String> {
-    // All blocking I/O — run on a thread to avoid stalling the async executor
-    tokio::task::spawn_blocking(move || {
-        let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_url)?;
+    let spotify_tracks = dj_rs::spotify::fetch_playlist(&token, &playlist_url)
+        .map_err(|e| e.to_string())?;
 
-        let library_tracks = Library::open(&db_path)
-            .map_err(|e| e.to_string())?
-            .tracks()
-            .map_err(|e| e.to_string())?;
+    let library_tracks = lib.tracks().map_err(|e| e.to_string())?;
 
-        let results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
+    let results = dj_rs::matcher::match_tracks(&spotify_tracks, &library_tracks);
 
-        Ok(results.into_iter().map(|r| {
-            MatchResultEntry {
-                matched_track_id: r.matched.as_ref().map(|t| t.id),
-                matched_title: r.matched.as_ref().map(|t| t.title.clone()),
-                matched_artist: r.matched.as_ref().and_then(|t| t.artist.clone()),
-                spotify: r.spotify,
-            }
-        }).collect())
-    })
-    .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    Ok(results.into_iter().map(|r| {
+        MatchResultEntry {
+            matched_track_id: r.matched.as_ref().map(|t| t.id),
+            matched_title: r.matched.as_ref().map(|t| t.title.clone()),
+            matched_artist: r.matched.as_ref().and_then(|t| t.artist.clone()),
+            spotify: r.spotify,
+        }
+    }).collect())
 }
