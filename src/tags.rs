@@ -27,6 +27,81 @@ fn write_item(tag: &mut lofty::tag::Tag, key: ItemKey, value: &str) {
     tag.push(TagItem::new(key, ItemValue::Text(value.to_string())));
 }
 
+/// Fields that can be written to audio file tags.
+#[derive(Debug, Clone, Default)]
+pub struct TagUpdate {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub label: Option<String>,
+    pub key: Option<String>,
+    pub remixer: Option<String>,
+    pub year: Option<i32>,
+    pub bpm: Option<f32>,
+    pub isrc: Option<String>,
+    pub acoustid_id: Option<String>,
+    pub musicbrainz_recording_id: Option<String>,
+}
+
+/// Write metadata tags to an audio file. Only fields that are `Some` are written;
+/// existing tags for `None` fields are left untouched.
+pub fn write_tags(path: &Path, update: &TagUpdate) -> Result<(), String> {
+    let mut file = Probe::open(path)
+        .map_err(|e| format!("lofty open: {e}"))?
+        .read()
+        .map_err(|e| format!("lofty read: {e}"))?;
+
+    let tag = file.primary_tag_mut()
+        .ok_or_else(|| "file has no primary tag".to_string())?;
+
+    if let Some(ref v) = update.title {
+        tag.set_title(v.clone());
+    }
+    if let Some(ref v) = update.artist {
+        tag.set_artist(v.clone());
+    }
+    if let Some(ref v) = update.album {
+        tag.set_album(v.clone());
+    }
+    if let Some(ref v) = update.genre {
+        tag.set_genre(v.clone());
+    }
+    if let Some(ref v) = update.label {
+        write_item(tag, ItemKey::Label, v);
+    }
+    if let Some(ref v) = update.key {
+        write_item(tag, ItemKey::InitialKey, v);
+    }
+    if let Some(ref v) = update.remixer {
+        write_item(tag, ItemKey::Remixer, v);
+    }
+    if let Some(year) = update.year {
+        write_item(tag, ItemKey::Year, &year.to_string());
+    }
+    if let Some(bpm) = update.bpm {
+        write_item(tag, ItemKey::Bpm, &format!("{:.0}", bpm));
+    }
+    if let Some(ref v) = update.isrc {
+        write_item(tag, ItemKey::Isrc, v);
+    }
+    if let Some(ref v) = update.acoustid_id {
+        write_item(tag, ItemKey::Unknown("Acoustid Id".to_string()), v);
+    }
+    if let Some(ref v) = update.musicbrainz_recording_id {
+        write_item(tag, ItemKey::Unknown("MusicBrainz Recording Id".to_string()), v);
+    }
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open for write: {e}"))?;
+
+    file.save_to(&mut f, lofty::config::WriteOptions::default())
+        .map_err(|e| format!("lofty save: {e}"))
+}
+
 /// Migrate ISRC, AcoustID, and MusicBrainz Recording ID from `src` to `dst`.
 pub fn migrate_tags(src: &Path, dst: &Path) -> Result<(), String> {
     let src_file = Probe::open(src)

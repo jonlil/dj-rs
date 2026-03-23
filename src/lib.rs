@@ -6,3 +6,4 @@ pub mod matcher;
 pub mod rekordbox;
 pub mod services;
 pub mod spotify;
+pub mod tags;

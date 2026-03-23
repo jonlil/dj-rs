@@ -1,5 +1,8 @@
-use crate::rekordbox::{Library, Track};
+use std::path::Path;
+use crate::config::Config;
+use crate::rekordbox::{Library, Track, TrackUpdate};
 use crate::spotify::SpotifyTrack;
+use crate::tags::TagUpdate;
 
 // ── Query types ─────────────────────────────────────────────────────────────
 
@@ -27,6 +30,48 @@ pub struct GigMatchEntry {
 }
 
 // ── Service functions ───────────────────────────────────────────────────────
+
+/// Save track metadata to both the Rekordbox DB and the audio file tags.
+/// Returns an error message if either write fails (but attempts both).
+pub fn save_track_metadata(
+    lib: &Library,
+    track_id: i64,
+    update: &TrackUpdate,
+    config: &Config,
+) -> Result<(), String> {
+    // Write to Rekordbox DB
+    lib.update_track(track_id, update)
+        .map_err(|e| format!("DB update failed: {e}"))?;
+
+    // Write to file tags if we can resolve the path
+    if let Some(track) = lib.track_by_id(track_id).ok().flatten() {
+        if let Some(ref fp) = track.file_path {
+            let resolved = config.apply_mappings(fp);
+            let path = Path::new(&resolved);
+            if path.exists() {
+                let tag_update = TagUpdate {
+                    title: update.title.clone(),
+                    artist: update.artist.clone().flatten(),
+                    album: update.album.clone().flatten(),
+                    genre: update.genre.clone().flatten(),
+                    label: update.label.clone().flatten(),
+                    key: update.key.clone().flatten(),
+                    remixer: update.remixer.clone().flatten(),
+                    year: update.year.flatten(),
+                    bpm: update.bpm.flatten(),
+                    isrc: update.isrc.clone().flatten(),
+                    acoustid_id: update.acoustid_id.clone().flatten(),
+                    musicbrainz_recording_id: update.musicbrainz_recording_id.clone().flatten(),
+                };
+                if let Err(e) = crate::tags::write_tags(path, &tag_update) {
+                    return Err(format!("Tag write failed: {e}"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 pub fn query_tracks(lib: &Library, query: TrackQuery) -> Vec<Track> {
     match query {
