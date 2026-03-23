@@ -152,6 +152,28 @@ impl Library {
         Ok(Library { db })
     }
 
+    pub fn track_by_id(&self, content_id: i64) -> Result<Option<Track>> {
+        self.db.with_conn(move |conn| {
+            let id_str = content_id.to_string();
+            let mut stmt = conn.prepare(
+                "SELECT c.ID, c.Title,
+                        a.Name, al.Name, g.Name, k.ScaleName,
+                        c.BPM, c.Length, c.Rating, c.DJPlayCount,
+                        c.FolderPath, c.TrackNo,
+                        l.Name, c.ColorID, c.ImagePath
+                 FROM djmdContent c
+                 LEFT JOIN djmdArtist  a  ON c.ArtistID  = a.ID
+                 LEFT JOIN djmdAlbum   al ON c.AlbumID   = al.ID
+                 LEFT JOIN djmdGenre   g  ON c.GenreID   = g.ID
+                 LEFT JOIN djmdKey     k  ON c.KeyID     = k.ID
+                 LEFT JOIN djmdLabel   l  ON c.LabelID   = l.ID
+                 WHERE c.ID = ?1",
+            )?;
+            let track = stmt.query_row([&id_str], map_track_row).ok();
+            Ok(track)
+        })
+    }
+
     pub fn tracks(&self) -> Result<Vec<Track>> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -622,6 +644,27 @@ impl Track {
     }
 }
 
+/// Fields that can be updated on a track. `None` = don't change.
+#[derive(Debug, Clone, Default)]
+pub struct TrackUpdate {
+    pub title: Option<String>,
+    pub artist: Option<Option<String>>,
+    pub album: Option<Option<String>>,
+    pub genre: Option<Option<String>>,
+    pub label: Option<Option<String>>,
+    pub key: Option<Option<String>>,
+    pub remixer: Option<Option<String>>,
+    pub year: Option<Option<i32>>,
+    /// BPM as displayed (e.g. 128.0), stored ×100 in DB
+    pub bpm: Option<Option<f32>>,
+    pub rating: Option<Option<i32>>,
+    pub color_id: Option<Option<String>>,
+    // Enrichment fields (not in Rekordbox DB, only in file tags)
+    pub isrc: Option<Option<String>>,
+    pub acoustid_id: Option<Option<String>>,
+    pub musicbrainz_recording_id: Option<Option<String>>,
+}
+
 fn build_filter_conditions(f: &TrackFilter) -> Vec<String> {
     let mut conditions = vec!["c.rb_local_deleted = 0".to_string()];
     if let Some(min) = f.bpm_min {
@@ -698,6 +741,92 @@ impl Library {
         Ok((color, overview))
     }
 
+    /// Update track metadata in the Rekordbox DB. Handles upsert into
+    /// lookup tables (djmdArtist, djmdAlbum, etc.) and updates djmdContent.
+    pub fn update_track(&self, content_id: i64, update: &TrackUpdate) -> Result<()> {
+        self.db.with_conn(move |conn| {
+            let id_str = content_id.to_string();
+            let mut sets: Vec<String> = Vec::new();
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+            if let Some(ref title) = update.title {
+                sets.push("Title = ?".into());
+                params.push(Box::new(title.clone()));
+            }
+
+            if let Some(ref artist) = update.artist {
+                let fk = upsert_lookup(conn, "djmdArtist", artist.as_deref())?;
+                sets.push("ArtistID = ?".into());
+                params.push(Box::new(fk));
+            }
+
+            if let Some(ref album) = update.album {
+                let fk = upsert_lookup(conn, "djmdAlbum", album.as_deref())?;
+                sets.push("AlbumID = ?".into());
+                params.push(Box::new(fk));
+            }
+
+            if let Some(ref genre) = update.genre {
+                let fk = upsert_lookup(conn, "djmdGenre", genre.as_deref())?;
+                sets.push("GenreID = ?".into());
+                params.push(Box::new(fk));
+            }
+
+            if let Some(ref label) = update.label {
+                let fk = upsert_lookup(conn, "djmdLabel", label.as_deref())?;
+                sets.push("LabelID = ?".into());
+                params.push(Box::new(fk));
+            }
+
+            if let Some(ref key) = update.key {
+                let fk = upsert_key(conn, key.as_deref())?;
+                sets.push("KeyID = ?".into());
+                params.push(Box::new(fk));
+            }
+
+            if let Some(ref remixer) = update.remixer {
+                sets.push("Remixer = ?".into());
+                params.push(Box::new(remixer.clone()));
+            }
+
+            if let Some(ref year) = update.year {
+                sets.push("ReleaseYear = ?".into());
+                params.push(Box::new(*year));
+            }
+
+            if let Some(ref bpm) = update.bpm {
+                let db_bpm = bpm.map(|b| (b * 100.0) as i32);
+                sets.push("BPM = ?".into());
+                params.push(Box::new(db_bpm));
+            }
+
+            if let Some(ref rating) = update.rating {
+                sets.push("Rating = ?".into());
+                params.push(Box::new(*rating));
+            }
+
+            if let Some(ref color_id) = update.color_id {
+                sets.push("ColorID = ?".into());
+                params.push(Box::new(color_id.clone()));
+            }
+
+            if sets.is_empty() {
+                return Ok(());
+            }
+
+            let sql = format!(
+                "UPDATE djmdContent SET {} WHERE ID = ?",
+                sets.join(", ")
+            );
+            params.push(Box::new(id_str));
+
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            conn.execute(&sql, param_refs.as_slice())?;
+            Ok(())
+        })
+    }
+
     pub fn load_cues(&self, content_id: i64) -> Result<Vec<CuePoint>> {
         self.db.with_conn(move |conn| {
             let id_str = content_id.to_string();
@@ -722,5 +851,67 @@ impl Library {
             Ok(cues)
         })
     }
+}
+
+/// Find or create a row in a simple lookup table (djmdArtist, djmdAlbum, etc.)
+/// that has `ID` (VARCHAR) and `Name` columns. Returns the ID as Option<String>.
+/// If `name` is None, returns None (clears the FK).
+fn upsert_lookup(conn: &rusqlite::Connection, table: &str, name: Option<&str>) -> Result<Option<String>> {
+    let name = match name {
+        Some(n) if !n.is_empty() => n,
+        _ => return Ok(None),
+    };
+
+    // Try to find existing
+    let sql = format!("SELECT ID FROM {} WHERE Name = ?1", table);
+    let existing: Option<String> = conn
+        .query_row(&sql, [name], |row| row.get(0))
+        .ok();
+
+    if let Some(id) = existing {
+        return Ok(Some(id));
+    }
+
+    // Insert new — generate a numeric ID from max existing + 1
+    let max_sql = format!("SELECT MAX(CAST(ID AS INTEGER)) FROM {}", table);
+    let max_id: i64 = conn
+        .query_row(&max_sql, [], |row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let new_id = (max_id + 1).to_string();
+
+    let insert_sql = format!("INSERT INTO {} (ID, Name) VALUES (?1, ?2)", table);
+    conn.execute(&insert_sql, params![&new_id, name])?;
+
+    Ok(Some(new_id))
+}
+
+/// Find or create a key in djmdKey. Uses `ScaleName` column.
+fn upsert_key(conn: &rusqlite::Connection, scale_name: Option<&str>) -> Result<Option<String>> {
+    let name = match scale_name {
+        Some(n) if !n.is_empty() => n,
+        _ => return Ok(None),
+    };
+
+    let existing: Option<String> = conn
+        .query_row("SELECT ID FROM djmdKey WHERE ScaleName = ?1", [name], |row| row.get(0))
+        .ok();
+
+    if let Some(id) = existing {
+        return Ok(Some(id));
+    }
+
+    let max_id: i64 = conn
+        .query_row("SELECT MAX(CAST(ID AS INTEGER)) FROM djmdKey", [], |row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let new_id = (max_id + 1).to_string();
+
+    conn.execute(
+        "INSERT INTO djmdKey (ID, ScaleName) VALUES (?1, ?2)",
+        params![&new_id, name],
+    )?;
+
+    Ok(Some(new_id))
 }
 
