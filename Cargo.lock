@@ -1067,6 +1067,7 @@ dependencies = [
  "sha2",
  "strsim",
  "symphonia",
+ "tempfile",
  "tokio",
  "urlencoding",
  "uuid",

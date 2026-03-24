@@ -41,3 +41,6 @@ profiles.xml
 
 # Tizen local env (cert password, not for version control)
 tizen-app/.env.tizen
+
+# Generated test fixtures (ffmpeg sine tones)
+tests/fixtures/
