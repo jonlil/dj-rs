@@ -23,6 +23,7 @@ impl ConvertEntry {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let convert = args.iter().any(|a| a == "--no-dry-run");
+    let delete_originals = args.iter().any(|a| a == "--delete-originals");
     let config = Config::load();
 
     let db_path = config.db_path.as_deref().unwrap_or_else(|| {
@@ -95,7 +96,7 @@ fn main() {
 
     if !convert {
         if !to_convert.is_empty() {
-            println!("\nDry run. Pass --no-dry-run to transcode.");
+            println!("\nDry run. Pass --no-dry-run to transcode. Add --delete-originals to remove source files after verified conversion.");
         }
         return;
     }
@@ -127,6 +128,12 @@ fn main() {
                 let new_db_path = Path::new(&entry.db_path).with_extension(new_ext);
                 if let Err(e) = lib.update_track_path(entry.track_id, &new_db_path.to_string_lossy()) {
                     eprintln!("  WARN  DB path update: {e}");
+                }
+
+                if delete_originals {
+                    if let Err(e) = std::fs::remove_file(&entry.resolved_path) {
+                        eprintln!("  WARN  delete original: {e}");
+                    }
                 }
 
                 println!("  OK    {}  [fp verified]", entry.label());
